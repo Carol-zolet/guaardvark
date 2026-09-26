@@ -274,7 +274,8 @@ const StreamingMessage = forwardRef(({ chatService, sessionId, onComplete }, ref
       if (!mountedRef.current || data.session_id !== sessionIdRef.current) return;
       setStatus("streaming");
       setReasoningExpanded(false);
-      setContent((prev) => prev + (data.content || ""));
+      // reset: the text streamed so far was the model's reasoning, not the answer.
+      setContent((prev) => (data.reset ? "" : prev) + (data.content || ""));
     });
 
     chatService.onComplete((data) => {

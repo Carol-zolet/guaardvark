@@ -20,6 +20,9 @@ from typing import Dict, List, Any, Optional, Callable
 logger = logging.getLogger(__name__)
 
 from backend.utils.text_cut import cut_on_whitespace
+from backend.utils.inline_reasoning import (
+    InlineReasoningStream, REASONING, RETRACT, VISIBLE, split_inline_reasoning,
+)
 from backend.utils.llm_debug_logger import (
     log_system_prompt, log_user_message, log_llm_response,
     log_tool_call, log_tool_result, log_guard_event, log_decision,
@@ -4197,9 +4200,10 @@ class UnifiedChatEngine:
         is_thinking_model = model_supports_thinking(model_name)
         think_on = is_thinking_model and bool(getattr(self, "_think", False))
 
-        # Track <think>...</think> blocks in the content stream so we can
-        # suppress them from being emitted as visible tokens.
-        in_think_block = False
+        # Reasoning a thinking model writes into the content stream (tagged,
+        # or ended by a lone </think>) goes to the reasoning channel, not the
+        # answer. think_buffer holds visible text that may open tool markup.
+        inline_reasoning = InlineReasoningStream()
         think_buffer = ""
 
         # Reasoning (message.thinking) goes out on its own channel, batched;
@@ -4343,9 +4347,29 @@ class UnifiedChatEngine:
             xml_detected = False
             _native_tool_calls_acc = []  # collected message.tool_calls (native path)
 
+            def _route_inline_reasoning(events) -> List[str]:
+                """Send inline reasoning to the reasoning channel; return the visible pieces."""
+                nonlocal think_buffer
+                visible = []
+                for kind, piece in events:
+                    if kind == VISIBLE:
+                        visible.append(piece)
+                        continue
+                    accumulated_thinking.append(piece)
+                    reasoning_buf.append(piece)
+                    if kind == RETRACT:
+                        # Text already on screen was reasoning: clear the answer.
+                        visible.clear()
+                        think_buffer = ""
+                        _flush_reasoning(force=True)
+                        if emit_tokens:
+                            emit_fn("chat:token", {"content": "", "reset": True, "session_id": session_id})
+                _flush_reasoning()
+                return visible
+
             def _consume(chunks) -> None:
                 """Drain one Ollama stream into the accumulators, emitting visible tokens."""
-                nonlocal xml_detected, in_think_block, think_buffer
+                nonlocal xml_detected, think_buffer
                 nonlocal input_tokens, output_tokens, done_reason
                 for chunk in chunks:
                     if is_aborted(session_id):
@@ -4368,6 +4392,9 @@ class UnifiedChatEngine:
                         # complete when the answer starts.
                         _flush_reasoning(force=True)
                         accumulated.append(token)
+                        visible_pieces = [token]
+                        if is_thinking_model:
+                            visible_pieces = _route_inline_reasoning(inline_reasoning.feed(token))
                         if emit_tokens and not xml_detected:
                             # Check if we've hit a tool_call tag in the accumulated text
                             # Use last 20 chunks to handle slow-chunk Ollama streams.
@@ -4382,44 +4409,15 @@ class UnifiedChatEngine:
                                 or "[tool_call" in _tail or "[tool]" in _tail
                             ):
                                 xml_detected = True
+                            elif is_thinking_model:
+                                # Keep a trailing "[tool_" / "<tool" that may be the
+                                # start of tool markup arriving token by token.
+                                think_buffer += "".join(visible_pieces)
+                                _head, think_buffer = _split_pending_tool_marker(think_buffer)
+                                if _head:
+                                    emit_fn("chat:token", {"content": _head, "session_id": session_id})
                             else:
-                                # Filter out <think>...</think> blocks from content stream
-                                emit_token = token
-                                if is_thinking_model:
-                                    think_buffer += token
-                                    if not in_think_block:
-                                        if "<think>" in think_buffer:
-                                            # Emit anything before the <think> tag
-                                            before = think_buffer.split("<think>", 1)[0]
-                                            if before:
-                                                emit_fn("chat:token", {"content": before, "session_id": session_id})
-                                            in_think_block = True
-                                            think_buffer = think_buffer.split("<think>", 1)[1]
-                                            emit_token = None
-                                        elif len(think_buffer) > 20:
-                                            # No <think> tag detected: flush, but keep a
-                                            # trailing "[tool_" / "<tool" that may be the
-                                            # start of tool markup arriving token by token.
-                                            _head, think_buffer = _split_pending_tool_marker(think_buffer)
-                                            if _head:
-                                                emit_fn("chat:token", {"content": _head, "session_id": session_id})
-                                            emit_token = None
-                                        else:
-                                            # Still buffering, don't emit yet
-                                            emit_token = None
-                                    else:
-                                        # Inside <think> block — suppress output
-                                        if "</think>" in think_buffer:
-                                            # End of think block, emit anything after
-                                            after = think_buffer.split("</think>", 1)[1]
-                                            think_buffer = after if after else ""
-                                            in_think_block = False
-                                            if after:
-                                                emit_fn("chat:token", {"content": after, "session_id": session_id})
-                                                think_buffer = ""
-                                        emit_token = None
-                                if emit_token:
-                                    emit_fn("chat:token", {"content": emit_token, "session_id": session_id})
+                                emit_fn("chat:token", {"content": token, "session_id": session_id})
                     if thinking_token:
                         accumulated_thinking.append(thinking_token)
                         reasoning_buf.append(thinking_token)
@@ -4432,16 +4430,18 @@ class UnifiedChatEngine:
 
             def _visible_content() -> str:
                 nonlocal think_buffer
-                # Flush any remaining think_buffer (non-think text that was still
+                if is_thinking_model:
+                    tail = _route_inline_reasoning(inline_reasoning.finish())
+                    think_buffer += "".join(tail)
+                # Flush any remaining think_buffer (visible text that was still
                 # buffered). Not when tool markup was detected: the buffer then
                 # holds the opening characters of that markup ("[tool_").
-                if think_buffer and not in_think_block and emit_tokens and not xml_detected:
+                if think_buffer and emit_tokens and not xml_detected:
                     emit_fn("chat:token", {"content": think_buffer, "session_id": session_id})
                 think_buffer = ""
                 text = "".join(accumulated).strip()
-                # Strip <think>...</think> blocks from final content
                 if is_thinking_model:
-                    text = re.sub(r'<think>[\s\S]*?</think>\s*', '', text).strip()
+                    text = split_inline_reasoning(text)[1]
                 return text
 
             _consume(stream)
@@ -4472,7 +4472,7 @@ class UnifiedChatEngine:
                 )
                 accumulated.clear()
                 xml_detected = False
-                in_think_block = False
+                inline_reasoning = InlineReasoningStream()
                 think_buffer = ""
                 _consume(ollama.chat(**retry_kwargs))
                 content = _visible_content()
@@ -4528,10 +4528,10 @@ class UnifiedChatEngine:
                             output_tokens = chunk.get("eval_count", 0) or 0
                             done_reason = chunk.get("done_reason") or None
 
-                    content = "".join(accumulated).strip()
+                    inline, content = split_inline_reasoning("".join(accumulated))
+                    if inline:
+                        accumulated_thinking.append(inline)
                     thinking = "".join(accumulated_thinking).strip()
-                    # Strip <think>...</think> blocks from retry content
-                    content = re.sub(r'<think>[\s\S]*?</think>\s*', '', content).strip()
                     if not content and thinking:
                         logger.info(f"Sanitized retry returned reasoning only ({len(thinking)} chars)")
                         content = _REASONING_ONLY_FALLBACK_TEXT
@@ -4559,9 +4559,8 @@ class UnifiedChatEngine:
                     text = (msg.get("content") or "").strip()
                     think = (msg.get("thinking") or "").strip()
                     if is_thinking_model:
-                        text = re.sub(
-                            r'<think>[\s\S]*?</think>\s*', '', text
-                        ).strip()
+                        inline, text = split_inline_reasoning(text)
+                        think = "\n".join(p for p in (inline, think) if p)
                     if not text and think:
                         logger.info(f"Non-stream retry returned reasoning only ({len(think)} chars)")
                         text = _REASONING_ONLY_FALLBACK_TEXT
@@ -4645,8 +4644,9 @@ class UnifiedChatEngine:
                                 input_tokens = chunk.get("prompt_eval_count", 0) or 0
                                 output_tokens = chunk.get("eval_count", 0) or 0
                                 done_reason = chunk.get("done_reason") or None
-                        content = "".join(accumulated).strip()
-                        content = re.sub(r'<think>[\s\S]*?</think>\s*', '', content).strip()
+                        inline, content = split_inline_reasoning("".join(accumulated))
+                        if inline:
+                            accumulated_thinking.append(inline)
                         if _native_active:
                             self._native_pending_tool_calls = _native_tool_calls_acc or None
                         if content:

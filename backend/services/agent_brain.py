@@ -797,7 +797,8 @@ class AgentBrain:
                 logger.warning(f"[narration_fallback] narration call failed (attempt {attempt}): {e}")
                 continue
             raw = "".join(accumulated)
-            text = re.sub(r'<think>[\s\S]*?</think>\s*', '', raw).strip()
+            from backend.utils.inline_reasoning import split_inline_reasoning
+            text = split_inline_reasoning(raw)[1]
             logger.info(
                 f"[narration] attempt={attempt} reason={reason!r} success={success} "
                 f"chunks={len(accumulated)} raw_len={len(raw)} clean_len={len(text)} "
