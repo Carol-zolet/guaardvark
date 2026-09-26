@@ -240,7 +240,9 @@ def get_model_info(model_name: str) -> Optional[dict]:
         loose_context = 0
         embedding_length = 0
         for key, value in model_info_raw.items():
-            if key.endswith(".embedding_length"):
+            # "<arch>.embedding_length" only: multimodal models also report
+            # "<arch>.vision.embedding_length" and "<arch>.audio.embedding_length".
+            if key.endswith(".embedding_length") and key.count(".") == 1:
                 embedding_length = int(value)
             if key.endswith(".context_length"):
                 native_context = int(value)

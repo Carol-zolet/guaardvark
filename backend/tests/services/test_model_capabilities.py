@@ -133,7 +133,10 @@ def test_the_record_reads_api_show(ollama):
                                "model_info": {"qwen3.embedding_length": 2560, "qwen3.context_length": 40960}},
         "gemma4:e4b": {"capabilities": ["completion", "vision", "tools", "thinking"], "family": "gemma4",
                        "model_info": {"gemma4.context_length": 131072,
-                                      "gemma4.rope.scaling.original_context_length": 8192}},
+                                      "gemma4.rope.scaling.original_context_length": 8192,
+                                      "gemma4.audio.embedding_length": 1024,
+                                      "gemma4.embedding_length": 2560,
+                                      "gemma4.vision.embedding_length": 768}},
     }
     emb = mc.capabilities_for("qwen3-embedding:4b")
     assert (emb.exists, emb.embedding, emb.completion, emb.embedding_dim, emb.native_context) == \
@@ -142,6 +145,7 @@ def test_the_record_reads_api_show(ollama):
     g = mc.capabilities_for("gemma4:e4b")
     assert (g.tools, g.thinking, g.vision, g.native_context, g.architecture) == \
         (True, True, True, 131072, "gemma4")
+    assert g.embedding_dim == 2560  # the text model's, not the vision or audio encoder's
     assert g.evidence["tools"] == "api_show" and g.evidence["vision"] == "api_show_capabilities"
 
 
