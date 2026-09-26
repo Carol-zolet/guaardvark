@@ -282,3 +282,57 @@ class TestPendingToolMarker:
         assert uce._split_pending_tool_marker("see [1] and [note") == ("see [1] and [note", "")
         assert uce._split_pending_tool_marker("a < b") == ("a < b", "")
         assert uce._split_pending_tool_marker("plain") == ("plain", "")
+
+
+# Content-stream forms recorded from Ollama 0.33.3 with think:false (2026-09-26).
+INLINE_REASONING = "3:40 plus 95 minutes is 1 hour 35 minutes later, so 5:15."
+INLINE_ANSWER = "The train arrives at 5:15."
+
+
+def _chunked(text, size=5):
+    return [text[i:i + size] for i in range(0, len(text), size)]
+
+
+def _visible_after_resets(tokens):
+    shown = ""
+    for t in tokens:
+        shown = ("" if t.get("reset") else shown) + t["content"]
+    return shown
+
+
+class TestInlineReasoning:
+    """Reasoning written into message.content lands on the reasoning channel."""
+
+    def _run(self, engine, raw):
+        def chat(**_kw):
+            for piece in _chunked(raw):
+                yield {"message": {"content": piece}}
+            yield _done()
+
+        (content, _, _), events = _stream(engine, chat)
+        return content, events
+
+    def test_tagged_reasoning(self, engine):
+        # lfm2.5:8b
+        content, events = self._run(engine, f"<think>\n{INLINE_REASONING}\n</think>\n{INLINE_ANSWER}")
+        assert content == INLINE_ANSWER
+        assert _visible_after_resets(_tokens(events)).strip() == INLINE_ANSWER
+        assert INLINE_REASONING in engine._last_llm_call_meta["thinking"]
+
+    def test_closing_tag_without_opening_tag(self, engine):
+        # granite4.2:8b: the reasoning streams as if it were the answer until </think>.
+        content, events = self._run(engine, f"{INLINE_REASONING}\n</think>\n{INLINE_ANSWER}")
+        assert content == INLINE_ANSWER
+        tokens = _tokens(events)
+        assert any(t.get("reset") for t in tokens)
+        assert _visible_after_resets(tokens).strip() == INLINE_ANSWER
+        assert INLINE_REASONING in engine._last_llm_call_meta["thinking"]
+        done = [p for p in _reasoning(events) if p.get("done")]
+        assert INLINE_REASONING in done[0]["text"]
+
+    def test_plain_answer_streams_untouched(self, engine):
+        content, events = self._run(engine, INLINE_ANSWER)
+        assert content == INLINE_ANSWER
+        tokens = _tokens(events)
+        assert not any(t.get("reset") for t in tokens)
+        assert "".join(t["content"] for t in tokens) == INLINE_ANSWER

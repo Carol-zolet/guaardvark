@@ -316,9 +316,8 @@ class AnimationGenerator:
                     )
                     text = response.get("message", {}).get("content", "").strip()
                     if text and len(text) > 20:
-                        # Strip any thinking tags
-                        import re
-                        text = re.sub(r'<think>[\s\S]*?</think>\s*', '', text).strip()
+                        from backend.utils.inline_reasoning import split_inline_reasoning
+                        text = split_inline_reasoning(text)[1]
                         return text
                 except Exception:
                     continue
