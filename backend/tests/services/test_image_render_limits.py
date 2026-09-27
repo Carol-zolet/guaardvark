@@ -338,14 +338,18 @@ def _cast_flux_still(tmp_path):
                                   include_bible=False, output_path=tmp_path / "c.png")
 
 
-def test_cast_comfy_still_sends_the_resolved_guidance_only_when_strict(comfy_calls, tmp_path, monkeypatch):
-    result = _cast_flux_still(tmp_path)
-    assert result.success, result.error
-    assert "cfg" not in comfy_calls[-1], "the graph's own default (7.0) applies"
-    assert comfy_calls[-1]["steps"] == 9, "Z-Image's steps, from the route's fallback key"
-    monkeypatch.setenv(STRICT_LIMITS_ENV, "1")
-    result = _cast_flux_still(tmp_path)
-    assert result.success, result.error
-    assert comfy_calls[-1]["cfg"] == 3.5
-    assert comfy_calls[-1]["steps"] == 28
-    assert comfy_calls[-1]["model"] == "flux-dev"
+def test_cast_flux_still_samples_from_the_flux_row_with_or_without_strict(comfy_calls, tmp_path, monkeypatch):
+    for strict in ("", "1"):
+        monkeypatch.setenv(STRICT_LIMITS_ENV, strict)
+        result = _cast_flux_still(tmp_path)
+        assert result.success, result.error
+        assert comfy_calls[-1]["cfg"] == 3.5, strict
+        assert comfy_calls[-1]["steps"] == 28, strict
+        assert comfy_calls[-1]["model"] == "flux-dev", strict
+
+
+def test_cast_flux_route_has_no_offline_model_key():
+    from backend.services.character_still_pipeline import _offline_key_for
+    assert _offline_key_for({"family": "flux", "offline_model_key": None}) is None
+    assert _offline_key_for({"family": "sdxl"}) is None
+    assert _offline_key_for({"family": "zimage"}) == "zimage-turbo"
