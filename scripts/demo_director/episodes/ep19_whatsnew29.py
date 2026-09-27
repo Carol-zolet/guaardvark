@@ -205,8 +205,11 @@ def act_teach(st: Stage):
     # The first reply after narration waits for the chat model to load back.
     with st.fast_forward():
         wait_reply(st, before, timeout=300)
-    time.sleep(2.0)
+    answer = st.page.get_by_text(re.compile(r"service-agreement")).last
+    st.cue(1, focus=answer)
+    time.sleep(4.0)                           # the line about the answer, over the answer
     up = assistant_rows(st).last
+    st.cue(2, focus=up)
     st.glide_click(up, dur=0.9)
     st.cursor.glide(1500, 700, dur=0.6)       # off the note and its tooltip
     note = st.page.get_by_text(re.compile(r"memor(y|ies) credited|recipe .+ up|reinforced"))
@@ -217,7 +220,9 @@ def act_teach(st: Stage):
         pass
     time.sleep(3.5)
     # Second click on the lit thumb withdraws it.
-    st.glide_click(st.page.locator("button:has([data-testid='ThumbUpIcon'])").last, dur=0.7)
+    lit = st.page.locator("button:has([data-testid='ThumbUpIcon'])").last
+    st.cue(3, focus=lit)
+    st.glide_click(lit, dur=0.7)
     st.cursor.glide(1500, 700, dur=0.6)
     withdrawn = st.page.get_by_text("feedback withdrawn")
     try:
@@ -248,11 +253,15 @@ def act_photo(st: Stage):
     attach(st, CAFE)
     for k, text in enumerate((EDIT_ASK, OUTPAINT_ASK, CUTOUT_ASK)):
         before = chat_images(st).count()
+        st.cue(1 + k)
         ask(st, text)
         with st.fast_forward():
             wait_new_image(st, before, expect=2 if k == 0 else 1)
+        st.focus_on(chat_images(st).last, hold=3.0)
         st.hover_over(chat_images(st).last, dur=0.9)
         time.sleep(2.5)
+    st.cue(4)
+    time.sleep(1.0)
 
 
 def v_photo(st: Stage):
@@ -304,11 +313,13 @@ def act_consent(st: Stage):
     ask(st, IDENTITY_ASK)
     card = st.page.locator("[data-testid='consent-approval-card']").last
     card.wait_for(state="visible", timeout=120_000)
-    st.hover_over(card, dur=0.9)
-    time.sleep(3.0)
+    st.cue(1)
+    # The card is part of the real product, so it is on screen; the episode
+    # does not dwell on it (Dean's Ep 19 review).
     st.glide_click(card.get_by_role("button", name="I have the right to use this likeness"), dur=0.8)
     with st.fast_forward():
         wait_new_image(st, before, expect=2, timeout=600)
+    st.cue(2, focus=chat_images(st).last)
     st.hover_over(chat_images(st).last, dur=0.9)
     time.sleep(3.0)
 
@@ -332,11 +343,15 @@ def reset_mcp(st: Stage):
 
 def act_mcp(st: Stage):
     row = st.page.locator("tr").filter(has_text=MCP_SERVER).first
+    st.cue(1, focus=row)
     st.glide_click(row.get_by_role("button", name="Connect"), dur=0.9)
     st.page.get_by_text("connected", exact=True).first.wait_for(state="visible", timeout=60_000)
-    time.sleep(2.5)
+    time.sleep(1.0)
+    st.cue(2)
     st.glide_click(row.get_by_role("button", name="Tools"), dur=0.8)
-    time.sleep(5.0)
+    time.sleep(0.8)
+    st.focus_on(st.page.get_by_text("zvec_grep_search", exact=True).first, hold=3.5)
+    time.sleep(4.2)
     close_dialogs(st)
     time.sleep(1.5)
 
@@ -354,48 +369,48 @@ def spoken_version(v: str) -> str:
 
 
 BEATS = [
+    # Plain words throughout: a first-time viewer with no background in the
+    # project must follow every line. Numbers in comments are the spoken-line
+    # indexes the actions cue on (blank lines do not count).
     Beat(
         name="teach",
         narration=[
-            "Everything since episode thirteen. Start with the smallest button "
-            "in the product.",
-            "",
-            "A thumb used to be a vote. Now it says what it taught.",
-            "The memories that built this reply get the credit. Click it again, "
-            "and it is taken back.",
+            "Guard-vark two point nine. Here is what's new.",                       # 0
+            "Ask about your own files, and it answers from them, and names the "
+            "file it used.",                                                        # 1
+            "Like an answer? Give it a thumbs up. Guard-vark keeps track of what "
+            "helped, and uses it next time.",                                       # 2
+            "Change your mind? Click it again, and that is undone.",                # 3
         ],
         action=act_teach, verify=v_teach, reset=reset_teach,
     ),
     Beat(
         name="photo",
         narration=[
-            "Drop a photo into chat, and say what you want.",
-            "",
-            "Night. Wider. Background gone.",
-            "Three edits, each one rendered on this card, in the same chat "
-            "that answers your questions. The waits are sped up; the counter "
-            "in the corner says by how much.",
+            "You can edit photos right in the chat, too.",                          # 0
+            "Just say what you want. Make it night.",                               # 1
+            "Make it wider.",                                                       # 2
+            "Take out the background.",                                             # 3
+            "Every edit ran right here, on this computer. We sped up the waiting.", # 4
         ],
         action=act_photo, verify=v_photo, reset=reset_photo,
     ),
     Beat(
-        name="consent",
+        name="identity",
         narration=[
-            "Put a real face in a new scene, and it stops first.",
-            "",
-            "Nothing renders until you say you have the right to use that "
-            "likeness. This face was generated on this machine for the demo.",
+            "Got a photo of someone? Put them in any scene, and keep their face.",  # 0
+            "This woman is not real. We made her on this computer for the demo.",   # 1
+            "Same face. New place.",                                                # 2
         ],
         action=act_consent, verify=v_consent, reset=reset_consent,
     ),
     Beat(
         name="mcp",
         narration=[
-            "Episode sixteen plugged Guard-vark into other agents. This is the "
-            "other direction.",
-            "",
-            "Point it at any tool server that speaks the protocol. Connect, "
-            "and its tools join Guard-vark's own, under the same rules.",
+            "Guard-vark can also use tools from other programs, through M C P, "
+            "a common way for A I apps to share tools.",                            # 0
+            "Pick one, and click connect.",                                         # 1
+            "Its tools show up right here, ready to use when you ask.",             # 2
         ],
         action=act_mcp, verify=v_mcp, reset=reset_mcp,
     ),
@@ -406,25 +421,56 @@ ASSETS_OUT = REPO / "data" / "demo_assets" / "ep19"
 FINAL = REPO / "data" / "outputs" / "demos" / "EP19_FINAL.mp4"
 
 
+PLATES = REPO / "data" / "demo_assets" / "launch" / "plates" / "final_plates.json"
+RESULTS = REPO / "data" / "outputs" / "generated_images"
+
+
+def _newest(prefix: str, since: float) -> str | None:
+    found = sorted((p for p in RESULTS.glob(f"{prefix}_*.png") if p.stat().st_mtime >= since),
+                   key=lambda p: p.stat().st_mtime)
+    return str(found[-1]) if found else None
+
+
 def finish(ep: Episode, body: Path) -> Path:
-    """Cold open + the recorded episode + a narrated end card."""
+    """Cold open, the beats with movement, a montage ending on an animated title
+    and a narrated sign-off: assets/finish.py, rendered from a Shotcut project."""
     import subprocess
     from director import generate_narration
-    tool = str(Path(__file__).resolve().parents[1] / "assets" / "coldopen.py")
+    tools = Path(__file__).resolve().parents[1] / "assets"
     opener = ASSETS_OUT / "coldopen.mp4"
     if not opener.exists():
-        subprocess.run([sys.executable, tool, str(opener), "GUAARDVARK 2.9", "WHAT'S NEW"],
-                       check=True)
-    wav = ep.dir / "endcard.wav"
+        subprocess.run([sys.executable, str(tools / "coldopen.py"), str(opener),
+                        "GUAARDVARK 2.9", "WHAT'S NEW"], check=True)
+    signoff = ep.dir / "signoff.wav"
+    # "Free and open source" is on screen in the call to action; spoken, it held
+    # the title for eight seconds.
     generate_narration([f"Guard-vark {spoken_version(N['version'])}.",
-                        "One machine. No cloud."], wav)
-    end = ep.dir / "endcard.mp4"
-    subprocess.run([sys.executable, tool, "--endcard", str(end), str(wav),
-                    "ONE MACHINE. NO CLOUD.", f"GUAARDVARK {N['version']}"], check=True)
-    bedded = ep.dir / "body_bed.mp4"
-    subprocess.run([sys.executable, tool, "--bed", str(body), str(bedded)], check=True)
-    subprocess.run([sys.executable, tool, "--join", str(FINAL), str(opener), str(bedded),
-                    str(end)], check=True)
+                        "One machine, no cloud."], signoff)
+    plates = {k: v["clip"] for k, v in json.loads(PLATES.read_text()).items()}
+    # The run started when its folder was named (slug_YYYYmmdd_HHMMSS); the
+    # folder's mtime moves with every file written into it.
+    since = time.mktime(time.strptime(ep.dir.name[-15:], "%Y%m%d_%H%M%S"))
+    results = [_newest("edit", since), _newest("outpaint", since), _newest("nobg", since),
+               _newest("identity", since)]
+    require(all(results), f"missing a result image for the ending: {results}")
+    shots = [
+        {"src": plates["01_one_machine"], "beats": 2, "move": "in"},
+        {"src": results[0], "beats": 1, "move": "left"},
+        {"src": plates["02_fifteen_skills"], "beats": 1, "move": "in"},
+        {"src": results[1], "beats": 1, "move": "right"},
+        {"src": plates["05_nothing_leaves"], "beats": 1, "move": "out"},
+        {"src": results[2], "beats": 1, "move": "in"},
+        {"src": plates["07_film_crew"], "beats": 1, "move": "left"},
+        {"src": results[3], "beats": 2, "move": "in"},
+    ]
+    spec = ep.dir / "outro_shots.json"
+    spec.write_text(json.dumps({"shots": shots, "title_bg": plates["13_loop_rain"]}, indent=1))
+    subprocess.run([sys.executable, str(tools / "finish.py"), str(ep.dir), str(FINAL),
+                    "--open", str(opener), "--shots", str(spec),
+                    "--title", f"GUAARDVARK {N['version']}",
+                    "--tagline", "ONE MACHINE. NO CLOUD.",
+                    "--cta", "Free and open source  ·  guaardvark.com",
+                    "--signoff", str(signoff)], check=True)
     return FINAL
 
 
