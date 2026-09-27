@@ -616,6 +616,33 @@ EPISODES = {
         links=[11, 13, 14, 15],
         tags=["multi-agent", "git worktree", "parallel coding agents"],
     ),
+    19: dict(
+        title="Everything New in 2.9 — Guaardvark, Episode 19",
+        keyword="local AI photo editing",
+        hook=(
+            "A thumb that says what it taught. Photo edits in chat. And a "
+            "face that needs your say-so first."
+        ),
+        body=(
+            "What landed since Episode 13, on the real product: a thumbs up "
+            "that names the memories it credited and a second click that takes "
+            "it back, a photo edited three ways inside chat (night, wider, "
+            "background gone), a consent card that stops any likeness before "
+            "it renders, and the MCP client connecting an outside tool server "
+            "that chat can call by name. The photo and the face were generated "
+            "on the same machine for the demo."
+        ),
+        chapters=[
+            "A thumb that teaches",
+            "Photo editing in chat",
+            "Consent before likeness",
+            "MCP, the other direction",
+            "One machine. No cloud.",
+        ],
+        links=[13, 16],
+        tags=["AI photo editing", "local image editing", "MCP client",
+              "human in the loop"],
+    ),
 }
 
 

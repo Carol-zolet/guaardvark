@@ -63,6 +63,8 @@ EPISODES = {
     # Ep 18 breaks the warm-object series look on purpose (launch piece, 2026-09-12):
     # synthwave palette, neon, chrome. The composite for it gets its own treatment.
     18: ("YOUR AGENT", "cyberpunk synthwave key art, a neon-outlined aardvark silhouette on a rain-slick rooftop, magenta and electric-cyan grid horizon, chrome sun with scanlines, volumetric fog, 1984 retro-future poster composition, high contrast, cinematic lighting, no text"),
+    # Ep 19 keeps Ep 18's synthwave look: its cold open is cut from the launch plates.
+    19: ("WHAT'S NEW 2.9", "cyberpunk synthwave key art, a chrome camera lens and a glowing photograph floating above a neon grid horizon, magenta and electric-cyan light, striped retro sun, volumetric fog, 1984 retro-future poster composition, high contrast, cinematic lighting, no text"),
 }
 
 SERIES_LABEL = "GUAARDVARK DEMO"

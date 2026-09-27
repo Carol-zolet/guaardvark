@@ -11,9 +11,9 @@ Ledger: `docs/local-workspace-only/MASTER_TASKS.md` (walkthrough-videos entry)
 
 ## Series-wide rules
 
-**Narrator.** Chatterbox clone of the Piper female voice
-(`data/uploads/voice_references/piper-female-series-narrator.wav`), Piper
-fallback. Narration = list-of-lines; blank line = long pause. Spoken
+**Narrator.** Kokoro, voice `af_heart`, through Audio Foundry (`director.py`
+default); Chatterbox and Piper are the alternatives, and the preflight refuses
+a silent fallback unless `DEMO_ALLOW_FALLBACK=1`. Narration = list-of-lines; blank line = long pause. Spoken
 "Guaardvark" → "Guard-vark" via the pronunciation map; on-screen text keeps
 the real spelling. Every line is whisper-verified before use.
 
@@ -760,3 +760,34 @@ in a plugin install are `mcp__plugin_guaardvark_guaardvark__<tool>`.
 - [ ] Ep 17: one end-to-end swarm run on a scratch branch
 - [ ] Thumbnails 13–17 (`thumbnails.py EPISODES`), descriptions 13–17
       (`descriptions.py`), private uploads to the same playlist
+
+---
+
+## Ep 19 — Everything New in 2.9 (≈5:00, cold open + 16:9 and 9:16 trailer) — `ep19_whatsnew29.py`
+**Primary:** 2.9 features · **GPU cast:** Ollama (chat beats), then ComfyUI (photo beats) ·
+**Assets:** `data/demo_assets/ep19/` — `cafe_street.png` and `portrait_fictional.png` (Z-Image on
+this box, no real person). Staging: `staging.py up` with `DEMO_CHAT_MODEL=gemma4:12b`, then
+`staging.py down` after the last take.
+
+Cold open (`assets/coldopen.py`): the launch plates cut on the launch track's beat, ending on the
+title card; prepended after assembly. Trailer (`assets/trailer.py`): picks from takes whose verify
+passed, 16:9 and 9:16, captions burned in.
+
+Beats: teach (a thumb says what it taught; a second click withdraws it) → photo (night edit,
+outpaint, background cut-out in chat) → consent (a likeness stops on the consent card first) →
+mcp (the MCP client connects an outside server; chat calls it by name) → closer (version read
+from `/api/health`; mantra).
+
+Say/not additions:
+
+| say | not |
+|---|---|
+| the chat model decides; a measured vision model looks and clicks (brain + eye) | "Gemma4 sees and clicks in one call" (Ep 4, retired) |
+| chat runs on local models only; cloud models reach it through MCP | any cloud chat routing (removed 2026-09-23) |
+| the teach question is one the indexed corpus answers | a general-knowledge question: chat refuses those while unrelated chunks are attached (open finding 2026-09-27) |
+| the thumb note as the page prints it ("N memories credited", "feedback withdrawn") | a count typed into the script |
+
+Dropped from this episode after checking the real path (2026-09-27): bring-your-own Hugging Face
+model (the Wan 2.2 5B single file is matched to the 14B workflow; the LTX-Video repo root is
+suggested as a LoRA).
+
