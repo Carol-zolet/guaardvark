@@ -122,6 +122,26 @@ class TestConfig:
             assert leaked not in env
 
 
+    def test_fixed_args_round_trip(self):
+        from backend.services.mcp_config import parse_server
+
+        cfg = parse_server("zg", {"command": "zg", "fixedArgs": {"root": "${GUAARDVARK_ROOT}"}})
+        assert cfg.fixed_args == {"root": "${GUAARDVARK_ROOT}"}
+        assert cfg.to_json()["fixedArgs"] == {"root": "${GUAARDVARK_ROOT}"}
+        assert cfg.to_editable()["fixedArgs"] == {"root": "${GUAARDVARK_ROOT}"}
+        assert cfg.to_public()["fixed_arg_names"] == ["root"]
+        assert parse_server("zg", cfg.to_json()).fixed_args == cfg.fixed_args
+
+    def test_fixed_args_expand_the_checkout_root(self):
+        from backend import config
+        from backend.services.mcp_config import parse_server, resolve_fixed_args
+
+        cfg = parse_server("zg", {"command": "zg", "fixedArgs": {"root": "${GUAARDVARK_ROOT}",
+                                                                 "limit": "5"}})
+        assert resolve_fixed_args(cfg, {}) == {"root": str(config.GUAARDVARK_ROOT), "limit": "5"}
+        assert resolve_fixed_args(cfg, {"GUAARDVARK_ROOT": "/srv/other"})["root"] == "/srv/other"
+
+
 # ---------------------------------------------------------------------------
 # Policy / output hygiene
 # ---------------------------------------------------------------------------
@@ -345,6 +365,20 @@ class TestProxyTools:
         assert reg.get_tool("mcp__fx__add") and reg.get_tool("mcp__fx__delete_thing") is None
         res = mcp_service.call_tool("fx", "delete_thing", {"name": "x"}, approved=True)
         assert not res["success"] and "blocked" in res["error"]
+
+    def test_fixed_args_are_hidden_from_the_model_and_sent(self, mcp_service):
+        from backend.services.agent_tools import get_tool_registry
+        from backend.tools import mcp_tools
+
+        mcp_tools.install_proxy_sync()
+        mcp_service._runtimes["fx"].config.fixed_args = {"b": "4"}
+        assert mcp_service.connect("fx")["success"]
+        add = get_tool_registry().get_tool("mcp__fx__add")
+        assert set(add.parameters) == {"a"}  # the model is asked for a only
+        res = get_tool_registry().execute_tool("mcp__fx__add", a=1)
+        assert res.success and "\n5\n" in res.output  # b arrived as the integer 4
+        res = get_tool_registry().execute_tool("mcp__fx__add", a=1, b=100)
+        assert res.success and "\n5\n" in res.output  # a model-sent value never wins
 
     def test_proxies_removed_on_disconnect(self, proxied, mcp_service):
         mcp_service.disconnect("fx")
