@@ -19,6 +19,7 @@ from typing import Dict, List, Any, Optional, Callable
 
 logger = logging.getLogger(__name__)
 
+from backend.utils.display_paths import display_params
 from backend.utils.text_cut import cut_on_whitespace
 from backend.utils.inline_reasoning import (
     InlineReasoningStream, REASONING, RETRACT, VISIBLE, split_inline_reasoning,
@@ -2588,7 +2589,7 @@ class UnifiedChatEngine:
             for tc, tool_name, params in tool_jobs:
                 emit_fn("chat:tool_call", {
                     "tool": tool_name,
-                    "params": params,
+                    "params": display_params(params),
                     "iteration": iteration,
                     "reasoning": tc.reasoning,
                 })
@@ -3370,7 +3371,7 @@ class UnifiedChatEngine:
             _approval_responses.pop(session_id, None)
         payload: Dict[str, Any] = {
             "tools": approval_jobs,
-            "tool_details": approval_details,
+            "tool_details": display_params(approval_details),
             "iteration": iteration,
             "available_scopes": ["once", "session", "task"],
             "session_id": session_id,
@@ -3478,7 +3479,7 @@ class UnifiedChatEngine:
                     tool_name, params, detail, session_id, emit_fn, request_id,
                 )
 
-        emit_fn("chat:tool_call", {"tool": tool_name, "params": params, "iteration": 1})
+        emit_fn("chat:tool_call", {"tool": tool_name, "params": display_params(params), "iteration": 1})
         _t0 = time.time()
         try:
             result = self.registry.execute_tool(tool_name, **params)
@@ -3690,7 +3691,7 @@ class UnifiedChatEngine:
             self._save_message(session_id, "user", message)
 
             # Execute the tool
-            emit_fn("chat:tool_call", {"tool": tool_name, "params": params, "iteration": 1})
+            emit_fn("chat:tool_call", {"tool": tool_name, "params": display_params(params), "iteration": 1})
             _t0 = time.time()
             try:
                 result = self.registry.execute_tool(tool_name, **params)
