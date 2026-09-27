@@ -344,7 +344,7 @@ class VideoGenerationRouter:
             # Mirror plugins/comfyui/scripts/start.sh: loopback bind and the
             # memory flags the #13109 patch depends on.
             listen = os.environ.get("GUAARDVARK_COMFYUI_LISTEN", "127.0.0.1")
-            from backend.services.comfyui_launch_flags import preview_cli_args
+            from backend.services.comfyui_launch_flags import model_paths_launch, preview_cli_args
             args = [
                 str(venv_python), str(main_py), "--listen", listen, "--port", "8188",
                 "--disable-smart-memory", "--cache-none", "--reserve-vram", "1.0",
@@ -352,12 +352,15 @@ class VideoGenerationRouter:
             if os.environ.get("GUAARDVARK_COMFYUI_PINNED_MEMORY", "0") != "1":
                 args.append("--disable-pinned-memory")
             args.extend(preview_cli_args())
+            paths_args, paths_env = model_paths_launch(GUAARDVARK_ROOT)
+            args.extend(paths_args)
             proc = subprocess.Popen(
                 args,
                 cwd=str(comfyui_dir),
                 stdout=log_file,
                 stderr=subprocess.STDOUT,
                 start_new_session=True,
+                env={**os.environ, **paths_env},
             )
             self._comfyui_process = proc
 

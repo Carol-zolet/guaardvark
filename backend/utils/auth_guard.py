@@ -96,6 +96,13 @@ MUTATION_PROTECTED_PREFIXES = (
     '/api/upscaling',
 )
 
+# Mutation-only protection for routes whose id sits mid-path: (prefix, suffix).
+# Importing a Cast LoRA writes a file of up to a few GB and replaces the member's
+# LoRA, so it is closed to other hosts; train/generate/upload-refs stay LAN-usable.
+MUTATION_PROTECTED_SUFFIXES = (
+    ('/api/cast-library/subjects/', '/import-lora'),
+)
+
 
 def _normalize_ip(addr: str) -> str:
     """Normalize IP for localhost checks (handles IPv4-mapped IPv6 like ::ffff:127.0.0.1 and zone IDs)."""
@@ -200,6 +207,9 @@ def _is_protected():
     if request.method not in ('GET', 'HEAD', 'OPTIONS'):
         for prefix in MUTATION_PROTECTED_PREFIXES:
             if path.startswith(prefix):
+                return True
+        for prefix, suffix in MUTATION_PROTECTED_SUFFIXES:
+            if path.startswith(prefix) and path.rstrip('/').endswith(suffix):
                 return True
     if request.method == 'DELETE':
         for prefix in PROTECTED_DELETE_PREFIXES:

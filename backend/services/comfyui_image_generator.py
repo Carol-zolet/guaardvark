@@ -10,8 +10,8 @@ is what the SVD I2V step animates, carrying identity into video.
 Model loading uses DiffusersLoader against ComfyUI/models/diffusers/sdxl-base-1.0
 (a symlink to the diffusers-format SDXL we already have on disk), so no
 single-file checkpoint conversion is needed. Trained LoRAs are referenced by
-basename because data/training/loras is registered as a ComfyUI loras search
-path via extra_model_paths.yaml.
+basename because STORAGE_DIR/training/loras is on ComfyUI's LoRA search path
+(plugins/comfyui/guaardvark_model_paths.yaml, passed at launch).
 """
 from __future__ import annotations
 
@@ -885,7 +885,7 @@ class ComfyUIImageGenerator:
         except Exception:
             pass
         try:
-            # Comfy registers extra_model_paths; probe a likely loras/ subdir next to ComfyUI.
+            # ComfyUI's own loras/ folder, the other place a LoRA name can resolve.
             # This is read-only best-effort; the actual LoraLoader inside Comfy will
             # resolve by basename anyway.
             search_dirs.append(Path(__file__).resolve().parents[3] / "plugins" / "comfyui" / "ComfyUI" / "models" / "loras")
@@ -919,7 +919,7 @@ class ComfyUIImageGenerator:
 
         effective_model = model or self.model
         # ComfyUI resolves LoRAs by basename within its loras search paths;
-        # data/training/loras is registered via extra_model_paths.yaml.
+        # STORAGE_DIR/training/loras is added by plugins/comfyui/guaardvark_model_paths.yaml.
         lora_paths = [p for p in (loras or []) if p]
         lora_names = [os.path.basename(p) for p in lora_paths]
         # Full paths for media_model_registry sidecar lookup in _build_workflow.

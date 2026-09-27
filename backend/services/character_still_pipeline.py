@@ -31,6 +31,18 @@ CharacterSource = Literal[
 ]
 
 
+def _offline_key_for(profile: dict) -> Optional[str]:
+    """Offline model key for a train-base profile; Z-Image is the only offline base.
+
+    A ComfyUI base (FLUX, SDXL) has none. Giving it Z-Image's key made FLUX
+    characters take Z-Image's strength setting and its 9 steps / guidance 0.
+    """
+    key = profile.get("offline_model_key")
+    if key:
+        return key
+    return "zimage-turbo" if (profile.get("family") or "zimage") == "zimage" else None
+
+
 def _subjects_from_ids(subject_ids: Sequence[int] | None) -> list:
     """Load Subjects by id. Safe from daemon threads / Celery (opens app_context)."""
     if not subject_ids:
@@ -202,7 +214,7 @@ def render_character_still(
                     route = {
                         "family": profile.get("family") or "zimage",
                         "inference_engine": profile.get("inference_engine") or "offline",
-                        "offline_model_key": profile.get("offline_model_key") or "zimage-turbo",
+                        "offline_model_key": _offline_key_for(profile),
                         "comfy_model_tag": profile.get("comfy_model_tag"),
                         "base_model_id": profile.get("id") or explicit,
                     }
@@ -212,7 +224,7 @@ def render_character_still(
                 route = {
                     "family": profile.get("family") or "zimage",
                     "inference_engine": profile.get("inference_engine") or "offline",
-                    "offline_model_key": profile.get("offline_model_key") or "zimage-turbo",
+                    "offline_model_key": _offline_key_for(profile),
                     "comfy_model_tag": profile.get("comfy_model_tag"),
                     "base_model_id": profile.get("id") or base_id,
                 }
@@ -235,9 +247,8 @@ def render_character_still(
     from backend.services.image_render_limits import resolve_canvas, strict_limits_enabled
     strict = strict_limits_enabled()
     defaults_model = route.get("offline_model_key") or route.get("comfy_model_tag") or "auto"
-    if strict and engine == "comfy" and route.get("comfy_model_tag"):
-        # A FLUX route carries offline_model_key "zimage-turbo" (its fallback), which
-        # started FLUX stills from Z-Image's 9 steps / guidance 0.
+    if engine == "comfy" and route.get("comfy_model_tag"):
+        # A ComfyUI base samples from its own row (FLUX-dev 28 steps / 3.5).
         defaults_model = route["comfy_model_tag"]
     defaults = resolve_stills_defaults(
         defaults_model,
@@ -336,11 +347,10 @@ def render_character_still(
         # Comfy SDXL / FLUX — never for Z-Image LoRAs (guarded above).
         from backend.services.comfyui_image_generator import ComfyUIImageGenerator
         model_tag = route.get("comfy_model_tag") or ("flux-dev" if family == "flux" else "sdxl")
-        extra = {}
+        # The resolved guidance, not the graph's own default of 7.0 (FLUX-dev's
+        # FluxGuidance value is 3.5). Canvas limits stay behind strict mode.
+        extra = {"cfg": g}
         if strict:
-            # The resolved guidance, not the graph's own default of 7.0 (FLUX-dev's
-            # FluxGuidance value is 3.5), and the family's canvas limits.
-            extra["cfg"] = g
             w, h, _ = resolve_canvas(w, h, model_tag)
         gen = ComfyUIImageGenerator(lora_strength=strength)
         path = gen.generate_image(
