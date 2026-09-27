@@ -1522,7 +1522,6 @@ class EditImageTool(BaseTool):
         from backend.config import OUTPUT_DIR
         from backend.services.offline_image_generator import get_image_generator
         from backend.services.gpu_resource_policy import gpu_session
-        from backend.services.job_operation_gate import GpuBusyError
         from backend.services.job_types import JobKind
 
         generator = get_image_generator()
@@ -1534,12 +1533,21 @@ class EditImageTool(BaseTool):
         init_image = Image.open(src)
         width, height = init_image.size
         effective_model = model if model and model != "auto" else "auto"
+        gpu_wait = _chat_gpu_wait()
+        session_kwargs = dict(evict_ollama=True, vram_estimate_mb=11000,
+                              require_fit=True, cross_process=True)
+        op_id = f"chat_edit_{uuid.uuid4().hex[:8]}"
+        if gpu_wait and gpu_wait.get("wait_s"):
+            from backend.services.gpu_resource_policy import gpu_session_when_free
+            claim = gpu_session_when_free(
+                JobKind.VIDEO_RENDER, op_id, wait_s=gpu_wait["wait_s"],
+                on_wait=gpu_wait["on_wait"], should_stop=gpu_wait["should_stop"],
+                **session_kwargs,
+            )
+        else:
+            claim = gpu_session(JobKind.VIDEO_RENDER, op_id, on_busy="raise", **session_kwargs)
         try:
-            with gpu_session(
-                JobKind.VIDEO_RENDER, f"chat_edit_{uuid.uuid4().hex[:8]}",
-                on_busy="raise", evict_ollama=True, vram_estimate_mb=11000,
-                require_fit=True, cross_process=True,
-            ):
+            with claim:
                 result = generator.generate_image_from_image(
                     prompt=instruction,
                     init_image=init_image,
@@ -1549,11 +1557,11 @@ class EditImageTool(BaseTool):
                     height=height,
                     num_inference_steps=28,
                 )
-        except GpuBusyError:
-            return ToolResult(
-                success=False,
-                error="GPU is busy with another render right now — try again in a moment.",
-            )
+        except Exception as e:
+            refusal = _gpu_refusal(e, gpu_wait)
+            if refusal is None:
+                raise
+            return ToolResult(success=False, error=refusal)
         if not result.success or not result.image_path:
             return ToolResult(success=False, error=result.error or "img2img edit failed")
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
@@ -1632,6 +1640,7 @@ class EditImageTool(BaseTool):
                 p = self._resolve_image(raw)
                 if p:
                     extra.append(p)
+        gpu_wait = None
         try:
             from backend.config import OUTPUT_DIR
             from backend.services.comfyui_image_generator import ComfyUIImageGenerator
@@ -1644,16 +1653,17 @@ class EditImageTool(BaseTool):
             output_path = os.path.join(output_dir, filename)
             backend = self._pick_edit_backend(effective_model)
             gen = ComfyUIImageGenerator()
+            gpu_wait = _chat_gpu_wait()
 
             if backend == "qwen":
                 gen.edit_image_qwen(
                     image_paths=[src, *extra], instruction=instruction,
-                    output_path=output_path, steps=int(steps) or 20,
+                    output_path=output_path, steps=int(steps) or 20, gpu_wait=gpu_wait,
                 )
             elif backend == "kontext":
                 gen.edit_image(
                     image_path=src, instruction=instruction,
-                    output_path=output_path, steps=int(steps),
+                    output_path=output_path, steps=int(steps), gpu_wait=gpu_wait,
                 )
             else:
                 img2img_result = self._edit_via_img2img(
@@ -1684,8 +1694,59 @@ class EditImageTool(BaseTool):
                 },
             )
         except Exception as e:
+            refusal = _gpu_refusal(e, gpu_wait)
+            if refusal:
+                return ToolResult(success=False, error=refusal, metadata={"gpu_busy": True})
             logger.error(f"EditImageTool error: {e}", exc_info=True)
             return ToolResult(success=False, error=f"Image edit failed: {str(e)}")
+
+
+_GPU_WAIT_STATUS = "Waiting for the GPU: another render is running. This starts as soon as it finishes."
+_GPU_STILL_BUSY = (
+    "The GPU stayed busy with another render for {mins} minutes, so this did not run. "
+    "Say \"try again\" when it is free."
+)
+
+
+def _chat_gpu_wait() -> dict | None:
+    """On a chat turn, queue behind a busy GPU instead of refusing.
+
+    Waits up to GUAARDVARK_IMAGE_VRAM_WAIT_S (the batch image wait, default
+    600 s) with a status line in the chat, and gives up when the person presses
+    Stop. Other callers (the MCP server, scripts) get None and keep the
+    immediate answer, since a client there may time out while it waits.
+    """
+    from backend.services.agent_control_service import get_chat_emit_fn, get_chat_stop_check
+    stop = get_chat_stop_check()
+    if stop is None:
+        return None
+    try:
+        wait_s = max(0.0, float(os.environ.get("GUAARDVARK_IMAGE_VRAM_WAIT_S", "600")))
+    except ValueError:
+        wait_s = 600.0
+    emit = get_chat_emit_fn()
+
+    def on_wait(reason: str) -> None:
+        logger.info("chat image job waiting for the GPU: %s", reason)
+        if emit:
+            emit("chat:thinking", {"status": _GPU_WAIT_STATUS})
+
+    return {"wait_s": wait_s, "on_wait": on_wait, "should_stop": stop}
+
+
+def _gpu_refusal(e: Exception, gpu_wait: dict | None) -> str | None:
+    """Chat text for a GPU refusal, or None when ``e`` is not one."""
+    from backend.services.gpu_resource_policy import GpuWaitStopped
+    from backend.services.job_operation_gate import GpuBusyError, GpuCapacityError
+    if isinstance(e, GpuWaitStopped):
+        return "Stopped before the GPU was free; nothing was rendered."
+    if isinstance(e, GpuCapacityError):
+        return None
+    if isinstance(e, GpuBusyError):
+        if gpu_wait and gpu_wait.get("wait_s"):
+            return _GPU_STILL_BUSY.format(mins=max(1, round(gpu_wait["wait_s"] / 60)))
+        return "GPU is busy with another render right now — try again in a moment."
+    return None
 
 
 def _chat_png_path(prefix: str) -> tuple[str, str]:
@@ -1829,14 +1890,16 @@ class OutpaintImageTool(BaseTool):
             "Fill the extended canvas so it continues the original scene, matching lighting, "
             "perspective and style. Do not change the original subject."
         )
+        gpu_wait = None
         try:
             from backend.services.comfyui_image_generator import ComfyUIImageGenerator
             gen = ComfyUIImageGenerator()
             output_path, filename = _chat_png_path("outpaint")
+            gpu_wait = _chat_gpu_wait()
             if gen.qwen_edit_installed():
                 gen.edit_image_qwen(
                     image_paths=[src], instruction=fill, output_path=output_path,
-                    steps=int(steps) or 20, pad=pad,
+                    steps=int(steps) or 20, pad=pad, gpu_wait=gpu_wait,
                 )
                 backend = "qwen"
             elif gen._kontext_installed():
@@ -1845,6 +1908,7 @@ class OutpaintImageTool(BaseTool):
                     image_path=src,
                     instruction=f"Outpaint: {fill}",
                     output_path=output_path, steps=max(int(steps) or 20, 20),
+                    gpu_wait=gpu_wait,
                 )
                 backend = "kontext"
             else:
@@ -1857,6 +1921,9 @@ class OutpaintImageTool(BaseTool):
                 metadata={"image_url": image_url, "filename": filename, "backend": backend, "pad": pad},
             )
         except Exception as e:
+            refusal = _gpu_refusal(e, gpu_wait)
+            if refusal:
+                return ToolResult(success=False, error=refusal, metadata={"gpu_busy": True})
             logger.error("outpaint_image failed: %s", e, exc_info=True)
             return ToolResult(success=False, error=f"Outpaint failed: {e}")
 
@@ -1963,6 +2030,7 @@ class GenerateIdentityTool(BaseTool):
                 ),
                 metadata={"needs_consent": True, "reference_image": src},
             )
+        gpu_wait = None
         try:
             from backend.services.comfyui_image_generator import ComfyUIImageGenerator
             output_path, filename = _chat_png_path("identity")
@@ -1970,10 +2038,11 @@ class GenerateIdentityTool(BaseTool):
                 k: kwargs[k] for k in self._PASSTHROUGH
                 if kwargs.get(k) is not None and kwargs.get(k) != ""
             }
+            gpu_wait = _chat_gpu_wait()
             ComfyUIImageGenerator().generate_with_identity(
                 image_path=src, prompt=prompt, output_path=output_path,
                 width=int(width) or 768, height=int(height) or 1024,
-                steps=int(steps) or 20, **overrides,
+                steps=int(steps) or 20, gpu_wait=gpu_wait, **overrides,
             )
             image_url = f"/api/outputs/generated_images/{filename}"
             return ToolResult(
@@ -1988,5 +2057,8 @@ class GenerateIdentityTool(BaseTool):
                 },
             )
         except Exception as e:
+            refusal = _gpu_refusal(e, gpu_wait)
+            if refusal:
+                return ToolResult(success=False, error=refusal, metadata={"gpu_busy": True})
             logger.error("generate_identity failed: %s", e, exc_info=True)
             return ToolResult(success=False, error=f"Identity generate failed: {e}")
