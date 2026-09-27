@@ -109,7 +109,8 @@ def build(out: Path, title: str, sub: str):
                   f"trim=duration={total:.3f}[card]")
         fl.append(f"[cut][card]overlay=0:0:shortest=1,"
                   f"fade=t=out:st={total - 0.5:.3f}:d=0.5,format=yuv420p[v]")
-        fl.append(f"[{n + 1}:a]afade=t=out:st={total - 1.2:.3f}:d=1.2,"
+        # 4 dB under full scale so the open does not jump above the narration.
+        fl.append(f"[{n + 1}:a]volume=0.63,afade=t=out:st={total - 1.2:.3f}:d=1.2,"
                   f"aformat=sample_rates=44100:channel_layouts=stereo[a]")
         cmd += ["-filter_complex", ";".join(fl), "-map", "[v]", "-map", "[a]",
                 "-c:v", "libx264", "-preset", "medium", "-crf", "18",
@@ -150,6 +151,24 @@ def endcard(out: Path, narration: Path, line1: str, line2: str, plate: str = "00
     print(f"end card: {out} ({total:.2f}s)")
 
 
+def bed(body: Path, out: Path, level: float = 0.09):
+    """The launch track looped quietly under an episode body, so the stretches
+    where the picture runs past the narration are not dead air. At 0.09 the
+    bed sits about 15 dB under the narrator."""
+    dur = float(subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0",
+         str(body)], capture_output=True, text=True).stdout)
+    run(["ffmpeg", "-y", "-i", str(body),
+         "-stream_loop", "-1", "-ss", f"{TRACK_START}", "-i", str(TRACK),
+         "-filter_complex",
+         f"[1:a]volume={level},afade=t=in:st=0:d=1.5,afade=t=out:st={dur - 2:.3f}:d=2,"
+         f"atrim=duration={dur:.3f}[m];"
+         f"[0:a][m]amix=inputs=2:duration=first:normalize=0,"
+         f"aformat=sample_rates=44100:channel_layouts=stereo[a]",
+         "-map", "0:v", "-map", "[a]", "-c:v", "copy", "-c:a", "aac", "-b:a", "160k", str(out)])
+    print(f"bed: {out}")
+
+
 def join(out: Path, parts: list[Path]):
     """Clips in order through the concat filter, each normalised to one shape."""
     fl = "".join(
@@ -169,7 +188,9 @@ def join(out: Path, parts: list[Path]):
 
 if __name__ == "__main__":
     a = sys.argv[1:]
-    if a and a[0] == "--join":
+    if a and a[0] == "--bed":
+        bed(Path(a[1]), Path(a[2]))
+    elif a and a[0] == "--join":
         join(Path(a[1]), [Path(p) for p in a[2:]])
     elif a and a[0] == "--endcard":
         endcard(Path(a[1]), Path(a[2]), a[3], a[4] if len(a) > 4 else "")

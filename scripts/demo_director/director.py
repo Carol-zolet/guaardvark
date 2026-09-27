@@ -480,6 +480,10 @@ class Stage:
                 "--ozone-platform=x11",
                 "--kiosk", f"--window-position=0,0", f"--window-size={w},{h}",
                 "--hide-crash-restore-bubble", "--disable-infobars",
+                # DEMO_DEVICE_SCALE=1.25 renders every page 25% larger for
+                # small type on camera; the cursor mapping reads the ratio back.
+                *([f"--force-device-scale-factor={os.environ['DEMO_DEVICE_SCALE']}"]
+                  if os.environ.get("DEMO_DEVICE_SCALE") else []),
             ],
         )
         self.page = (self.browser.pages[0] if self.browser.pages
@@ -496,7 +500,7 @@ class Stage:
         w, h = display_size(self.display)
         for _ in range(3):
             size = self.page.evaluate(
-                "() => [window.innerWidth, window.innerHeight]")
+                "() => [window.innerWidth * (window.devicePixelRatio || 1), window.innerHeight * (window.devicePixelRatio || 1)]")
             if size[0] >= w - 4 and size[1] >= h - 4:
                 return
             self.cursor.jump(w // 2, h // 2)
@@ -504,7 +508,7 @@ class Stage:
             time.sleep(0.3)
             self.cursor._xdo("key", "--clearmodifiers", "F11")
             time.sleep(1.2)
-        size = self.page.evaluate("() => [window.innerWidth, window.innerHeight]")
+        size = self.page.evaluate("() => [window.innerWidth * (window.devicePixelRatio || 1), window.innerHeight * (window.devicePixelRatio || 1)]")
         raise RuntimeError(f"could not fullscreen the stage: viewport={size}, "
                            f"display={w}x{h}")
 
@@ -529,15 +533,17 @@ class Stage:
 
     # -- coordinate mapping (kiosk => ~identity, but computed, not assumed)
     def _zoom(self) -> float:
-        """CSS-to-screen pixel ratio. Browser zoom (Ctrl+plus) raises it above
-        1 and shrinks innerWidth/innerHeight in CSS pixels."""
+        """CSS-to-screen pixel ratio: above 1 when the stage is launched with
+        DEMO_DEVICE_SCALE (Chromium's device scale factor)."""
         return float(self.page.evaluate("() => window.devicePixelRatio || 1"))
 
     def _offsets(self) -> tuple[int, int]:
+        # Under a device scale factor every window metric (screenX, outer and
+        # inner sizes) is in scaled pixels, so the whole offset scales.
         m = self.page.evaluate(
             "() => { const r = window.devicePixelRatio || 1;"
-            " return [window.screenX + (window.outerWidth - window.innerWidth * r),"
-            " window.screenY + (window.outerHeight - window.innerHeight * r)]; }"
+            " return [(window.screenX + window.outerWidth - window.innerWidth) * r,"
+            " (window.screenY + window.outerHeight - window.innerHeight) * r]; }"
         )
         return int(m[0]), int(m[1])
 

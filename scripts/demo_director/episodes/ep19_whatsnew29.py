@@ -43,10 +43,11 @@ CAFE = ASSETS / "cafe_street.png"
 PORTRAIT = ASSETS / "portrait_fictional.png"
 
 CHAT_INPUT = "Type your message, paste an image, or use voice..."
-# Browser zoom steps (Ctrl+plus) for beats with small type: the thumb row and
-# the taught note are 10 px at 100%, unreadable in a 1080p frame. Browser zoom
-# re-lays the page out; CSS zoom on the root breaks the 100vh chat layout.
-CHAT_ZOOM = int(os.environ.get("EP19_CHAT_ZOOM_STEPS", "2"))
+# The whole episode renders at 125%: at 100% the thumb row and the taught note
+# are 10 px type, unreadable in a 1080p frame. Chromium's device scale factor
+# re-lays every page out (CSS zoom broke the 100vh chat layout; Ctrl+plus
+# depended on X keyboard focus). Read by director.Stage at launch.
+DEVICE_SCALE = os.environ.setdefault("DEMO_DEVICE_SCALE", "1.25")
 
 TEACH_ASK = os.environ.get(
     "EP19_TEACH_ASK", "When does the AcmeCorp service agreement renew, and how much notice does cancelling take?")
@@ -81,15 +82,12 @@ def chat_box(st: Stage):
     ).first
 
 
-def zoom(st: Stage, steps: int):
-    """Reset browser zoom, then step it up. Chrome keeps zoom per origin, so
-    every beat sets its own level."""
-    st.cursor._xdo("key", "--clearmodifiers", "ctrl+0")
-    time.sleep(0.3)
-    for _ in range(steps):
-        st.cursor._xdo("key", "--clearmodifiers", "ctrl+plus")
-        time.sleep(0.3)
-    time.sleep(0.8)
+def check_scale(st: Stage):
+    """Every page renders at DEVICE_SCALE (set before the Stage launches):
+    the thumb row and the taught note are 10 px type at 100%."""
+    got = st.page.evaluate("() => window.devicePixelRatio")
+    require(abs(got - float(DEVICE_SCALE)) < 0.01,
+            f"page renders at {got}, not {DEVICE_SCALE}: set DEMO_DEVICE_SCALE before the Stage")
 
 
 def new_chat(st: Stage):
@@ -118,7 +116,7 @@ def fresh_chat(st: Stage):
     set_nav_chrome(st, "software", path="/chat")
     chat_box(st).wait_for(state="visible", timeout=60_000)
     new_chat(st)
-    zoom(st, CHAT_ZOOM)
+    check_scale(st)
     require(plugin_status("ollama") == "running", "Ollama is not running")
 
 
@@ -210,6 +208,7 @@ def act_teach(st: Stage):
     time.sleep(2.0)
     up = assistant_rows(st).last
     st.glide_click(up, dur=0.9)
+    st.cursor.glide(1500, 700, dur=0.6)       # off the note and its tooltip
     note = st.page.get_by_text(re.compile(r"memor(y|ies) credited|recipe .+ up|reinforced"))
     try:
         note.first.wait_for(state="visible", timeout=8_000)
@@ -219,6 +218,7 @@ def act_teach(st: Stage):
     time.sleep(3.5)
     # Second click on the lit thumb withdraws it.
     st.glide_click(st.page.locator("button:has([data-testid='ThumbUpIcon'])").last, dur=0.7)
+    st.cursor.glide(1500, 700, dur=0.6)
     withdrawn = st.page.get_by_text("feedback withdrawn")
     try:
         withdrawn.first.wait_for(state="visible", timeout=8_000)
@@ -327,7 +327,7 @@ def reset_mcp(st: Stage):
     rq.post(f"{API}/api/automation/mcp/disconnect", json={"server": MCP_SERVER}, timeout=20)
     set_nav_chrome(st, "software", path="/agents/mcp")
     st.page.get_by_text(MCP_SERVER, exact=True).first.wait_for(state="visible", timeout=30_000)
-    zoom(st, 1)
+    check_scale(st)
 
 
 def act_mcp(st: Stage):
@@ -421,7 +421,9 @@ def finish(ep: Episode, body: Path) -> Path:
     end = ep.dir / "endcard.mp4"
     subprocess.run([sys.executable, tool, "--endcard", str(end), str(wav),
                     "ONE MACHINE. NO CLOUD.", f"GUAARDVARK {N['version']}"], check=True)
-    subprocess.run([sys.executable, tool, "--join", str(FINAL), str(opener), str(body),
+    bedded = ep.dir / "body_bed.mp4"
+    subprocess.run([sys.executable, tool, "--bed", str(body), str(bedded)], check=True)
+    subprocess.run([sys.executable, tool, "--join", str(FINAL), str(opener), str(bedded),
                     str(end)], check=True)
     return FINAL
 

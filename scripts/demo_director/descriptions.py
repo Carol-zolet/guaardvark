@@ -44,6 +44,16 @@ TAGS_COMMON = ["Guaardvark", "local AI", "self-hosted AI", "open source AI",
 # not the finer-grained SERIES.md beat plan, which the production consolidated
 # during editing. Overrides the placeholder chapters below for these episodes.
 REAL_CHAPTERS = {
+    # EP19_FINAL.mp4 (2026-09-27): cold open 12.8, teach 23.4, photo 37.0,
+    # consent 25.4, mcp 16.0, end card 7.3.
+    19: [
+        (0, "Cold open"),
+        (13, "A thumb that teaches"),
+        (36, "Photo editing in chat"),
+        (73, "Consent before likeness"),
+        (99, "MCP, the other direction"),
+        (115, "One machine. No cloud."),
+    ],
     # Beat lengths of ep16_mcp_20260913_021604 (doctor 24.0, install 27.0,
     # policy 37.0, profiles 38.5, client 44.5, approvals 34.0, fixed 42.5).
     16: [
@@ -629,8 +639,9 @@ EPISODES = {
             "it back, a photo edited three ways inside chat (night, wider, "
             "background gone), a consent card that stops any likeness before "
             "it renders, and the MCP client connecting an outside tool server "
-            "that chat can call by name. The photo and the face were generated "
-            "on the same machine for the demo."
+            "whose tools join Guaardvark's own under the same policy. Render "
+            "waits are sped up on screen, with the speed shown. The photo and "
+            "the face were generated on the same machine for the demo."
         ),
         chapters=[
             "A thumb that teaches",
