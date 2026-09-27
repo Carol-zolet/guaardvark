@@ -1031,12 +1031,29 @@ def parse_outpaint_pad(message: str) -> dict:
     return pad
 
 
+_IDENTITY_PLACE_RE = re.compile(
+    r"^(?:please\s+)?(?:can you\s+|could you\s+)?"
+    r"put this (?:person|face|guy|girl|man|woman) (in|into|on)\s+",
+    re.IGNORECASE,
+)
+
+
 def identity_prompt_from_message(message: str) -> str:
+    """The scene prompt for generate_identity.
+
+    "this person as a 1940s detective" names a subject already. "put this
+    person in a greenhouse" names only a place: without a subject FLUX draws
+    the greenhouse empty and the face reference has nobody to land on, so
+    that form keeps "a person" in front of the place."""
     text = (message or "").strip()
+    place = _IDENTITY_PLACE_RE.match(text)
+    if place:
+        rest = text[place.end():].strip(" .")
+        prep = "on" if place.group(1).lower() == "on" else "in"
+        return f"a person {prep} {rest}" if rest else text
     stripped = re.sub(
         r"^(?:please\s+)?(?:can you\s+|could you\s+)?"
-        r"(?:put this (?:person|face) (?:in|into|on)\s+|"
-        r"this (?:person|face|photo|picture) as\s+)",
+        r"this (?:person|face|photo|picture) as\s+",
         "",
         text,
         flags=re.IGNORECASE,
