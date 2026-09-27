@@ -850,6 +850,10 @@ Please try uploading the file again or contact support if the issue persists.`;
         // Check if it's an image first
         if (file.type.startsWith("image/")) {
           handleImageUpload(file);
+          // The image now lives in imageState. Left in the input, the send
+          // path would read it back as a document for the next message and
+          // open the upload dialog instead of sending that message.
+          event.target.value = "";
           return;
         }
 
