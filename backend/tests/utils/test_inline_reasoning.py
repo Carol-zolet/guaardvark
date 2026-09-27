@@ -62,3 +62,45 @@ def test_lone_closing_tag_retracts_what_was_shown():
     assert RETRACT in kinds
     retracted = next(p for k, p in events if k == RETRACT)
     assert R.startswith(retracted) and retracted
+
+
+# ── the tag pairs are data ───────────────────────────────────────────────────
+
+from backend.services.model_capability_data import INLINE_REASONING_TAGS  # noqa: E402
+
+
+@pytest.mark.parametrize("open_tag, close_tag", INLINE_REASONING_TAGS)
+def test_every_default_pair(open_tag, close_tag):
+    assert split_inline_reasoning(f"{open_tag}{R}{close_tag}{A}") == (R, A)
+    assert split_inline_reasoning(f"{R}{close_tag}{A}") == (R, A)
+
+
+@pytest.mark.parametrize("size", [1, 3, 1000])
+def test_longest_default_pair_streams(size):
+    text = f"<|begin_of_thought|>{R}<|end_of_thought|>{A}"
+    reasoning, answer = [], []
+    for kind, piece in _events_with(text, size, None):
+        (answer if kind == VISIBLE else reasoning).append(piece)
+        assert "<|" not in piece or kind != VISIBLE
+    assert ("".join(reasoning).strip(), "".join(answer).strip()) == (R, A)
+
+
+def test_a_model_row_replaces_the_default_pairs():
+    granite32 = [("Here is my thought process:", "Here is my response:")]
+    text = f"Here is my thought process: {R} Here is my response: {A}"
+    assert split_inline_reasoning(text, granite32) == (R, A)
+    # The defaults no longer apply to that model.
+    assert split_inline_reasoning(f"<think>{R}</think>{A}", granite32) == ("", f"<think>{R}</think>{A}")
+
+
+def test_near_miss_tags_stay_in_the_answer():
+    text = f"{A} Use <thinkpad> or <reasons> freely."
+    assert split_inline_reasoning(text) == ("", text)
+
+
+def _events_with(text, size, tags):
+    stream = InlineReasoningStream(tags)
+    out = []
+    for i in range(0, len(text), size):
+        out += stream.feed(text[i:i + size])
+    return out + stream.finish()

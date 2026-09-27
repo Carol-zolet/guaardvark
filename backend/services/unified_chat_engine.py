@@ -4203,7 +4203,14 @@ class UnifiedChatEngine:
         # Reasoning a thinking model writes into the content stream (tagged,
         # or ended by a lone </think>) goes to the reasoning channel, not the
         # answer. think_buffer holds visible text that may open tool markup.
-        inline_reasoning = InlineReasoningStream()
+        reasoning_tags = None
+        if is_thinking_model:
+            try:
+                from backend.services.model_capabilities import capabilities_for
+                reasoning_tags = capabilities_for(model_name, with_vision=False).reasoning_tags
+            except Exception as _tag_err:  # noqa: BLE001 - fall back to the default pairs
+                logger.debug(f"reasoning tag lookup failed for {model_name}: {_tag_err}")
+        inline_reasoning = InlineReasoningStream(reasoning_tags)
         think_buffer = ""
 
         # Reasoning (message.thinking) goes out on its own channel, batched;
@@ -4441,7 +4448,7 @@ class UnifiedChatEngine:
                 think_buffer = ""
                 text = "".join(accumulated).strip()
                 if is_thinking_model:
-                    text = split_inline_reasoning(text)[1]
+                    text = split_inline_reasoning(text, reasoning_tags)[1]
                 return text
 
             _consume(stream)
@@ -4472,7 +4479,7 @@ class UnifiedChatEngine:
                 )
                 accumulated.clear()
                 xml_detected = False
-                inline_reasoning = InlineReasoningStream()
+                inline_reasoning = InlineReasoningStream(reasoning_tags)
                 think_buffer = ""
                 _consume(ollama.chat(**retry_kwargs))
                 content = _visible_content()
@@ -4528,7 +4535,7 @@ class UnifiedChatEngine:
                             output_tokens = chunk.get("eval_count", 0) or 0
                             done_reason = chunk.get("done_reason") or None
 
-                    inline, content = split_inline_reasoning("".join(accumulated))
+                    inline, content = split_inline_reasoning("".join(accumulated), reasoning_tags)
                     if inline:
                         accumulated_thinking.append(inline)
                     thinking = "".join(accumulated_thinking).strip()
@@ -4559,7 +4566,7 @@ class UnifiedChatEngine:
                     text = (msg.get("content") or "").strip()
                     think = (msg.get("thinking") or "").strip()
                     if is_thinking_model:
-                        inline, text = split_inline_reasoning(text)
+                        inline, text = split_inline_reasoning(text, reasoning_tags)
                         think = "\n".join(p for p in (inline, think) if p)
                     if not text and think:
                         logger.info(f"Non-stream retry returned reasoning only ({len(think)} chars)")
@@ -4644,7 +4651,7 @@ class UnifiedChatEngine:
                                 input_tokens = chunk.get("prompt_eval_count", 0) or 0
                                 output_tokens = chunk.get("eval_count", 0) or 0
                                 done_reason = chunk.get("done_reason") or None
-                        inline, content = split_inline_reasoning("".join(accumulated))
+                        inline, content = split_inline_reasoning("".join(accumulated), reasoning_tags)
                         if inline:
                             accumulated_thinking.append(inline)
                         if _native_active:

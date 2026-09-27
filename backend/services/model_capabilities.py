@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
 from backend.services.model_capability_data import (
+    INLINE_REASONING_TAGS,
     MODEL_CAPABILITY_ROWS,
     OVERRIDABLE_FIELDS,
     THINKING_NAME_PATTERNS,
@@ -48,6 +49,7 @@ class ModelRecord:
     tools: bool
     thinking: bool                # Ollama lists "thinking"
     thinks_by_name: bool          # THINKING_NAME_PATTERNS matches the tag
+    reasoning_tags: Tuple[Tuple[str, str], ...]  # tag pairs around inline reasoning
     vision: bool
     embedding: bool
     native_context: int           # <arch>.context_length (0 when unknown)
@@ -66,6 +68,15 @@ class ModelRecord:
 def thinks_by_name(tag: Optional[str]) -> bool:
     lower = (tag or "").lower()
     return bool(lower) and any(re.search(p, lower) for p in THINKING_NAME_PATTERNS)
+
+
+def _tag_pairs(value: Any) -> Tuple[Tuple[str, str], ...]:
+    """[[open, close], ...] from a row, or () when it is not that shape."""
+    try:
+        pairs = tuple((str(o), str(c)) for o, c in value if o and c)
+    except (TypeError, ValueError):
+        return ()
+    return pairs
 
 
 def _local_rows() -> Dict[str, Dict[str, Any]]:
@@ -137,8 +148,15 @@ def record_from_info(tag: str, info: Optional[dict], *, with_vision: bool = True
         "embedding_dim": int((info or {}).get("embedding_length") or 0),
     }
     evidence = {k: source for k in values}
+    values["reasoning_tags"] = INLINE_REASONING_TAGS
+    evidence["reasoning_tags"] = "default"
     row, row_source = declared_row(tag)
     for key, value in row.items():
+        if key == "reasoning_tags":
+            value = _tag_pairs(value)
+            if not value:
+                logger.warning("Ignoring reasoning_tags for %r: expected [[open, close], ...]", tag)
+                continue
         values[key] = value
         evidence[key] = row_source
 
@@ -157,6 +175,7 @@ def record_from_info(tag: str, info: Optional[dict], *, with_vision: bool = True
         tools=bool(values["tools"]),
         thinking=bool(values["thinking"]),
         thinks_by_name=by_name,
+        reasoning_tags=values["reasoning_tags"],
         vision=bool(vision),
         embedding=bool(values["embedding"]),
         native_context=int(values["native_context"]),

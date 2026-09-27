@@ -263,6 +263,21 @@ NON_TEXT_NAME_PATTERNS = [
     r'embed', r'retrieval', r'minilm',
 ]
 
+# Tag pairs a model may write around reasoning in its answer text, matched
+# case-insensitively by backend/utils/inline_reasoning.py; what they enclose
+# goes to the Thinking card instead of the answer. The set is Open WebUI's
+# documented default (checked 2026-09-26). Seen live on this project's own
+# probes: <think> (lfm2.5, granite4.2 on Ollama 0.33.3). A model with its own
+# markers gets a ``reasoning_tags`` row below, which replaces this list for it.
+INLINE_REASONING_TAGS = (
+    ("<think>", "</think>"),
+    ("<thinking>", "</thinking>"),
+    ("<reason>", "</reason>"),
+    ("<reasoning>", "</reasoning>"),
+    ("<thought>", "</thought>"),
+    ("<|begin_of_thought|>", "<|end_of_thought|>"),
+)
+
 # ---------------------------------------------------------------------------
 # Declared capability rows
 # ---------------------------------------------------------------------------
@@ -270,11 +285,14 @@ NON_TEXT_NAME_PATTERNS = [
 # Shipped rows are for a build whose /api/show is known to be wrong; there are
 # none. A machine adds its own in data/config/model_capabilities.json (gitignored,
 # like the rest of data/config), shaped {"<tag>": {"tools": false, ...}}; a local
-# row wins over a shipped one. Vision is not overridable here: it has its own
-# authority order in model_capability_resolver (EXTERNAL_MODEL_ROWS).
+# row wins over a shipped one. ``reasoning_tags`` is a list of [open, close]
+# pairs, e.g. {"<tag>": {"reasoning_tags": [["<think>", "</think>"]]}}, and
+# replaces INLINE_REASONING_TAGS for that model. Vision is not overridable here:
+# it has its own authority order in model_capability_resolver (EXTERNAL_MODEL_ROWS).
 MODEL_CAPABILITY_ROWS: dict = {}
 OVERRIDABLE_FIELDS = (
     "tools", "thinking", "completion", "embedding", "native_context", "embedding_dim",
+    "reasoning_tags",
 )
 
 

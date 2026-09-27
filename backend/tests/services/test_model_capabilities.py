@@ -222,3 +222,28 @@ def test_the_report_flags_models_the_checks_disagree_on(ollama, capsys):
     assert rows["llama3.1:8b"]["disagree"] == []
     assert report.main(["--models", "qwen3.5:9b"]) == 0
     assert "! qwen3.5:9b" in capsys.readouterr().out
+
+
+# ── reasoning tag pairs ──────────────────────────────────────────────────────
+
+def test_reasoning_tags_default_to_the_shared_list(ollama):
+    from backend.services.model_capability_data import INLINE_REASONING_TAGS
+    ollama.models = {"qwen3:14b": {"capabilities": ["completion", "thinking"]}}
+    rec = mc.capabilities_for("qwen3:14b")
+    assert rec.reasoning_tags == INLINE_REASONING_TAGS and rec.evidence["reasoning_tags"] == "default"
+
+
+def test_a_local_row_sets_a_models_reasoning_tags(ollama):
+    ollama.models = {"granite3.2:8b": {"capabilities": ["completion", "thinking"]}}
+    mc.LOCAL_ROWS_PATH.write_text(json.dumps({"granite3.2:8b": {
+        "reasoning_tags": [["Here is my thought process:", "Here is my response:"]]}}))
+    rec = mc.capabilities_for("granite3.2:8b")
+    assert rec.reasoning_tags == (("Here is my thought process:", "Here is my response:"),)
+    assert rec.evidence["reasoning_tags"] == "local_row"
+
+
+def test_a_malformed_reasoning_tags_row_is_ignored(ollama):
+    from backend.services.model_capability_data import INLINE_REASONING_TAGS
+    ollama.models = {"qwen3:14b": {"capabilities": ["completion", "thinking"]}}
+    mc.LOCAL_ROWS_PATH.write_text(json.dumps({"qwen3:14b": {"reasoning_tags": "<think>"}}))
+    assert mc.capabilities_for("qwen3:14b").reasoning_tags == INLINE_REASONING_TAGS
