@@ -443,7 +443,7 @@ const StreamingMessage = forwardRef(({ chatService, sessionId, onComplete }, ref
       ? "error.main"
       : status === "complete"
       ? "divider"
-      : "warning.main";
+      : "primary.main";
 
   const formattedTime = formatTime(startTime);
 
@@ -493,7 +493,7 @@ const StreamingMessage = forwardRef(({ chatService, sessionId, onComplete }, ref
         {/* Thinking indicator */}
         {(status === "thinking" || pendingApproval) && (
           <Box sx={{ display: "flex", alignItems: "center", gap: 1, mb: toolCalls.length > 0 ? 1 : 0 }}>
-            <CircularProgress size={14} color={pendingApproval ? "error" : "warning"} />
+            <CircularProgress size={14} color="primary" />
             <Typography variant="body2" color="text.secondary">
               {pendingApproval ? "Waiting for your approval..." : thinkingText}
             </Typography>
