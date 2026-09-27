@@ -19,6 +19,7 @@ Design notes (why this exists instead of scripts/agent_demo.py):
 from __future__ import annotations
 
 import json
+from contextlib import contextmanager
 import os
 import signal
 import subprocess
@@ -479,6 +480,10 @@ class Stage:
                 "--ozone-platform=x11",
                 "--kiosk", f"--window-position=0,0", f"--window-size={w},{h}",
                 "--hide-crash-restore-bubble", "--disable-infobars",
+                # DEMO_DEVICE_SCALE=1.25 renders every page 25% larger for
+                # small type on camera; the cursor mapping reads the ratio back.
+                *([f"--force-device-scale-factor={os.environ['DEMO_DEVICE_SCALE']}"]
+                  if os.environ.get("DEMO_DEVICE_SCALE") else []),
             ],
         )
         self.page = (self.browser.pages[0] if self.browser.pages
@@ -495,7 +500,7 @@ class Stage:
         w, h = display_size(self.display)
         for _ in range(3):
             size = self.page.evaluate(
-                "() => [window.innerWidth, window.innerHeight]")
+                "() => [window.innerWidth * (window.devicePixelRatio || 1), window.innerHeight * (window.devicePixelRatio || 1)]")
             if size[0] >= w - 4 and size[1] >= h - 4:
                 return
             self.cursor.jump(w // 2, h // 2)
@@ -503,7 +508,7 @@ class Stage:
             time.sleep(0.3)
             self.cursor._xdo("key", "--clearmodifiers", "F11")
             time.sleep(1.2)
-        size = self.page.evaluate("() => [window.innerWidth, window.innerHeight]")
+        size = self.page.evaluate("() => [window.innerWidth * (window.devicePixelRatio || 1), window.innerHeight * (window.devicePixelRatio || 1)]")
         raise RuntimeError(f"could not fullscreen the stage: viewport={size}, "
                            f"display={w}x{h}")
 
@@ -527,10 +532,18 @@ class Stage:
             self._pw.stop()
 
     # -- coordinate mapping (kiosk => ~identity, but computed, not assumed)
+    def _zoom(self) -> float:
+        """CSS-to-screen pixel ratio: above 1 when the stage is launched with
+        DEMO_DEVICE_SCALE (Chromium's device scale factor)."""
+        return float(self.page.evaluate("() => window.devicePixelRatio || 1"))
+
     def _offsets(self) -> tuple[int, int]:
+        # Under a device scale factor every window metric (screenX, outer and
+        # inner sizes) is in scaled pixels, so the whole offset scales.
         m = self.page.evaluate(
-            "() => [window.screenX + (window.outerWidth - window.innerWidth),"
-            " window.screenY + (window.outerHeight - window.innerHeight)]"
+            "() => { const r = window.devicePixelRatio || 1;"
+            " return [(window.screenX + window.outerWidth - window.innerWidth) * r,"
+            " (window.screenY + window.outerHeight - window.innerHeight) * r]; }"
         )
         return int(m[0]), int(m[1])
 
@@ -550,8 +563,9 @@ class Stage:
                 if not box:
                     raise RuntimeError("element has no bounding box")
                 ox, oy = self._offsets()
-                return (int(box["x"] + box["width"] / 2 + ox),
-                        int(box["y"] + box["height"] / 2 + oy))
+                r = self._zoom()
+                return (int((box["x"] + box["width"] / 2) * r + ox),
+                        int((box["y"] + box["height"] / 2) * r + oy))
             except Exception as e:
                 last_err = e
                 if "not attached" not in str(e) and "bounding box" not in str(e):
@@ -599,6 +613,18 @@ class Stage:
         x, y = self.screen_xy(locator)
         self.cursor.glide(x, y, dur=dur)
 
+    @contextmanager
+    def fast_forward(self):
+        """Mark the enclosed wait (a render, a model load) for fast-forward at
+        assembly. Outside a recorded take (dry runs) it does nothing."""
+        rec = getattr(self, "recorder", None)
+        start = rec.elapsed() if rec else None
+        try:
+            yield
+        finally:
+            if rec is not None and start is not None:
+                self.fast_marks.append((start, rec.elapsed()))
+
 
 # ---------------------------------------------------------------- beats
 
@@ -618,6 +644,10 @@ class Beat:
     # x11grab records VIDEO ONLY — anything the UI "plays" is silent unless
     # it is scheduled here (essential for the audio episodes).
     audio_overlays: list = field(default_factory=list)
+    # Stretches of the take spent waiting on a render, as (start_s, end_s) on
+    # the recording clock; filled by Stage.fast_forward() during the action.
+    # Assembly plays each one sped up, with the speed printed on the frame.
+    fast_segments: list = field(default_factory=list, repr=False)
     audio_path: Path = field(default=None, repr=False)
     audio_dur: float = 0.0
 
@@ -647,6 +677,7 @@ class Episode:
                 if b.reset:
                     b.reset(stage)
                 rec.start()
+                stage.recorder, stage.fast_marks = rec, []
                 time.sleep(b.lead_in)
                 b.action(stage)
                 if b.verify:
@@ -654,7 +685,16 @@ class Episode:
                 target = max(b.audio_dur + 0.7, b.min_hold)
                 while rec.elapsed() < target:
                     time.sleep(0.1)
+                stage.recorder = None
+                b.fast_segments = list(stage.fast_marks)
                 vdur = rec.stop()
+                if b.fast_segments:
+                    raw = self._fast_forward(raw, b.fast_segments)
+                    vdur = ffprobe_duration(raw)
+                    if vdur + 0.3 < b.audio_dur:
+                        raw = self._pad_raw_to_audio(
+                            raw, b.audio_dur, raw.with_name(raw.stem + ".pad.mp4"))
+                        vdur = ffprobe_duration(raw)
                 if vdur + 0.3 < b.audio_dur:
                     raise RuntimeError(
                         f"video {vdur:.1f}s shorter than narration {b.audio_dur:.1f}s")
@@ -705,6 +745,45 @@ class Episode:
                 "-c:v", "copy", "-c:a", "aac", "-b:a", "160k",
                 "-shortest", str(out)]
         _run(cmd)
+        return out
+
+    FF_TARGET_S = 4.0          # each marked wait plays in about this long
+    FF_FONT = "/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf"
+
+    def _fast_forward(self, raw: Path, segments: list) -> Path:
+        """Play each marked wait at the speed that fits it into FF_TARGET_S
+        (never slower than 4x), with the speed shown in the corner, so a
+        three-minute render reads as a render and not as a cut."""
+        total = ffprobe_duration(raw)
+        cuts, t = [], 0.0
+        for a, b in sorted(segments):
+            a, b = max(a, t), min(b, total)
+            if b - a < 2.0:
+                continue
+            if a > t:
+                cuts.append((t, a, 1.0))
+            cuts.append((a, b, max(4.0, (b - a) / self.FF_TARGET_S)))
+            t = b
+        if not any(k > 1 for _, _, k in cuts):
+            return raw
+        if t < total:
+            cuts.append((t, total, 1.0))
+        fl, labels = [], []
+        for n, (a, b, k) in enumerate(cuts):
+            chain = f"[0:v]trim=start={a:.3f}:end={b:.3f},setpts=(PTS-STARTPTS)/{k:.3f},fps={FPS}"
+            if k > 1:
+                chain += (f",drawbox=x=iw-250:y=24:w=226:h=72:color=black@0.6:t=fill,"
+                          f"drawtext=fontfile={self.FF_FONT}:text='>> {k:.0f}x':"
+                          f"x=w-230:y=40:fontsize=40:fontcolor=white")
+            fl.append(chain + f"[v{n}]")
+            labels.append(f"[v{n}]")
+        fl.append(f"{''.join(labels)}concat=n={len(cuts)}:v=1:a=0[v]")
+        out = raw.with_name(raw.stem + ".ff.mp4")
+        _run(["ffmpeg", "-y", "-i", str(raw), "-filter_complex", ";".join(fl),
+              "-map", "[v]", "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+              "-pix_fmt", "yuv420p", str(out)])
+        print(f"  fast-forward: {total:.1f}s -> {ffprobe_duration(out):.1f}s "
+              f"({', '.join(f'{b - a:.0f}s at {k:.0f}x' for a, b, k in cuts if k > 1)})")
         return out
 
     def _pad_raw_to_audio(self, raw: Path, audio_dur: float, dest: Path) -> Path:

@@ -1,0 +1,25 @@
+A thumb that says what it taught. Photo edits in chat. And a face that needs your say-so first.
+
+What landed since Episode 13, on the real product: a thumbs up that names the memories it credited and a second click that takes it back, a photo edited three ways inside chat (night, wider, background gone), a consent card that stops any likeness before it renders, and the MCP client connecting an outside tool server whose tools join Guaardvark's own under the same policy. Render waits are sped up on screen, with the speed shown. The photo and the face were generated on the same machine for the demo.
+
+One machine. No cloud. This is Episode 19.
+
+CHAPTERS
+0:00 Cold open
+0:13 A thumb that teaches
+0:36 Photo editing in chat
+1:13 Consent before likeness
+1:39 MCP, the other direction
+1:55 One machine. No cloud.
+
+FEATURED IN THIS EPISODE
+▸ Ep 13: The New Front Door — Workspaces, and Everything New Since Episode 12 — {EP13}
+▸ Ep 16: Plug In Anything — MCP, Episode 16 — {EP16}
+
+Full playlist: {PLAYLIST}
+
+Guaardvark is a self-hosted AI system that writes, voices, shoots, and edits video — chat, image gen, video gen, voice cloning, an autonomous screen agent, and a full AI film crew — running on a single desktop GPU, no cloud API calls. This episode is part of the Guaardvark walkthrough series.
+
+Source & docs: https://github.com/guaardvark/guaardvark
+
+#Guaardvark #localAI #selfhostedAI #opensourceAI #offlineAI #AIvideogeneration #onemachinenocloud #localAIphotoediting #AIphotoediting #localimageediting #MCPclient #humanintheloop

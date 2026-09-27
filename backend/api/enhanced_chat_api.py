@@ -18,6 +18,7 @@ from flask import Blueprint, current_app, request, jsonify, Response, stream_wit
 
 logger = logging.getLogger(__name__)
 
+from backend.utils.display_paths import display_params
 from backend.utils.settings_utils import get_setting
 
 # Local imports
@@ -4821,7 +4822,9 @@ def get_chat_history(session_id: str):
                         msg_data[key] = msg.extra_data[key]
                 # Restore tool call steps for unified chat rendering
                 if 'steps' in msg.extra_data:
-                    msg_data['toolCalls'] = msg.extra_data['steps']
+                    # Stored with the real paths the tools ran on; shown the
+                    # way the live chat:tool_call event shows them.
+                    msg_data['toolCalls'] = display_params(msg.extra_data['steps'])
                     msg_data['isUnifiedChat'] = True
             formatted_messages.append(msg_data)
 

@@ -242,9 +242,10 @@ def verify_no_private_names(st: Stage):
         for pat, why in pats:
             m = pat.search(text)
             if m:
+                around = text[max(0, m.start() - 60):m.end() + 60].replace("\n", " ")
                 raise RuntimeError(
                     f"private name on camera ({where}): pattern #{pats.index((pat, why)) + 1} "
-                    f"matched {m.group(0)!r} — {why}")
+                    f"matched {m.group(0)!r} — {why}; in: {around!r}")
     print(f"  privacy: {len(pats)} patterns, 0 hits")
 
 

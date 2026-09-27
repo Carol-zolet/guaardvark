@@ -70,6 +70,9 @@ def test_parse_outpaint_pad_named_side():
 
 def test_identity_prompt_strips_chrome():
     assert identity_prompt_from_message("this person as a 1940s detective") == "a 1940s detective"
+    # A place alone renders an empty scene; the subject stays in front of it.
+    assert (identity_prompt_from_message("Put this person into a sunlit greenhouse, same face.")
+            == "a person in a sunlit greenhouse, same face")
 
 
 def test_generate_identity_requires_a_consent_record(tmp_path, monkeypatch):

@@ -19,6 +19,7 @@ from typing import Dict, List, Any, Optional, Callable
 
 logger = logging.getLogger(__name__)
 
+from backend.utils.display_paths import display_params
 from backend.utils.text_cut import cut_on_whitespace
 from backend.utils.inline_reasoning import (
     InlineReasoningStream, REASONING, RETRACT, VISIBLE, split_inline_reasoning,
@@ -1031,12 +1032,29 @@ def parse_outpaint_pad(message: str) -> dict:
     return pad
 
 
+_IDENTITY_PLACE_RE = re.compile(
+    r"^(?:please\s+)?(?:can you\s+|could you\s+)?"
+    r"put this (?:person|face|guy|girl|man|woman) (in|into|on)\s+",
+    re.IGNORECASE,
+)
+
+
 def identity_prompt_from_message(message: str) -> str:
+    """The scene prompt for generate_identity.
+
+    "this person as a 1940s detective" names a subject already. "put this
+    person in a greenhouse" names only a place: without a subject FLUX draws
+    the greenhouse empty and the face reference has nobody to land on, so
+    that form keeps "a person" in front of the place."""
     text = (message or "").strip()
+    place = _IDENTITY_PLACE_RE.match(text)
+    if place:
+        rest = text[place.end():].strip(" .")
+        prep = "on" if place.group(1).lower() == "on" else "in"
+        return f"a person {prep} {rest}" if rest else text
     stripped = re.sub(
         r"^(?:please\s+)?(?:can you\s+|could you\s+)?"
-        r"(?:put this (?:person|face) (?:in|into|on)\s+|"
-        r"this (?:person|face|photo|picture) as\s+)",
+        r"this (?:person|face|photo|picture) as\s+",
         "",
         text,
         flags=re.IGNORECASE,
@@ -2571,7 +2589,7 @@ class UnifiedChatEngine:
             for tc, tool_name, params in tool_jobs:
                 emit_fn("chat:tool_call", {
                     "tool": tool_name,
-                    "params": params,
+                    "params": display_params(params),
                     "iteration": iteration,
                     "reasoning": tc.reasoning,
                 })
@@ -3353,7 +3371,7 @@ class UnifiedChatEngine:
             _approval_responses.pop(session_id, None)
         payload: Dict[str, Any] = {
             "tools": approval_jobs,
-            "tool_details": approval_details,
+            "tool_details": display_params(approval_details),
             "iteration": iteration,
             "available_scopes": ["once", "session", "task"],
             "session_id": session_id,
@@ -3461,7 +3479,7 @@ class UnifiedChatEngine:
                     tool_name, params, detail, session_id, emit_fn, request_id,
                 )
 
-        emit_fn("chat:tool_call", {"tool": tool_name, "params": params, "iteration": 1})
+        emit_fn("chat:tool_call", {"tool": tool_name, "params": display_params(params), "iteration": 1})
         _t0 = time.time()
         try:
             result = self.registry.execute_tool(tool_name, **params)
@@ -3673,7 +3691,7 @@ class UnifiedChatEngine:
             self._save_message(session_id, "user", message)
 
             # Execute the tool
-            emit_fn("chat:tool_call", {"tool": tool_name, "params": params, "iteration": 1})
+            emit_fn("chat:tool_call", {"tool": tool_name, "params": display_params(params), "iteration": 1})
             _t0 = time.time()
             try:
                 result = self.registry.execute_tool(tool_name, **params)
