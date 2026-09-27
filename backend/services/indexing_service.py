@@ -672,6 +672,53 @@ def _persist_dir_for(project_id=None) -> str:
 
 
 _embed_dim_cache: Dict[str, int] = {}
+_embed_sync_gave_up: Optional[str] = None
+
+
+def _sync_embed_model(model: Optional[str] = None) -> None:
+    """Rebuild the embedding client when Settings chose a different model.
+
+    A Celery worker keeps the client it built when it started. After a switch in
+    Settings it would go on embedding with the old model into the old width's
+    table while chat searched the new one. The web server swaps its own client
+    in the switch route, so there this is a no-op.
+    """
+    global index, storage_context, _embed_sync_gave_up
+    try:
+        if model is None:
+            from backend.config import get_active_embedding_model
+            model = get_active_embedding_model()
+        if not model or model == _embed_sync_gave_up:
+            return
+        from llama_index.core import Settings as _LISettings
+        current = getattr(getattr(_LISettings, "embed_model", None), "model_name", None)
+        if current == model:
+            return
+        from backend.utils.llm_service import get_default_embed_model
+        client = get_default_embed_model()
+        if getattr(client, "model_name", None) != model:
+            _embed_sync_gave_up = model
+            logger.warning(
+                "Embedding client for %s came back as %s; keeping %s",
+                model, getattr(client, "model_name", None), current,
+            )
+            return
+        _LISettings.embed_model = client
+        index = None
+        storage_context = None
+        try:
+            from flask import current_app, has_app_context
+            if has_app_context():
+                current_app.config.pop("INDEX_CACHE", None)
+                current_app.config["LLAMA_INDEX_EMBED_MODEL"] = client
+        except Exception:
+            pass
+        logger.info(
+            "Embedding model is %s (this process had %s): client rebuilt, index handle reset",
+            model, current,
+        )
+    except Exception as e:
+        logger.warning("Could not bring the embedding client in line with %s: %s", model, e)
 
 
 def _active_embed_dim() -> Optional[int]:
@@ -694,13 +741,18 @@ def _active_embed_dim() -> Optional[int]:
         model = "unknown"
     if model in _embed_dim_cache:
         return _embed_dim_cache[model]
+    # Probe the client that will actually embed, and only once it is the chosen model;
+    # probing a stale client cached the old width under the new model's name.
+    if model != "unknown":
+        _sync_embed_model(model)
     try:
         from llama_index.core import Settings
         embed_model = getattr(Settings, "embed_model", None)
         if embed_model is None:
             return None
         dim = len(embed_model.get_query_embedding("dimension probe"))
-        _embed_dim_cache[model] = dim
+        if getattr(embed_model, "model_name", model) == model:
+            _embed_dim_cache[model] = dim
         logger.info("Embedding dimension for %s: %d", model, dim)
         return dim
     except Exception as e:
@@ -1292,6 +1344,8 @@ def get_or_create_index(project_id: Optional[str] = None):
     global index, storage_context
 
     from backend.config import INDEX_ROOT, PROJECT_INDEX_MODE
+
+    _sync_embed_model()
 
     index_mode = os.getenv("GUAARDVARK_PROJECT_INDEX_MODE", PROJECT_INDEX_MODE)
     index_root = os.getenv("GUAARDVARK_INDEX_ROOT", INDEX_ROOT)
