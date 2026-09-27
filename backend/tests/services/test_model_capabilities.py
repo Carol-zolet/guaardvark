@@ -92,6 +92,13 @@ def _old_thinking(tag, info):
     return "thinking" in (info.get("capabilities") or [])
 
 
+def _expected_thinking(tag, info):
+    """The old answer, except that an embedding model is no longer a thinker by name."""
+    if tag and re.search(r"embed|rerank", tag.lower()):
+        return bool(info) and "thinking" in (info.get("capabilities") or [])
+    return _old_thinking(tag, info)
+
+
 def test_the_name_rules_are_unchanged():
     assert orm.THINKING_MODEL_PATTERNS == OLD_THINKING
     assert orm.VISION_MODEL_PATTERNS == [
@@ -108,15 +115,15 @@ def test_tools_and_thinking_answer_as_before(ollama, caps):
     for tag in TAGS:
         info = orm.get_model_info(tag)
         assert orm.model_supports_tools(tag) == _old_tools(tag, info), tag
-        assert orm.model_supports_thinking(tag) == _old_thinking(tag, info), tag
-        assert orm.think_payload(tag) == ({"think": False} if _old_thinking(tag, info) else {})
+        assert orm.model_supports_thinking(tag) == _expected_thinking(tag, info), tag
+        assert orm.think_payload(tag) == ({"think": False} if _expected_thinking(tag, info) else {})
 
 
 def test_tools_and_thinking_with_ollama_down(ollama):
     ollama.down = True
     for tag in TAGS + ["", None]:
         assert orm.model_supports_tools(tag or "") is False
-        assert orm.model_supports_thinking(tag or "") == _old_thinking(tag or "", None)
+        assert orm.model_supports_thinking(tag or "") == _expected_thinking(tag or "", None)
 
 
 def test_a_name_match_still_decides_thinking_without_io(ollama):
@@ -141,7 +148,7 @@ def test_the_record_reads_api_show(ollama):
     emb = mc.capabilities_for("qwen3-embedding:4b")
     assert (emb.exists, emb.embedding, emb.completion, emb.embedding_dim, emb.native_context) == \
         (True, True, False, 2560, 40960)
-    assert emb.thinks_by_name is True and emb.thinking is False and emb.sends_think_flag is True
+    assert emb.thinks_by_name is False and emb.thinking is False and emb.sends_think_flag is False
     g = mc.capabilities_for("gemma4:e4b")
     assert (g.tools, g.thinking, g.vision, g.native_context, g.architecture) == \
         (True, True, True, 131072, "gemma4")
@@ -247,3 +254,57 @@ def test_a_malformed_reasoning_tags_row_is_ignored(ollama):
     ollama.models = {"qwen3:14b": {"capabilities": ["completion", "thinking"]}}
     mc.LOCAL_ROWS_PATH.write_text(json.dumps({"qwen3:14b": {"reasoning_tags": "<think>"}}))
     assert mc.capabilities_for("qwen3:14b").reasoning_tags == INLINE_REASONING_TAGS
+
+
+# ── cleanups the capability report found ─────────────────────────────────────
+
+def test_an_embedding_model_is_not_a_thinker_by_name(ollama):
+    assert mc.thinks_by_name("qwen3-embedding:4b-q4_K_M") is False
+    assert orm.model_supports_thinking("qwen3-embedding:4b-q4_K_M") is False
+    assert mc.thinks_by_name("qwen3:14b") is True
+    assert orm.model_supports_thinking("qwen3:14b") is True
+    assert "qwen3:14b" not in ollama.shows  # answered by name, no I/O
+
+
+def test_an_embedding_model_is_not_a_chat_model_whatever_its_name(ollama):
+    ollama.models = {
+        "bge-m3:latest": {"capabilities": ["embedding"]},
+        "llama3.1:8b": {"capabilities": ["completion", "tools"]},
+        "moondream:latest": {"capabilities": ["completion", "vision"]},
+    }
+    assert orm.is_text_chat_model("bge-m3:latest") is False
+    assert orm.is_text_chat_model("llama3.1:8b") is True
+    assert orm.is_text_chat_model("moondream:latest") is False  # vision-only by name, as before
+
+
+def test_chat_eligibility_falls_back_to_the_name_rule_with_ollama_down(ollama):
+    ollama.down = True
+    assert orm.is_text_chat_model("bge-m3:latest") is True
+    assert orm.is_text_chat_model("nomic-embed-text:latest") is False
+
+
+def test_servo_config_asks_ollama_whether_a_model_sees(ollama):
+    from backend.services.servo_knowledge_store import get_vision_config
+    ollama.models = {
+        "qwen3.5:9b": {"capabilities": ["completion", "vision", "tools", "thinking"]},
+        "someone/gemma4-26b-text-only:latest": {"capabilities": ["completion", "tools", "thinking"]},
+    }
+    seeing = get_vision_config("qwen3.5:9b")
+    assert seeing["has_vision"] is True and seeing["source"] == "resolver_api_show_capabilities"
+    blind = get_vision_config("someone/gemma4-26b-text-only:latest")
+    assert blind["has_vision"] is False
+
+
+def test_embedding_width_comes_from_ollama_before_the_4096_fallback(ollama, monkeypatch):
+    import backend.config as config
+    from backend.utils.embedding_router import EmbeddingRouter
+    ollama.models = {"mxbai-embed-large:latest": {
+        "capabilities": ["embedding"], "family": "bert",
+        "model_info": {"bert.embedding_length": 1024, "bert.context_length": 512}}}
+    monkeypatch.setattr(config, "get_active_embedding_model", lambda: "mxbai-embed-large:latest")
+    monkeypatch.setattr(config, "get_embedding_vram_estimates", lambda: {})
+    router = object.__new__(EmbeddingRouter)  # not the singleton
+    router._embed_dim = None
+    router._gpu_embedding = None
+    router._cpu_embedding = None
+    assert router.embed_dim == 1024

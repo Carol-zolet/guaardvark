@@ -246,6 +246,12 @@ EYE_BORROW_EYE_AT_MOST_PX = 24.0
 THINKING_NAME_PATTERNS = [
     r'deepseek-r1', r'thinking', r'gemma[\-_]?4', r'qwen3',
 ]
+# A tag matching one of these is never a thinking model by name, whatever
+# THINKING_NAME_PATTERNS says: qwen3-embedding:4b matched r'qwen3' and was
+# counted as a thinker (Ollama lists it as embedding only, 2026-09-26).
+THINKING_NAME_EXCLUDE_PATTERNS = [
+    r'embed', r'rerank',
+]
 
 # is_vision_model's fallback when the capability resolver cannot be imported.
 VISION_NAME_PATTERNS = [

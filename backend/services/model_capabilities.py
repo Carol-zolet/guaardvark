@@ -29,6 +29,7 @@ from backend.services.model_capability_data import (
     INLINE_REASONING_TAGS,
     MODEL_CAPABILITY_ROWS,
     OVERRIDABLE_FIELDS,
+    THINKING_NAME_EXCLUDE_PATTERNS,
     THINKING_NAME_PATTERNS,
 )
 
@@ -67,7 +68,11 @@ class ModelRecord:
 
 def thinks_by_name(tag: Optional[str]) -> bool:
     lower = (tag or "").lower()
-    return bool(lower) and any(re.search(p, lower) for p in THINKING_NAME_PATTERNS)
+    return (
+        bool(lower)
+        and any(re.search(p, lower) for p in THINKING_NAME_PATTERNS)
+        and not any(re.search(p, lower) for p in THINKING_NAME_EXCLUDE_PATTERNS)
+    )
 
 
 def _tag_pairs(value: Any) -> Tuple[Tuple[str, str], ...]:
