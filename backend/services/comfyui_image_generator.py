@@ -294,13 +294,10 @@ class ComfyUIImageGenerator:
                     ml = "sdxl"
 
         if "flux" in ml and "dev" in ml:
-            # FLUX-dev branch. As of the subject-16 fix this only fires for an
-            # explicit flux-dev model with NO LoRAs (plain flux-dev stills) — the
-            # capability guard above re-routes every LoRA request to the SDXL
-            # branch because this app's character LoRAs are SDXL. The LoraLoaderModelOnly
-            # chain below is retained for a FUTURE flux trainer; a flux-format LoRA
-            # would need to bypass the guard (e.g. a model tag like "flux-dev-loras")
-            # to reach it. Model-only chain: FLUX character LoRAs don't train the
+            # FLUX-dev branch: plain flux-dev stills, and LoRAs whose sidecar names
+            # a FLUX base (the capability guard above retags a non-FLUX model
+            # request to flux-dev for them; SDXL LoRAs go to the SDXL branch).
+            # Model-only chain: FLUX character LoRAs don't train the
             # text encoder (SimpleTuner "text encoder was not trained"), so clip is
             # left untouched and the trigger word in the prompt does the identity work.
             # Dev UNET/T5 come from the FLUX_DEV_* module constants (override via
