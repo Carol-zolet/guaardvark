@@ -17,6 +17,10 @@ or a model's own ``reasoning_tags`` row (see ``model_capabilities``).
 :func:`split_inline_reasoning` does the same for a finished text. Both treat
 text before a closing tag that has no opening tag as reasoning, and an opening
 tag that is never closed as reasoning to the end. Tags match case-insensitively.
+
+``leading_only`` is for models not known to think: only a block that opens the
+answer (nothing but whitespace before it) counts, and a lone closing tag does
+not, so an answer that merely mentions a tag is left alone.
 """
 from __future__ import annotations
 
@@ -41,11 +45,30 @@ def _normalise(tags: Optional[TagPairs]) -> List[Tuple[str, str]]:
     return pairs or [("<think>", "</think>")]
 
 
+# A tag with one of these right before and after it is being written about
+# (`<think>`, "</think>", “<think>”), not used as a marker.
+_QUOTES = "`'\"\u2018\u2019\u201c\u201d"
+
+
+def _find_tag(lower: str, needle: str) -> int:
+    """First position of ``needle`` used as a tag, skipping quoted mentions."""
+    pos = lower.find(needle)
+    while pos >= 0:
+        after = pos + len(needle)
+        quoted_before = pos > 0 and lower[pos - 1] in _QUOTES
+        if not (quoted_before and after < len(lower) and lower[after] in _QUOTES):
+            if quoted_before and after == len(lower):
+                return -1  # the closing quote may still be on its way
+            return pos
+        pos = lower.find(needle, after)
+    return -1
+
+
 def _earliest(lower: str, needles: Sequence[str]) -> Tuple[int, int]:
     """(position, index into needles) of the first needle found, or (-1, -1)."""
     best = (-1, -1)
     for i, needle in enumerate(needles):
-        pos = lower.find(needle)
+        pos = _find_tag(lower, needle)
         if pos >= 0 and (best[0] < 0 or pos < best[0]):
             best = (pos, i)
     return best
@@ -59,7 +82,7 @@ class InlineReasoningStream:
     streams without delay. ``finish`` releases whatever is still held.
     """
 
-    def __init__(self, tags: Optional[TagPairs] = None) -> None:
+    def __init__(self, tags: Optional[TagPairs] = None, *, leading_only: bool = False) -> None:
         self._pairs = _normalise(tags)
         self._opens = [o for o, _ in self._pairs]
         self._closes = [c for _, c in self._pairs]
@@ -68,15 +91,26 @@ class InlineReasoningStream:
         self._close: Optional[str] = None  # the closing tag awaited while inside
         self._seen_tag = False
         self._shown = ""  # visible text released so far, for RETRACT
+        self._leading_only = leading_only
+        self._passthrough = False  # leading_only, and the answer has started
 
     def _partial_tag_len(self, text: str) -> int:
-        """Length of the longest tail of ``text`` that could still grow into a tag."""
+        """Length of the longest tail of ``text`` that could still grow into a
+        tag, or that is a quoted tag still waiting for its closing quote."""
         lower = text.lower()
-        for n in range(min(len(lower), self._longest - 1), 0, -1):
-            tail = lower[-n:]
-            if any(t.startswith(tail) for t in self._opens + self._closes):
-                return n
-        return 0
+        for tag in self._opens + self._closes:
+            if lower.endswith(tag) and len(lower) > len(tag) and lower[-len(tag) - 1] in _QUOTES:
+                return len(tag) + 1
+        n = next(
+            (n for n in range(min(len(lower), self._longest - 1), 0, -1)
+             if any(t.startswith(lower[-n:]) for t in self._opens + self._closes)),
+            0,
+        )
+        # Keep a quote just before (or at the end) with it, so a quoted
+        # mention is still recognised as one when the tag arrives.
+        if len(lower) > n and lower[-n - 1] in _QUOTES:
+            n += 1
+        return n
 
     def _release(self, events, kind: str) -> None:
         hold = self._partial_tag_len(self._buf)
@@ -87,15 +121,36 @@ class InlineReasoningStream:
         self._buf += token or ""
         events: List[Tuple[str, str]] = []
         while True:
+            if self._passthrough:
+                self._emit(events, VISIBLE, self._buf)
+                self._buf = ""
+                return events
             lower = self._buf.lower()
             if self._close is not None:
-                end = lower.find(self._close)
+                end = _find_tag(lower, self._close)
                 if end < 0:
                     self._release(events, REASONING)
                     return events
                 self._emit(events, REASONING, self._buf[:end])
                 self._buf = self._buf[end + len(self._close):].lstrip()
                 self._close = None
+                continue
+
+            if self._leading_only:
+                if self._seen_tag:
+                    self._passthrough = True  # one leading block, then the answer
+                    continue
+                body = self._buf.lstrip()
+                low = body.lower()
+                opened = next((i for i, t in enumerate(self._opens) if low.startswith(t)), None)
+                if opened is not None:
+                    self._seen_tag = True
+                    self._buf = body[len(self._opens[opened]):]
+                    self._close = self._closes[opened]
+                    continue
+                if not body or any(t.startswith(low) for t in self._opens):
+                    return events  # whitespace, or a tag still arriving
+                self._passthrough = True
                 continue
 
             start, which = _earliest(lower, self._opens)
@@ -134,9 +189,11 @@ class InlineReasoningStream:
         events.append((kind, text))
 
 
-def split_inline_reasoning(text: str, tags: Optional[TagPairs] = None) -> Tuple[str, str]:
+def split_inline_reasoning(
+    text: str, tags: Optional[TagPairs] = None, *, leading_only: bool = False,
+) -> Tuple[str, str]:
     """``(reasoning, answer)`` from a finished text, both stripped."""
-    stream = InlineReasoningStream(tags)
+    stream = InlineReasoningStream(tags, leading_only=leading_only)
     reasoning: List[str] = []
     answer: List[str] = []
     for kind, piece in stream.feed(text or "") + stream.finish():
