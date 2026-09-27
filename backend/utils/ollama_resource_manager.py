@@ -130,11 +130,20 @@ def is_vision_model(model_name: str) -> bool:
 
 
 def is_text_chat_model(model_name: str) -> bool:
-    """Check if a model is suitable as a default text chat LLM."""
+    """Check if a model is suitable as a default text chat LLM.
+
+    The name rule leaves out vision-only and embedding models; when Ollama can
+    describe the model, one it lists as embedding is left out too, whatever its
+    name (bge-m3 has no "embed" in it).
+    """
     if not model_name:
         return False
     lower = model_name.lower()
-    return not any(re.search(p, lower) for p in NON_TEXT_MODEL_PATTERNS)
+    if any(re.search(p, lower) for p in NON_TEXT_MODEL_PATTERNS):
+        return False
+    from backend.services.model_capabilities import capabilities_for
+    rec = capabilities_for(model_name, with_vision=False)
+    return not (rec.exists and rec.embedding)
 
 
 def get_system_resources() -> Dict[str, float]:
