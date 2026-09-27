@@ -369,6 +369,11 @@ class MCPProxyTool(BaseTool):
         server, remote = self.mcp_origin
         arguments = {}
         for key, value in kwargs.items():
+            # The registry adds _agent_context (the user's message, the
+            # project path) for any tool that takes **kwargs. It is ours,
+            # never an argument for the external server.
+            if key == "_agent_context":
+                continue
             param = self.parameters.get(key)
             arguments[key] = _coerce_json_arg(value, param.type) if param else value
         if self.requires_confirmation:

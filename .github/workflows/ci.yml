@@ -339,6 +339,7 @@ jobs:
             backend/tests/services/test_model_capabilities.py \
             backend/tests/utils/test_inline_reasoning.py \
             backend/tests/test_thinking_channel.py \
+            backend/tests/test_mcp_chat_approval_e2e.py \
             backend/tests/services/test_workflow_contract_*.py \
             backend/tests/services/test_video_render_limits.py \
             backend/tests/services/test_video_prompt_defaults.py \
