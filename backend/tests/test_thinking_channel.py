@@ -355,3 +355,34 @@ class TestReasoningTagsFromTheRecord:
         assert content == INLINE_ANSWER
         assert _visible_after_resets(_tokens(events)).strip() == INLINE_ANSWER
         assert INLINE_REASONING in engine._last_llm_call_meta["thinking"]
+
+
+class TestModelsNotMarkedThinking:
+    """A model Ollama does not list as thinking: only a block that opens the answer moves."""
+
+    def _run(self, engine, monkeypatch, raw):
+        from backend.utils import ollama_resource_manager as orm
+        monkeypatch.setattr(orm, "model_supports_thinking", lambda _m: False)
+        engine.llm = MagicMock(model="imported-r1:latest", context_window=8192)
+
+        def chat(**kw):
+            assert "think" not in kw
+            for piece in _chunked(raw):
+                yield {"message": {"content": piece}}
+            yield _done()
+
+        (content, _, _), events = _stream(engine, chat)
+        return content, events
+
+    def test_a_leading_block_moves_to_reasoning(self, engine, monkeypatch):
+        content, events = self._run(engine, monkeypatch, f"<think>\n{INLINE_REASONING}\n</think>\n{INLINE_ANSWER}")
+        assert content == INLINE_ANSWER
+        assert _visible_after_resets(_tokens(events)).strip() == INLINE_ANSWER
+        assert INLINE_REASONING in engine._last_llm_call_meta["thinking"]
+
+    def test_a_mentioned_tag_stays_in_the_answer(self, engine, monkeypatch):
+        raw = f"{INLINE_ANSWER} Some models wrap reasoning in <think> and </think>."
+        content, events = self._run(engine, monkeypatch, raw)
+        assert content == raw
+        assert "".join(t["content"] for t in _tokens(events)) == raw
+        assert engine._last_llm_call_meta["thinking"] == ""
