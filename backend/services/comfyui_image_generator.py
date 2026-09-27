@@ -718,13 +718,31 @@ class ComfyUIImageGenerator:
             "save": {"class_type": "SaveImage", "inputs": {"filename_prefix": "identity-pulid", "images": ["vae", 0]}},
         }
 
-    def _run_edit_graph(self, workflow: dict, output_path: str, *, job: str, vram_mb: int, timeout: int) -> str:
-        from backend.services.gpu_resource_policy import gpu_session
+    @staticmethod
+    def _edit_gpu_session(op_id: str, gpu_wait: dict | None, **session_kwargs):
+        """The GPU claim for an edit: refuse when busy, or wait when the caller asks.
+
+        ``gpu_wait`` is ``{"wait_s", "on_wait", "should_stop"}``; chat passes it so
+        a second edit queues behind the first instead of failing.
+        """
+        from backend.services.gpu_resource_policy import gpu_session, gpu_session_when_free
         from backend.services.job_types import JobKind
+        if gpu_wait and gpu_wait.get("wait_s"):
+            return gpu_session_when_free(
+                JobKind.VIDEO_RENDER, op_id,
+                wait_s=gpu_wait["wait_s"],
+                on_wait=gpu_wait.get("on_wait"),
+                should_stop=gpu_wait.get("should_stop"),
+                **session_kwargs,
+            )
+        return gpu_session(JobKind.VIDEO_RENDER, op_id, on_busy="raise", **session_kwargs)
+
+    def _run_edit_graph(self, workflow: dict, output_path: str, *, job: str, vram_mb: int, timeout: int,
+                        gpu_wait: dict | None = None) -> str:
         import uuid as _uuid
-        with gpu_session(
-            JobKind.VIDEO_RENDER, f"{job}_{_uuid.uuid4().hex[:8]}",
-            on_busy="raise", evict_ollama=True, free_comfyui=True,
+        with self._edit_gpu_session(
+            f"{job}_{_uuid.uuid4().hex[:8]}", gpu_wait,
+            evict_ollama=True, free_comfyui=True,
             vram_estimate_mb=vram_mb, require_fit=True, cross_process=True,
         ):
             prompt_id = self._queue(workflow)
@@ -741,6 +759,7 @@ class ComfyUIImageGenerator:
     def edit_image_qwen(
         self, *, image_paths: list[str], instruction: str, output_path: str,
         steps: int = 20, cfg: float = 2.5, seed: int = 42, pad: dict | None = None,
+        gpu_wait: dict | None = None,
     ) -> str:
         if not self.qwen_edit_installed():
             from backend.services.image_editing_packs import missing_message
@@ -760,7 +779,7 @@ class ComfyUIImageGenerator:
         )
         result = self._run_edit_graph(
             workflow, output_path, job="chat_qwen_edit",
-            vram_mb=_registry_vram("qwen-image-edit"), timeout=600,
+            vram_mb=_registry_vram("qwen-image-edit"), timeout=600, gpu_wait=gpu_wait,
         )
         logger.info("Qwen-Image-Edit complete: %s", result)
         return result
@@ -770,6 +789,7 @@ class ComfyUIImageGenerator:
         width: int = 768, height: int = 1024, steps: int = 20, seed: int = 42,
         weight: float | None = None, start_at: float | None = None, end_at: float | None = None,
         unet_dtype: str | None = None, node_variant: str | None = "pulid_flux",
+        gpu_wait: dict | None = None,
     ) -> str:
         weight = _identity_default('weight', weight)
         start_at = _identity_default('start_at', start_at)
@@ -791,7 +811,7 @@ class ComfyUIImageGenerator:
         )
         result = self._run_edit_graph(
             workflow, output_path, job="chat_pulid",
-            vram_mb=_registry_vram("pulid-flux"), timeout=600,
+            vram_mb=_registry_vram("pulid-flux"), timeout=600, gpu_wait=gpu_wait,
         )
         logger.info("PuLID-FLUX identity generate complete: %s", result)
         return result
@@ -824,7 +844,8 @@ class ComfyUIImageGenerator:
         }
 
     def edit_image(self, *, image_path: str, instruction: str, output_path: str,
-                   steps: int = 28, guidance: float = 2.5, seed: int = 42) -> str:
+                   steps: int = 28, guidance: float = 2.5, seed: int = 42,
+                   gpu_wait: dict | None = None) -> str:
         """Instruction-guided edit of an existing image via FLUX.1 Kontext [dev].
         Honest failure if ComfyUI is down or the Kontext model isn't installed —
         never returns a fake/unedited image. Default 28 steps (Kontext is under-rendered
@@ -842,12 +863,10 @@ class ComfyUIImageGenerator:
                 f"until that model finishes downloading."
             )
         self._require_up(f"ComfyUI not reachable at {self.comfy_url} — cannot edit image")
-        from backend.services.gpu_resource_policy import gpu_session
-        from backend.services.job_types import JobKind
         import uuid as _uuid
-        with gpu_session(JobKind.VIDEO_RENDER, f"chat_edit_{_uuid.uuid4().hex[:8]}",
-                         on_busy="raise", evict_ollama=True, free_comfyui=True,
-                         vram_estimate_mb=11000, require_fit=True, cross_process=True):
+        with self._edit_gpu_session(f"chat_edit_{_uuid.uuid4().hex[:8]}", gpu_wait,
+                                    evict_ollama=True, free_comfyui=True,
+                                    vram_estimate_mb=11000, require_fit=True, cross_process=True):
             src_name = self._upload_image_to_comfyui(image_path)
             if not src_name:
                 raise RuntimeError("Failed to upload the source image to ComfyUI")
