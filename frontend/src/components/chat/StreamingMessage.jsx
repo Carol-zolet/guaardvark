@@ -22,7 +22,7 @@ import { a11yDark } from "react-syntax-highlighter/dist/esm/styles/prism";
 import { useAppStore } from "../../stores/useAppStore";
 import { BASE_URL } from "../../api/apiClient";
 import ToolCallCard from "./ToolCallCard";
-import { parseConsentApproval } from "./consentApproval";
+import { applyApprovalRequest, applyToolCall } from "./approvalCards";
 import SynthesizedAnswerChip from "./SynthesizedAnswerChip";
 import ThinkingCard from "./ThinkingCard";
 import AgentThinkingTrail from "./AgentThinkingTrail";
@@ -196,17 +196,7 @@ const StreamingMessage = forwardRef(({ chatService, sessionId, onComplete }, ref
     chatService.onToolCall((data) => {
       if (!mountedRef.current || data.session_id !== sessionIdRef.current) return;
       setStatus("streaming");
-      setToolCalls((prev) => [
-        ...prev,
-        {
-          tool: data.tool,
-          params: data.params || data.arguments || data.args || {},
-          result: null,
-          durationMs: null,
-          isPending: true,
-          reasoning: data.reasoning,
-        },
-      ]);
+      setToolCalls((prev) => applyToolCall(prev, data));
     });
 
     chatService.onToolResult((data) => {
@@ -251,23 +241,7 @@ const StreamingMessage = forwardRef(({ chatService, sessionId, onComplete }, ref
     chatService.onToolApprovalRequest((data) => {
       if (!mountedRef.current || data.session_id !== sessionIdRef.current) return;
       setPendingApproval(true);
-      setToolCalls((prev) => {
-        const approvalTools = new Set(data.tools || []);
-        return prev.map((tc) => {
-          if (tc.isPending && approvalTools.has(tc.tool)) {
-            const parsed = parseConsentApproval(data, tc.tool, tc.params);
-            return {
-              ...tc,
-              requiresApproval: true,
-              params: parsed.params,
-              consent: parsed.consent,
-              consentImage: parsed.image,
-              consentPrompt: parsed.prompt,
-            };
-          }
-          return tc;
-        });
-      });
+      setToolCalls((prev) => applyApprovalRequest(prev, data));
     });
 
     chatService.onToken((data) => {
