@@ -217,7 +217,8 @@ def test_the_report_flags_models_the_checks_disagree_on(ollama, capsys):
     ollama.models = {
         # Multimodal, but the name lists that predate /api/show call it blind.
         "qwen3.5:9b": {"capabilities": ["completion", "vision", "tools", "thinking"]},
-        # An embedding model the name-based chat filter lets through.
+        # An embedding model with no "embed" in its name: the chat filter
+        # now asks Ollama, so the checks agree.
         "bge-m3:latest": {"capabilities": ["embedding"]},
         "llama3.1:8b": {"capabilities": ["completion", "tools"]},
     }
@@ -225,7 +226,8 @@ def test_the_report_flags_models_the_checks_disagree_on(ollama, capsys):
     rows = {r["tag"]: r for r in json.loads(capsys.readouterr().out)}
     assert "vision" in rows["qwen3.5:9b"]["disagree"]
     assert rows["qwen3.5:9b"]["vision"]["record"] is True
-    assert "text_chat" in rows["bge-m3:latest"]["disagree"]
+    assert "text_chat" not in rows["bge-m3:latest"]["disagree"]
+    assert rows["bge-m3:latest"]["text_chat"]["is_text_chat_model (name)"] is False
     assert rows["llama3.1:8b"]["disagree"] == []
     assert report.main(["--models", "qwen3.5:9b"]) == 0
     assert "! qwen3.5:9b" in capsys.readouterr().out
