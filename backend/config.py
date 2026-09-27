@@ -543,18 +543,68 @@ def _get_gpu_vram_info() -> dict:
     return result
 
 
-def get_active_embedding_model() -> str:
-    # Check if user has explicitly set an embedding model (via Settings UI)
-    # Try DB first, then fall back to env var, then auto-selection
+_SAVED_EMBED_TTL_S = 10.0
+_saved_embed_cache: dict = {"at": 0.0, "value": None}
+_saved_embed_engine = None
+
+
+def _saved_embedding_model_outside_app() -> str | None:
+    """The Settings choice, read straight from the settings table.
+
+    Import-time configuration, Celery workers and scripts have no Flask app
+    context, so the ORM lookup fails there and the env var or auto-selection
+    used to win. The workers then embedded with a different model than the one
+    chosen in Settings, writing into another width's table while chat searched
+    the chosen one. Cached briefly because retrieval asks on every query.
+    """
+    import time as _time
+    global _saved_embed_engine
+    now = _time.monotonic()
+    if now - _saved_embed_cache["at"] < _SAVED_EMBED_TTL_S:
+        return _saved_embed_cache["value"]
+    value = None
     try:
-        from backend.models import Setting, db
-        if db and Setting:
-            setting = db.session.get(Setting, "active_embedding_model")
-            if setting and setting.value:
-                _config_logger.info(f"Using user-selected embedding model: {setting.value}")
-                return setting.value
+        from sqlalchemy import create_engine, text
+        from sqlalchemy.pool import NullPool
+        if _saved_embed_engine is None:
+            _saved_embed_engine = create_engine(
+                DATABASE_URL, poolclass=NullPool, connect_args={"connect_timeout": 3},
+            )
+        with _saved_embed_engine.connect() as conn:
+            row = conn.execute(
+                text("SELECT value FROM settings WHERE key = :k"),
+                {"k": "active_embedding_model"},
+            ).first()
+        value = (row[0] or None) if row else None
     except Exception as e:
-        _config_logger.debug(f"DB not available for embedding model lookup: {e}")
+        _config_logger.debug(f"Saved embedding model not readable outside the app: {e}")
+    _saved_embed_cache.update(at=now, value=value)
+    return value
+
+
+def get_active_embedding_model() -> str:
+    # The model chosen in Settings wins, in every process. Then the env var
+    # (first boot, before anything is saved), then auto-selection.
+    try:
+        from flask import has_app_context
+        in_app = has_app_context()
+    except Exception:
+        in_app = False
+    if in_app:
+        try:
+            from backend.models import Setting, db
+            if db and Setting:
+                setting = db.session.get(Setting, "active_embedding_model")
+                if setting and setting.value:
+                    _config_logger.info(f"Using user-selected embedding model: {setting.value}")
+                    return setting.value
+        except Exception as e:
+            _config_logger.debug(f"DB not available for embedding model lookup: {e}")
+    else:
+        saved = _saved_embedding_model_outside_app()
+        if saved:
+            _config_logger.debug(f"Using saved embedding model (no app context): {saved}")
+            return saved
 
     # Env var override (useful when DB is not ready at startup)
     env_model = os.environ.get("GUAARDVARK_EMBEDDING_MODEL")
