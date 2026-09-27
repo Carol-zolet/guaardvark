@@ -536,6 +536,25 @@ class PluginManager:
             f"(it was started from another install), then start the plugin."
         )
     
+    def _install_root(self) -> str:
+        return os.path.realpath(str(self.registry.plugins_dir.parent))
+
+    def _runs_outside_install(self, pid: int) -> bool:
+        """True when ``pid``'s working directory is known and outside this install.
+
+        Plugins are started with their plugin folder as the working directory,
+        so a process whose cwd lies elsewhere was not started by this install:
+        a second checkout sharing the ports, or a service run by hand. When the
+        cwd cannot be read (no /proc, or a non-dumpable process) the answer is
+        False and the caller keeps its old behaviour.
+        """
+        try:
+            cwd = os.path.realpath(os.readlink(f"/proc/{pid}/cwd"))
+        except OSError:
+            return False
+        root = self._install_root()
+        return not (cwd == root or cwd.startswith(root + os.sep))
+
     def _kill_by_port(self, port: int):
         """Kill any process listening on the given port (orphan cleanup).
 
@@ -611,6 +630,13 @@ class PluginManager:
                         f"Refusing to kill PID {pid} on port {port} — it is the backend "
                         f"process (or a child of it). Plugin manifest likely declares a "
                         f"port that collides with FLASK_PORT. Fix the plugin.json port."
+                    )
+                    continue
+                if self._runs_outside_install(pid):
+                    logger.warning(
+                        f"Not killing PID {pid} on port {port}: it runs from outside this "
+                        f"install ({self._install_root()}). Another copy of Guaardvark, or a "
+                        f"service started by hand, is using the port."
                     )
                     continue
                 try:
