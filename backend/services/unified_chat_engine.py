@@ -2261,7 +2261,8 @@ class UnifiedChatEngine:
         if provider_context:
             context_parts.append(f"Current context:\n{provider_context}")
         if rag_context and not hold_rag_for_code:
-            context_parts.append(f"Relevant context from knowledge base:\n{rag_context}")
+            from backend.services.chat_prompt_blocks import CHAT_KB_CONTEXT_HEADER
+            context_parts.append(f"{CHAT_KB_CONTEXT_HEADER}\n{rag_context}")
         # Vision pipeline context (if active). Ask the plugin manager first so
         # we skip a 2-second HTTP probe on every chat when the plugin is off.
         try:
@@ -4903,9 +4904,13 @@ class UnifiedChatEngine:
             from backend.services.indexing_service import search_with_llamaindex
             project_id = getattr(self, '_project_id', None)
             results = search_with_llamaindex(query, project_id=project_id)
+            from backend.utils.reranker import drop_unrelated
+            results, dropped = drop_unrelated(results or [])
+            if dropped:
+                self._prov_note("rag_dropped_unrelated", dropped)
             chunks = []
             sources = []
-            for r in results or []:
+            for r in results:
                 source = r.get("metadata", {}).get("source_filename", "Unknown")
                 text = cut_on_whitespace(r.get("text", ""), 500)
                 chunks.append(f"[Source: {source}]\n{text}")
