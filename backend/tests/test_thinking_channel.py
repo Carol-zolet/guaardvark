@@ -336,3 +336,22 @@ class TestInlineReasoning:
         tokens = _tokens(events)
         assert not any(t.get("reset") for t in tokens)
         assert "".join(t["content"] for t in tokens) == INLINE_ANSWER
+
+
+class TestReasoningTagsFromTheRecord:
+    def test_the_engine_uses_the_models_declared_pairs(self, engine, monkeypatch):
+        from types import SimpleNamespace
+        import backend.services.model_capabilities as mc
+        monkeypatch.setattr(mc, "capabilities_for", lambda tag, **kw: SimpleNamespace(
+            reasoning_tags=(("Here is my thought process:", "Here is my response:"),)))
+
+        def chat(**_kw):
+            raw = f"Here is my thought process: {INLINE_REASONING} Here is my response: {INLINE_ANSWER}"
+            for piece in _chunked(raw):
+                yield {"message": {"content": piece}}
+            yield _done()
+
+        (content, _, _), events = _stream(engine, chat)
+        assert content == INLINE_ANSWER
+        assert _visible_after_resets(_tokens(events)).strip() == INLINE_ANSWER
+        assert INLINE_REASONING in engine._last_llm_call_meta["thinking"]
