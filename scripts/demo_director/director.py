@@ -194,6 +194,11 @@ def _narrate_kokoro(text: str, dest: Path) -> None:
 ALLOW_FALLBACK = os.environ.get("DEMO_ALLOW_FALLBACK") == "1"
 
 
+# Whether this run started Audio Foundry, so release_narrator stops only a
+# service the director brought up.
+_NARRATOR = {"started_here": False}
+
+
 def ensure_narrator_ready() -> None:
     """Hard preflight: the configured narrator engine must actually answer.
 
@@ -214,6 +219,7 @@ def ensure_narrator_ready() -> None:
             pass
         if attempt == 0:
             print("  narrator: audio_foundry down — starting the plugin…")
+            _NARRATOR["started_here"] = True
             try:
                 requests.post(f"{API}/api/plugins/audio_foundry/enable",
                               json={"enabled": True}, timeout=30)
@@ -230,6 +236,29 @@ def ensure_narrator_ready() -> None:
         f"narrator engine '{NARRATOR_ENGINE}' unavailable (audio_foundry not "
         "healthy on :8206) and DEMO_ALLOW_FALLBACK is not set — refusing to "
         "record with the wrong voice")
+
+
+def release_narrator() -> None:
+    """Give the card back before the takes record.
+
+    Qwen-Image-Edit asks for ~13 GB free on a 16 GB card, and Audio Foundry
+    holds ~1 GB even with its voice model unloaded, enough to keep every photo
+    take waiting on VRAM that never frees (Ep 19, 2026-09-27). A foundry this
+    run started is stopped; one that was already running only drops its voice
+    model. generate_narration starts it again for the end card.
+    """
+    if NARRATOR_ENGINE not in ("kokoro", "chatterbox"):
+        return
+    try:
+        if _NARRATOR["started_here"]:
+            r = requests.post(f"{API}/api/plugins/audio_foundry/stop", timeout=60)
+            _NARRATOR["started_here"] = False
+            print(f"  narrator: audio_foundry stopped for the takes (HTTP {r.status_code})")
+        else:
+            r = requests.post("http://127.0.0.1:8206/evict/voice", timeout=30)
+            print(f"  narrator: voice model unloaded for the takes (HTTP {r.status_code})")
+    except Exception as e:
+        print(f"  narrator: could not release the card: {e}")
 
 
 def _synth_one(text: str, dest: Path, voice: str) -> None:
@@ -287,6 +316,7 @@ def generate_narration(text, dest: Path, voice: str = "libritts",
     Engine per DEMO_NARRATOR: 'chatterbox' (series default — cloned female
     narrator) with automatic Piper fallback, or 'piper'.
     """
+    ensure_narrator_ready()      # cheap when up; brings the foundry back after release_narrator
     lines = [text] if isinstance(text, str) else list(text)
     workdir = dest.parent / f".{dest.stem}_parts"
     workdir.mkdir(parents=True, exist_ok=True)
@@ -873,6 +903,7 @@ class Episode:
             b.audio_path = self.dir / f"beat_{i:02d}_{b.name}.wav"
             b.audio_dur = generate_narration(b.narration, b.audio_path)
             print(f"  audio {b.name}: {b.audio_dur:.1f}s")
+        release_narrator()
         print(f"[{self.slug}] recording {len(self.beats)} beats…")
         for i, b in enumerate(self.beats):
             if i in reused:
