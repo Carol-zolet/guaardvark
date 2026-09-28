@@ -30,8 +30,8 @@ https://github.com/user-attachments/assets/c6d9d18b-cfff-4ae2-8220-dc7f329fee5d
 **The self-hosted AI studio.** Coding agents and 20-agent swarms in isolated git worktrees, screen agents with their own real desktop, self-tuning RAG, continuous voice chat — and a full media pipeline: video, image, full-song music, neural voice. One install, one GPU, everything on your machine. Your machine. Your data. Your rules.
 
 <p align="center">
-  <a href="https://www.youtube.com/watch?v=EP19_VIDEO_ID"><img src="https://img.youtube.com/vi/EP19_VIDEO_ID/maxresdefault.jpg" alt="Everything New in 2.9 — Guaardvark Ep 19" width="720"></a><br>
-  <b>▶ New: <a href="https://www.youtube.com/watch?v=EP19_VIDEO_ID">Everything new in 2.9, on the real product</a></b> (Episode 19, 3:50)<br>
+  <a href="https://www.youtube.com/watch?v=RSFDHY39lwI"><img src="https://img.youtube.com/vi/RSFDHY39lwI/maxresdefault.jpg" alt="Everything New in 2.9 — Guaardvark Ep 19" width="720"></a><br>
+  <b>▶ New: <a href="https://www.youtube.com/watch?v=RSFDHY39lwI">Everything new in 2.9, on the real product</a></b> (Episode 19, 3:50)<br>
   A thumbs up that teaches · web pages read for you · MCP tools used from chat · Hugging Face models checked before download · photo edits in chat · video with its own voice
 </p>
 
@@ -87,7 +87,7 @@ Short, unscripted-feeling screen recordings of the real system doing real work �
 | [![Local AI Music Video — Guaardvark Ep 8](https://img.youtube.com/vi/l2LqKA9GQDc/maxresdefault.jpg)](https://www.youtube.com/watch?v=l2LqKA9GQDc)<br>**Ep 8 — Music Video:** drop a song, get a film | [![Local AI Film Crew — Guaardvark Ep 9](https://img.youtube.com/vi/sq104u9N4Qg/maxresdefault.jpg)](https://www.youtube.com/watch?v=sq104u9N4Qg)<br>**Ep 9 — Film Crew:** script, cast, storyboard, cut |
 | [![The System That Fixes Itself — Guaardvark Ep 11](https://img.youtube.com/vi/7kHvi_2vT6U/maxresdefault.jpg)](https://www.youtube.com/watch?v=7kHvi_2vT6U)<br>**Ep 11 — Self-Repair:** it fixes its own code, behind a gate you control | [![Command Center — Guaardvark Ep 12](https://img.youtube.com/vi/A1-_ykcHOhQ/maxresdefault.jpg)](https://www.youtube.com/watch?v=A1-_ykcHOhQ)<br>**Ep 12 — Command Center:** see everything, gate everything, kill everything |
 | [![The New Front Door — Guaardvark Ep 13](https://img.youtube.com/vi/3-3XHJHHVmA/maxresdefault.jpg)](https://www.youtube.com/watch?v=3-3XHJHHVmA)<br>**Ep 13 — The New Front Door:** the Workspaces bar, and everything new since the first series | [![A Map of Everything — Guaardvark Ep 14](https://img.youtube.com/vi/yEy1tVKxsF0/maxresdefault.jpg)](https://www.youtube.com/watch?v=yEy1tVKxsF0)<br>**Ep 14 — System Map:** every module, drawn from its real imports; findings that carry their own fix |
-| [![Plug In Anything: MCP for Any Client — Guaardvark Ep 16](https://img.youtube.com/vi/1qc6GZBLy5k/maxresdefault.jpg)](https://www.youtube.com/watch?v=1qc6GZBLy5k)<br>**Ep 16 — MCP:** plug Guaardvark into any MCP client | [![Everything New in 2.9 — Guaardvark Ep 19](https://img.youtube.com/vi/EP19_VIDEO_ID/maxresdefault.jpg)](https://www.youtube.com/watch?v=EP19_VIDEO_ID)<br>**Ep 19 — What's New in 2.9:** teach it, point it at a page, plug in tools, edit photos, make video that talks |
+| [![Plug In Anything: MCP for Any Client — Guaardvark Ep 16](https://img.youtube.com/vi/1qc6GZBLy5k/maxresdefault.jpg)](https://www.youtube.com/watch?v=1qc6GZBLy5k)<br>**Ep 16 — MCP:** plug Guaardvark into any MCP client | [![Everything New in 2.9 — Guaardvark Ep 19](https://img.youtube.com/vi/RSFDHY39lwI/maxresdefault.jpg)](https://www.youtube.com/watch?v=RSFDHY39lwI)<br>**Ep 19 — What's New in 2.9:** teach it, point it at a page, plug in tools, edit photos, make video that talks |
 
 **[▶ Watch the full playlist](https://www.youtube.com/playlist?list=PLYycooXIy1Qs)** — Episode 1 (the full tour) and Episode 10 (the video editor) are on the way.
 
