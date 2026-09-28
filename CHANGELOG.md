@@ -1,5 +1,96 @@
 # Changelog
 
+## 2.9.2 — MCP tools in chat, video that starts its own engine, and answers instead of refusals
+
+- **MCP client, rebuilt on the official SDK.** One session per server with health pings, crash
+  detection and clean teardown; paginated tool catalogs that refresh on `list_changed`;
+  schema-validated arguments, `isError` handling, resources, prompts, an audit log, and each
+  server's stderr in `logs/mcp/<server>.log`. `data/config/mcp_servers.json` accepts the Claude
+  Desktop `mcpServers` shape. Only local stdio servers are accepted, and a server's process gets a
+  minimal environment (no database URL or API keys unless mapped).
+- **MCP tools are chat tools.** Each connected server's tools register as
+  `mcp__<server>__<tool>` with their real schemas. A tool the server policy gates (a destructive
+  hint, a mutating name, `confirmTools`) asks through the chat's approval card and refuses on any
+  path that did not ask; `denyTools` are never offered. Resources and prompts get their own tools.
+  A server entry can set `fixedArgs` (with `${VAR}` expansion) for a parameter such as a workspace
+  root, which the model is then never asked for. Proxy calls no longer pass the chat message and
+  project path to the server.
+- **Managing MCP servers.** A new MCP Servers page, linked from Settings → Agents, shows each
+  server's status, its tools and their policy, its stderr and recent activity, and adds, edits or
+  removes local servers. REST routes under `/api/automation/mcp/` and a `llx mcp client` command
+  group do the same; writes to the server config answer localhost or the API key only.
+- **Tool fixes and containment.** generate_bulk_csv uses the topic, row count and client it is
+  given and reports a failure instead of "queued"; media volume 0 sets the volume; gui_hotkey
+  takes "ctrl+c"; string parameters stay strings. system_command refuses `find -exec`/`-delete`
+  and credential files, generated file names stay inside the output folder, and tool output
+  reaching the model is capped. Settings → Agents → File access adds an opt-in "Project folder
+  only" switch for system_command and codegen. `GUAARDVARK_PROTECT_TOOL_ENDPOINTS=true` closes
+  `/api/automation/*` and `/api/tools/execute` to other hosts without the API key.
+- **Chat answers general questions.** With documents indexed, chat attached the top passages to
+  every question and refused whatever they did not answer. Passages the reranker rates unrelated
+  are now dropped (a floor of 0.30 for bge-reranker-v2-m3, measured; `GUAARDVARK_RAG_MIN_RERANK_SCORE`
+  overrides it), so "what is the capital of Australia?" gets "Canberra". Questions your files
+  answer still cite them.
+- **Reasoning goes to the Thinking card.** Models that write their reasoning into the answer
+  (lfm2.5, granite4.2) have it moved to the Thinking card, a lone `</think>` included. The tag
+  pairs (`<think>`, `<thinking>`, `<reason>`, `<reasoning>`, `<thought>`, `<|begin_of_thought|>`)
+  are data with per-model overrides, and a quoted tag stays in the text.
+- **Model capabilities come from Ollama.** One capability record per model, read from Ollama's
+  `/api/show`: an embedding model (bge-m3) is never picked as the chat model, qwen3-embedding is
+  not sent `think:false`, and an embedding model's width is read from the model.
+- **Web pages are read where the answer is.** fetch_url and analyze_website with a question take
+  the passage its rarer words point to. "What does an aardvark eat" on the Wikipedia page opens at
+  Feeding instead of the reference list; on 14 questions over five pages the answering sentence
+  is in the excerpt for 10, against 5.
+- **Photo edits in chat.** An edit, outpaint or likeness request made while the GPU is busy waits
+  up to 600 s with a status line (Stop cancels) instead of refusing. The message after a photo is
+  sent instead of opening the upload dialog. "Put this person in <place>" keeps a person in the
+  scene. The likeness consent card renders on the direct path, tool cards show paths relative to
+  the checkout (live and after a reload), and approval cards and in-progress replies use the
+  theme's primary colour instead of error red.
+- **Video renders start ComfyUI themselves.** Queuing a video from Video Gen, chat, MCP, a music
+  video or the Film Crew starts ComfyUI when it is all the render lacks
+  (`GUAARDVARK_PLUGIN_AUTO_ORCHESTRATOR=0` keeps the old error). A finished render's job ends
+  complete instead of sitting at 99% and being reported later as stalled.
+- **Video limits in data, failures by name, frames checked.** Per-model render limits (canvas,
+  frames, steps, guidance, fps, VRAM floor, attention pin) are registry data enforced in one
+  place; `GUAARDVARK_VIDEO_STRICT_LIMITS=1` enforces the rest. A request that names no guidance
+  renders at the model's own template value instead of 7.5 (LTX 1, Wan 14B 3.5, Wan 5B 5,
+  Hunyuan 6, CogVideoX 6); at 7.5 LTX rendered posterised noise. A failed render carries a kind,
+  a label and a next step in the status JSON, MCP, the Studio card and the Jobs page, and a
+  ComfyUI error names the failing node. Finished clips are checked frame by frame for black
+  frames, blown highlights, washed-out colour, wrong size and wrong length, flagged on the card.
+- **Video fixes.** CogVideoX T2V and I2V are admitted on a 16 GB card, render after other jobs,
+  take a typed negative prompt, and skip the live preview their wrapper crashed. LTX 2.5 snaps to
+  the 64 px grid its output lands on. A LoRA at strength 0 loads at 0. A MiniMax H3 render with
+  12 or more guides and a user LoRA builds a valid graph. Workflow contract tests check every
+  family's graph against a ComfyUI node snapshot in CI, and `scripts/video_smoke.py` renders one
+  short clip per installed model.
+- **Add new model.** The Hugging Face lookup files each model under its own family (Wan 5B,
+  Hunyuan, CogVideoX and repo roots were read as Wan 14B), suggests the 5B for a Wan 2.2 5B LoRA,
+  and refuses Mochi and LTX-Video 0.9 by name.
+- **Cast Library.** Cast LoRAs are on ComfyUI's LoRA search path, so FLUX and SDXL characters
+  render. FLUX characters sample at FLUX's 28 steps and guidance 3.5, and Image Gen locks steps,
+  guidance and quality while a character is selected. Image model limits are registry data
+  (`GUAARDVARK_IMAGE_STRICT_LIMITS=1` applies the rest).
+- **Indexing uses the model chosen in Settings.** Celery workers and scripts embed with the
+  Settings embedding model instead of the `.env` one, so switching models and re-indexing takes
+  effect.
+- **Screen agent.** Every screen task is recorded as an episode (`agent_task_runs`,
+  `agent_task_steps`, created at boot; read-only routes under `/api/agent-control/runs`). The model
+  sees every step of the task, not the last three. The loop stops when progress stops (four steps
+  with no new target and no visible change), with 40 steps and 480 s as the floor instead of a
+  fixed 15 and 120 s. "Done" needs a click that changed the screen, a click with no visible change
+  is shown as such, and a click limit stated in the task holds. A model that sees but points
+  badly borrows a measured eye, and the correction loop clicks its answer for eyes measured to
+  judge well.
+- **GPU and plugins.** A cancelled batch leaves the GPU wait at once, a crashed plugin reads as
+  stopped, and a lease left from before a reboot is released. Orphan cleanup only kills processes
+  started from this install, so a second checkout's services are left alone.
+  `GUAARDVARK_JOB_SERVICE_START=1` (off by default) lets image, audio and upscale jobs start their
+  service too.
+- **Dependencies.** jsonschema >= 4.20.
+
 ## 2.9.1 — Local-only chat, feedback that teaches, and a start that works offline
 
 - **Chat is local-only again.** The dormant Mistral cloud provider, the `cloud_models_enabled`
