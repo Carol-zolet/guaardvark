@@ -1224,7 +1224,16 @@ Generate the CSV row now:"""
             # Handle variable field counts by mapping to expected positions
             # Expected order: id, title, content, excerpt, category, tags, slug, meta_description
             def safe_get_field(index: int, default: str = "") -> str:
-                return fields[index].strip() if index < len(fields) else default
+                if index >= len(fields):
+                    return default
+                value = fields[index].strip()
+                # Models often double the quotes around short fields (""Support
+                # Planning""). Remove quotes only in wrapping pairs, so a title that
+                # merely starts or ends with a quotation keeps it. The HTML content
+                # (index 2) is left alone.
+                while index != 2 and len(value) >= 2 and value[0] == '"' and value[-1] == '"':
+                    value = value[1:-1].strip()
+                return value
 
             # Generate missing fields if needed
             # FIX BUG #13: Ensure time module is available
@@ -2535,15 +2544,13 @@ Generate the CSV row now:"""
         active_rows = self.row_tracker.get_active_rows_ordered()
         self._log_info(f"Generation complete: {len(active_rows)} active rows")
 
-        # Prepare rows for CSV writing
+        # Prepare rows for CSV writing. Tracking ids live in the tracking file; the
+        # CSV keeps exactly the seven WordPress import columns _validate_csv_file
+        # checks for (extra keys became extra columns and failed every job).
         all_content_rows = []
         for record in active_rows:
             if record.current_row_data:
-                # Add tracking ID to metadata
-                row_copy = record.current_row_data.copy()
-                row_copy['_tracking_id'] = record.unique_id
-                row_copy['_tracking_sequence'] = record.sequence_number
-                all_content_rows.append(row_copy)
+                all_content_rows.append(record.current_row_data.copy())
 
         # Update tracking data with final results
         # Use stored job parameters or extract from tasks as fallback

@@ -10,244 +10,143 @@ import os
 import re
 from pathlib import Path
 from typing import Any, Optional
-from datetime import datetime
 
 from backend.services.agent_tools import BaseTool, ToolParameter, ToolResult
-from backend.utils.backend_http import is_mcp_transport, run_tool_in_backend
+from backend.utils.backend_http import is_mcp_transport
 
 from backend.utils.path_safety import safe_join
 logger = logging.getLogger(__name__)
 
 
 class BulkCSVGeneratorTool(BaseTool):
-    """
-    High-performance batch CSV generation for hundreds of pages.
-    Converted from /batchcsv command rule (rule ID: 7).
-
-    Supports concurrent processing, resume capability, and intelligent parameter extraction.
-    """
+    """Start a Studio bulk job that writes a WordPress import CSV, one page per row."""
 
     name = "generate_bulk_csv"
     read_only = False
-    # Small jobs write OUTPUT_DIR/csv/<filename>, replacing a file of that name.
-    destructive = True
-    description = "Generate bulk CSV files with hundreds of pages efficiently using concurrent processing"
+    # Adds a new file; the Studio job never overwrites (it picks a unique name).
+    destructive = False
+    description = (
+        "Start a background job (the Studio's Bulk Generation job) that writes a WordPress import CSV "
+        "with Guaardvark's local LLM: a header row, then one page per row with ID, Title, Content "
+        "(HTML), Excerpt, Category, Tags, slug. Row N is about '<topic> - Part N' (with quantity 1, the "
+        "topic itself). When client matches a client saved in Guaardvark, its saved details go into "
+        "the prompt. Returns at once with job_id and the file's path in the outputs folder; if that "
+        "name is taken when the job starts, a -001 style suffix is added. Rows are generated one at a "
+        "time and the file is written when the job ends; each model call can take up to 180 s and a "
+        "row that fails is regenerated. Poll get_generation_status with job_id; 'complete' reports "
+        "how many rows the file holds. For one page returned as text use generate_wordpress_content "
+        "or generate_enhanced_wordpress_content; for a table of arbitrary data, generate_csv."
+    )
 
     parameters = {
         "filename": ToolParameter(
             name="filename",
             type="string",
             required=True,
-            description="Output CSV filename (e.g., 'output.csv')"
+            description="Plain file name for the CSV, e.g. 'spring-pages.csv' (no folders). Unsafe characters are replaced; if the name is taken, a unique one is used and returned."
         ),
         "quantity": ToolParameter(
             name="quantity",
             type="int",
             required=True,
-            description="Number of CSV entries/pages to generate (50-1000+)"
+            minimum=1,
+            maximum=5000,
+            description="How many pages (rows) to write, 1-5000. With 1 the topic is used as is; otherwise row N is about '<topic> - Part N'."
         ),
         "topic": ToolParameter(
             name="topic",
             type="string",
             required=True,
-            description="Main topic or subject for content generation"
+            description="What the pages are about, e.g. 'gutter maintenance'."
         ),
         "client": ToolParameter(
             name="client",
             type="string",
             required=False,
-            description="Client name for personalized content",
+            description="Company the pages are for (default 'Professional Services'). Matched case-insensitively to clients saved in Guaardvark; a match adds its saved details to the prompt.",
+            default=""
+        ),
+        "website": ToolParameter(
+            name="website",
+            type="string",
+            required=False,
+            description="The company's website, e.g. 'example.com' (default 'website.com'); given to the model and used in the row IDs.",
+            default=""
+        ),
+        "project": ToolParameter(
+            name="project",
+            type="string",
+            required=False,
+            description="Project name given to the model (default 'Content Generation').",
             default=""
         ),
         "word_count": ToolParameter(
             name="word_count",
             type="int",
             required=False,
-            description="Target word count per entry",
+            minimum=100,
+            description="Words of HTML content the model is asked for per page (default 600). An instruction, not enforced: only pages under about 30 words are regenerated.",
             default=600
         ),
-        "project_id": ToolParameter(
-            name="project_id",
-            type="int",
-            required=False,
-            description="Project ID for RAG context",
-            default=None
-        ),
-        "concurrent_workers": ToolParameter(
-            name="concurrent_workers",
-            type="int",
-            required=False,
-            description="Number of concurrent generation workers",
-            default=5
-        )
     }
 
-    def __init__(self):
-        super().__init__()
-        self._generator = None
-
-    def _get_generator(self):
-        """Lazy load bulk CSV generator"""
-        if self._generator is None:
-            try:
-                from backend.utils.bulk_csv_generator import BulkCSVGenerator
-                self._generator = BulkCSVGenerator()
-            except Exception as e:
-                logger.error(f"Failed to initialize BulkCSVGenerator: {e}")
-                raise
-        return self._generator
-
     def execute(self, **kwargs) -> ToolResult:
-        """Start bulk CSV generation job"""
-        if is_mcp_transport(self):
-            # The generation services read Flask config and the database, so the job runs in the backend.
-            return run_tool_in_backend(self.name, kwargs)
-        filename = kwargs.get("filename")
-        quantity = kwargs.get("quantity")
-        topic = kwargs.get("topic")
-        client = kwargs.get("client", "")
-        word_count = kwargs.get("word_count", 600)
-        project_id = kwargs.get("project_id")
-        concurrent_workers = kwargs.get("concurrent_workers", 5)
-
+        filename = str(kwargs.get("filename") or "").strip()
+        topic = str(kwargs.get("topic") or "").strip()
         try:
-            # Validate parameters
+            quantity = int(kwargs.get("quantity"))
+        except (TypeError, ValueError):
+            return ToolResult(success=False, error="quantity must be a whole number from 1 to 5000")
+        if not 1 <= quantity <= 5000:
+            return ToolResult(success=False, error="quantity must be from 1 to 5000")
+        if not filename or not topic:
+            return ToolResult(success=False, error="filename and topic are required")
+        if "/" in filename or "\\" in filename or filename.startswith("."):
+            return ToolResult(success=False, error=f"filename must be a plain file name like 'pages.csv', not '{filename}'")
+
+        payload = {
+            "output_filename": filename,
+            "num_items": quantity,
+            "topics": [topic] if quantity == 1 else [f"{topic} - Part {i}" for i in range(1, quantity + 1)],
+            "target_word_count": int(kwargs.get("word_count") or 600),
+        }
+        for key in ("client", "website", "project"):
+            value = str(kwargs.get(key) or "").strip()
+            if value:
+                payload[key] = value
+
+        from flask import has_app_context
+        if is_mcp_transport(self) or not has_app_context():
+            from backend.utils.backend_http import BackendError, request_json
             try:
-                quantity = int(quantity)
-            except (TypeError, ValueError):
-                return ToolResult(success=False, error="quantity must be a whole number")
-            if quantity < 1:
-                return ToolResult(
-                    success=False,
-                    error="Quantity must be at least 1"
-                )
+                reply = request_json("POST", "/api/bulk-generate/csv", payload=payload)
+            except BackendError as e:
+                return ToolResult(success=False, error=str(e))
+            body, status = reply.body or {}, reply.status
+        else:
+            from backend.api.bulk_generation_api import start_bulk_csv_job
+            response = start_bulk_csv_job(payload)
+            flask_response, status = response if isinstance(response, tuple) else (response, response.status_code)
+            body = flask_response.get_json(silent=True) or {}
+        if status >= 400 or not body.get("job_id"):
+            return ToolResult(success=False, error=body.get("error") or f"The bulk job did not start (HTTP {status})")
 
-            if quantity > 5000:
-                return ToolResult(
-                    success=False,
-                    error="Quantity cannot exceed 5000 per job for performance reasons"
-                )
-
-            # Generate unique job ID
-            import uuid
-            job_id = f"bulk_{uuid.uuid4().hex[:8]}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-
-            # Determine output path
-            from backend.config import OUTPUT_DIR
-            output_dir = os.path.join(OUTPUT_DIR, "csv")
-            os.makedirs(output_dir, exist_ok=True)
-            try:
-                output_path = safe_join(output_dir, filename)
-            except ValueError:
-                return ToolResult(success=False, error=f"Invalid filename: {filename}")
-
-            unified_error = None
-            # Try to use the unified file generation service first
-            try:
-                from backend.services.unified_file_generation import (
-                    UnifiedFileGenerationService,
-                    GenerationRequest,
-                    GenerationType
-                )
-
-                service = UnifiedFileGenerationService()
-                request = GenerationRequest(
-                    generation_type=GenerationType.CSV_BULK,
-                    output_filename=filename,
-                    # Keys as read by UnifiedFileGenerationService._handle_csv_bulk:
-                    # one topic per row, word count as target_word_count, client
-                    # in context_variables.
-                    content_spec={
-                        "topics": [topic] if quantity == 1 else
-                                  [f"{topic} - Part {i}" for i in range(1, quantity + 1)],
-                        "target_word_count": word_count,
-                        "concurrent_workers": concurrent_workers,
-                    },
-                    context_variables={
-                        "client": client or "Client",
-                        "project_id": str(project_id) if project_id else "",
-                    }
-                )
-
-                result = service.generate(request)
-
-                if result.success:
-                    return ToolResult(
-                        success=True,
-                        output={
-                            "job_id": result.job_id or job_id,
-                            "output_path": result.output_path or output_path,
-                            "status": "started",
-                            "message": f"Bulk CSV generation started for {quantity} entries"
-                        },
-                        metadata={
-                            "quantity": quantity,
-                            "topic": topic,
-                            "client": client,
-                            "filename": filename
-                        }
-                    )
-                unified_error = result.error or "unknown error"
-                logger.warning(f"Unified bulk generation failed: {unified_error}")
-
-            except Exception as e:
-                unified_error = str(e)
-                logger.warning(f"Unified service failed, falling back to direct generation: {e}")
-
-            # Fallback: Direct generation for smaller batches
-            if quantity <= 10:
-                # For small quantities, generate inline
-                from backend.tools.content_tools import WordPressContentTool
-                tool = WordPressContentTool()
-
-                rows = []
-                for i in range(1, quantity + 1):
-                    result = tool.execute(
-                        client=client,
-                        topic=f"{topic} - Part {i}",
-                        row_id=i,
-                        word_count=word_count
-                    )
-                    if result.success:
-                        rows.append(result.output)
-
-                # Write to file
-                with open(output_path, 'w', encoding='utf-8') as f:
-                    f.write('\n'.join(rows))
-
-                return ToolResult(
-                    success=True,
-                    output={
-                        "job_id": job_id,
-                        "output_path": output_path,
-                        "status": "completed",
-                        "rows_generated": len(rows),
-                        "message": f"Generated {len(rows)} CSV rows"
-                    },
-                    metadata={
-                        "quantity": quantity,
-                        "topic": topic,
-                        "client": client
-                    }
-                )
-
-            # Larger jobs need the bulk generator; nothing is queued in the
-            # background here, so report the failure instead of a fake "queued".
-            return ToolResult(
-                success=False,
-                error=(
-                    f"Bulk generation of {quantity} rows failed ({unified_error}). "
-                    f"Try 10 rows or fewer, or use the Bulk Generation page."
-                ),
-                metadata={"quantity": quantity, "topic": topic, "filename": filename},
-            )
-
-        except Exception as e:
-            logger.error(f"Bulk CSV generation failed: {e}", exc_info=True)
-            return ToolResult(
-                success=False,
-                error=f"Bulk generation failed: {str(e)}"
-            )
+        output_name = body.get("output_filename") or filename
+        from backend.config import GUAARDVARK_ROOT, OUTPUT_DIR
+        out_dir = Path(OUTPUT_DIR).resolve()
+        root = Path(GUAARDVARK_ROOT).resolve()
+        shown_dir = out_dir.relative_to(root).as_posix() if out_dir.is_relative_to(root) else str(out_dir)
+        return ToolResult(
+            success=True,
+            output={
+                "job_id": body["job_id"],
+                "status": "processing",
+                "rows": quantity,
+                "output_file": f"{shown_dir}/{output_name}",
+                "next": "Poll get_generation_status with this job_id; the file is complete when it reports complete.",
+            },
+            metadata={"quantity": quantity, "topic": topic, "filename": output_name},
+        )
 
 
 class FileGeneratorTool(BaseTool):

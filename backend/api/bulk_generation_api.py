@@ -553,9 +553,14 @@ def generate_bulk_csv():
     Generate bulk CSV content based on topics and specifications
     Database-free version to avoid transaction issues
     """
+    return start_bulk_csv_job(request.get_json(silent=True))
 
+
+def start_bulk_csv_job(data):
+    """Start a background bulk CSV job from the fields the /csv route takes and
+    return that route's response. Needs an app context; the generate_bulk_csv
+    chat tool calls it in-process."""
     try:
-        data = request.get_json()
         if not data:
             return jsonify({"error": "Request body must be JSON."}), 400
 
@@ -839,9 +844,11 @@ def generate_bulk_csv():
         # Log task creation
         logger.info(f"Created {len(tasks)} enhanced generation tasks with prompt rule integration")
 
-        # Simple job ID without database
+        # Simple job ID without database. Seconds alone collide when two jobs start
+        # together (chat can run tools in parallel), so a short random suffix follows.
         import time
-        job_id = f"bulk_gen_{int(time.time())}"
+        import uuid
+        job_id = f"bulk_gen_{int(time.time())}_{uuid.uuid4().hex[:6]}"
         logger.info(f"Starting bulk CSV generation. Job ID: {job_id}")
         
         # Use existing task or create new database Task for job management
@@ -934,7 +941,9 @@ def generate_bulk_csv():
             'concurrent_workers': concurrent_workers,
             'batch_size': batch_size,
             'insert_content': insert_content,
-            'insert_position': insert_position
+            'insert_position': insert_position,
+            # Lets a status check find the file after the in-memory job is gone.
+            'output_filename': secure_output_filename,
         }
 
         # Create enhanced generator with prompt rule integration and progress tracking
@@ -964,6 +973,8 @@ def generate_bulk_csv():
                     "client": client,
                     "project": project,
                     "website": website,
+                    "output_filename": secure_output_filename,
+                    "num_items": len(tasks),
                     "target_word_count": target_word_count,
                     "concurrent_workers": concurrent_workers,
                     "batch_size": batch_size,
@@ -1503,6 +1514,8 @@ def get_generation_status(job_id):
                 "process_type": process.process_type.value,
                 "timestamp": process.timestamp.isoformat()
             },
+            "output_filename": (process.additional_data or {}).get("output_filename"),
+            "num_items": (process.additional_data or {}).get("num_items"),
             "task_status": {
                 "id": task.id if task else None,
                 "status": task.status if task else "UNKNOWN",
