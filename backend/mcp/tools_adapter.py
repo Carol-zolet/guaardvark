@@ -324,10 +324,16 @@ async def _await_result(task: asyncio.Future, name: str, timeout: float, read_on
         rec["error_code"] = "tool_failed"
 
     payload = getattr(tool_result, "output", tool_result)
-    if not success and payload in (None, ""):
-        # A failed ToolResult carries its reason in ``error``; without
-        # this the client saw "(no output)" and nothing to act on.
-        payload = getattr(tool_result, "error", None) or "Tool failed without a message."
+    if not success:
+        # A failed ToolResult carries its reason in ``error``; lead with it, then
+        # any output the tool attached, so the client always sees why.
+        error = getattr(tool_result, "error", None)
+        if payload in (None, ""):
+            payload = error or "Tool failed without a message."
+        elif error and error != payload:
+            blocks = [mcp_types.TextContent(type="text", text=str(error))] + _content_blocks_from_result(payload)
+            rec["bytes_out"] = sum(len(getattr(b, "text", "")) for b in blocks)
+            return mcp_types.CallToolResult(content=blocks, is_error=True)
     blocks = _content_blocks_from_result(payload)
     rec["bytes_out"] = sum(len(getattr(b, "text", "")) for b in blocks)
     return mcp_types.CallToolResult(content=blocks, is_error=not success)
@@ -434,6 +440,9 @@ def build_tool_handlers(config: MCPConfig) -> tuple[Any, Any, int]:
                     msg += f"\nSuggestion: {suggestion}"
                 return _error_result(msg)
 
+            # Validation already treats a null as an omitted optional argument;
+            # drop it so the tool's own default applies rather than None.
+            arguments = {k: v for k, v in arguments.items() if v is not None}
             # Tools run inside this MCP server process, not inside the backend.
             # Tell them so: a tool that needs the backend calls it over HTTP.
             base_tool.set_context({"transport": "mcp"})
