@@ -5,7 +5,7 @@ import { useUnifiedProgress } from '../contexts/UnifiedProgressContext';
 import {
   Box, Tabs, Tab, Typography, Button, TextField, Card, CardMedia, CardContent,
   CardActions, Chip, CircularProgress, Alert, Dialog, DialogTitle, DialogContent,
-  DialogActions, Grid, IconButton, Tooltip, Divider, Link, LinearProgress,
+  DialogActions, Grid, IconButton, Tooltip, Divider, Link, LinearProgress, MenuItem,
 } from '@mui/material';
 import ArrowBackIcon from '@mui/icons-material/ArrowBack';
 import AutoAwesomeIcon from '@mui/icons-material/AutoAwesome';
@@ -18,7 +18,7 @@ import CloseIcon from '@mui/icons-material/Close';
 import {
   getCastSubject, getCastSubjectDetail, updateCastSubject, planCharacter, rebuildBibleFromRefs,
   generateSamples, cancelGenerateSamples, listSamples, regenerateSample, approveSamples,
-  deleteSample, trainSubject, cancelTrainSubject,
+  deleteSample, trainSubject, cancelTrainSubject, importSubjectLora,
 } from '../api/productionService';
 import { SubjectThumb } from '../components/filmcrew/CastLibraryView';
 import DragDropImageUpload from '../components/filmcrew/DragDropImageUpload';
@@ -120,6 +120,35 @@ const CastMemberPage = () => {
   const [regenTarget, setRegenTarget] = useState(null); // sample being regenerated
   const [regenPrompt, setRegenPrompt] = useState('');
   const [lightboxIdx, setLightboxIdx] = useState(null); // open enlarged viewer at this samples[] index
+
+  // Import LoRA (externally-trained checkpoint attached to this Subject)
+  const [importOpen, setImportOpen] = useState(false);
+  const [importFile, setImportFile] = useState(null);
+  const [importBaseModel, setImportBaseModel] = useState('zimage-turbo');
+  const [importTrigger, setImportTrigger] = useState('');
+  const [importBusy, setImportBusy] = useState(false);
+  const [importError, setImportError] = useState(null);
+
+  const submitImportLora = async () => {
+    if (!importFile || !importTrigger.trim()) return;
+    setImportBusy(true);
+    setImportError(null);
+    try {
+      const res = await importSubjectLora(subject.id, {
+        file: importFile,
+        baseModelId: importBaseModel,
+        triggerWord: importTrigger.trim(),
+      });
+      setSubject(res.subject);
+      setImportOpen(false);
+      setImportFile(null);
+      setImportTrigger('');
+    } catch (e) {
+      setImportError(formatUiError(e.response?.data?.error) || 'Import failed.');
+    } finally {
+      setImportBusy(false);
+    }
+  };
 
   // Local state to surface training progress from unified jobs (so frontend "knows"
   // when GPU is crunching on long LoRA train, even if subject poll lags or health/celery 503s).
@@ -1100,6 +1129,16 @@ const CastMemberPage = () => {
           <Typography variant="body2" sx={{ wordBreak: 'break-all' }}>
             Path: {subject.lora_path || <em>none yet</em>}
           </Typography>
+          <Box sx={{ mt: 1.5 }}>
+            <Button size="small" variant="outlined" onClick={() => setImportOpen(true)}>
+              Import LoRA
+            </Button>
+            {subject.lora_path && (
+              <Typography variant="caption" color="text.secondary" sx={{ ml: 1.5 }}>
+                Importing replaces the current LoRA with a new version.
+              </Typography>
+            )}
+          </Box>
           {subject.training_status === 'trained' && (
             <Box sx={{ mt: 2 }}>
               <Typography variant="body2" color="text.secondary">Use this character in:</Typography>
@@ -1124,6 +1163,42 @@ const CastMemberPage = () => {
         <DialogActions>
           <Button onClick={() => setRegenTarget(null)}>Cancel</Button>
           <Button variant="contained" onClick={submitRegen}>Regenerate</Button>
+        </DialogActions>
+      </Dialog>
+
+      {/* Import LoRA dialog */}
+      <Dialog open={importOpen} onClose={() => !importBusy && setImportOpen(false)} maxWidth="sm" fullWidth>
+        <DialogTitle>Import LoRA</DialogTitle>
+        <DialogContent>
+          <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
+            Attach a LoRA checkpoint trained outside Guaardvark (Ostris AI-Toolkit, kohya,
+            or diffusers/PEFT). Only Z-Image Turbo and FLUX.1 Dev layouts are supported.
+          </Typography>
+          {importError && <Alert severity="error" sx={{ mb: 2 }}>{importError}</Alert>}
+          <TextField
+            select fullWidth label="Base model" value={importBaseModel} sx={{ mb: 2 }}
+            onChange={(e) => setImportBaseModel(e.target.value)}
+          >
+            <MenuItem value="zimage-turbo">Z-Image Turbo</MenuItem>
+            <MenuItem value="flux-dev">FLUX.1 Dev</MenuItem>
+          </TextField>
+          <TextField
+            fullWidth label="Trigger word" value={importTrigger} sx={{ mb: 2 }}
+            onChange={(e) => setImportTrigger(e.target.value)}
+            helperText="The token this LoRA was trained on (e.g. caroline_1)."
+          />
+          <Button variant="outlined" component="label">
+            {importFile ? importFile.name : 'Choose .safetensors file'}
+            <input type="file" hidden accept=".safetensors"
+                   onChange={(e) => setImportFile(e.target.files?.[0] || null)} />
+          </Button>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setImportOpen(false)} disabled={importBusy}>Cancel</Button>
+          <Button variant="contained" onClick={submitImportLora}
+                  disabled={importBusy || !importFile || !importTrigger.trim()}>
+            {importBusy ? 'Importing…' : 'Import'}
+          </Button>
         </DialogActions>
       </Dialog>
 
