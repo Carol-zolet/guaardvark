@@ -1227,12 +1227,14 @@ Generate the CSV row now:"""
                 if index >= len(fields):
                     return default
                 value = fields[index].strip()
-                # Models often double the quotes around short fields (""Support
-                # Planning""). Remove quotes only in wrapping pairs, so a title that
-                # merely starts or ends with a quotation keeps it. The HTML content
-                # (index 2) is left alone.
-                while index != 2 and len(value) >= 2 and value[0] == '"' and value[-1] == '"':
-                    value = value[1:-1].strip()
+                # Models often wrap short fields in extra quotes (""Support Planning"").
+                # Strip them only when the field starts and ends with quotes and no
+                # quote is left inside, so '"Best" Tips and "Tricks"' keeps its
+                # quotations. The HTML content (index 2) is left alone.
+                core = value.strip('"').strip()
+                if (index != 2 and len(value) >= 2 and value[0] == '"' and value[-1] == '"'
+                        and '"' not in core):
+                    value = core
                 return value
 
             # Generate missing fields if needed
@@ -2546,7 +2548,7 @@ Generate the CSV row now:"""
 
         # Prepare rows for CSV writing. Tracking ids live in the tracking file; the
         # CSV keeps exactly the seven WordPress import columns _validate_csv_file
-        # checks for (extra keys became extra columns and failed every job).
+        # checks for, since any extra key would become an extra column.
         all_content_rows = []
         for record in active_rows:
             if record.current_row_data:

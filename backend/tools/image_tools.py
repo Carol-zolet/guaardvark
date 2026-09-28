@@ -617,17 +617,18 @@ class GenerationStatusTool(BaseTool):
     idempotent = True
     description = (
         "Report the state of a queued generation: an image batch (ImageBatch_...) from "
-        "generate_image with wait_for_result=false or the batch image route, a video batch "
+        "generate_image with wait_for_result=false or started in the Studio, a video batch "
         "from generate_video, or a bulk CSV job (bulk_gen_...) from generate_bulk_csv. Returns "
         "status, progress while running, and each finished file (URL for images and video; for a "
         "CSV, its path and how many rows it holds). Use after a queued generate call, or when the "
-        "user asks whether a render is done."
+        "user asks whether a render is done. Read-only; an unknown id is an error, and so is a "
+        "backend that does not answer (over MCP the backend must be running)."
     )
     parameters = {
         "batch_id": ToolParameter(
             name="batch_id",
             type="string",
-            description="The id a generate tool returned, e.g. ImageBatch_09-11-2026_132620_013 or bulk_gen_1790556697.",
+            description="The id a generate tool returned, e.g. ImageBatch_09-11-2026_132620_013 or bulk_gen_1790556697_3fa2c1.",
             required=True,
         ),
     }
@@ -779,7 +780,8 @@ class GenerationStatusTool(BaseTool):
                 files = [{"url": shown}]
                 message = f"{rows} row(s) written" + (f" of {target_rows} asked for" if target_rows else "")
             else:
-                status, message = "error", "The job ended but its CSV is missing (it failed validation and was removed)."
+                status, message = "error", ("The job ended but its CSV is not in the outputs folder; a CSV that "
+                                            "fails validation is removed, and the Bulk Generation page shows why.")
         return {
             "kind": "bulk CSV", "batch_id": job_id, "status": status,
             "progress": progress.get("progress"), "message": message,
@@ -803,9 +805,11 @@ class GenerationStatusTool(BaseTool):
         name = (meta.get("job_parameters") or {}).get("output_filename")
         if meta.get("status") == "completed":
             return cls._bulk_info(job_id, {"status": "complete", "progress": 100}, name, meta.get("target_row_count"))
-        return cls._bulk_info(job_id, {"status": "error", "message": (
+        info = cls._bulk_info(job_id, {"status": "error", "message": (
             "The job stopped before finishing (the backend may have restarted); "
             "see the Bulk Generation page.")}, None)
+        info["stopped"] = True
+        return info
 
     @classmethod
     def _bulk_status(cls, job_id: str):
@@ -838,6 +842,7 @@ class GenerationStatusTool(BaseTool):
         if not batch_id:
             return ToolResult(success=False, error="batch_id is required")
         info = None
+        unreachable = None
         remote = self._context.get("transport") == "mcp"
         readers = (
             (self._bulk_status_http, self._bulk_status_tracking, self._image_status_http, self._video_status_http)
@@ -851,14 +856,22 @@ class GenerationStatusTool(BaseTool):
                 continue
             except Exception as e:
                 logger.warning("get_generation_status %s via %s: %s", batch_id, reader.__name__, e)
+                if reader.__name__.endswith("_http"):
+                    unreachable = unreachable or e
                 continue
             if info is not None:
                 break
+        # Without an answer from the backend a live job cannot be told from a lost one,
+        # so neither "stopped" nor "no such batch" is reported.
+        if unreachable is not None and (info is None or info.get("stopped")):
+            return ToolResult(success=False, error=(
+                f"Could not read {batch_id}: the Guaardvark backend did not answer ({unreachable}). "
+                "Try again shortly."))
         if info is None:
             return ToolResult(success=False, error=f"No image, video or bulk CSV batch named {batch_id}")
         total = info.get("total")
         done = info.get("completed") or 0
-        head = f"{info['kind'].title()} batch {batch_id}: {info['status']}"
+        head = f"{info['kind'][0].upper()}{info['kind'][1:]} batch {batch_id}: {info['status']}"
         if total:
             head += f" ({done}/{total} finished"
             if info.get("failed"):
@@ -867,6 +880,8 @@ class GenerationStatusTool(BaseTool):
         lines = [head]
         for f in info["files"]:
             lines.append(f"File: {f['url']}")
+            if info["kind"] == "bulk CSV" and info.get("message"):
+                lines.append(info["message"])
             if info["kind"] == "image":
                 lines.append(f"Steps: {f.get('steps') if f.get('steps') is not None else 'unknown'}")
                 if f.get("steps_notice"):

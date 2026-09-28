@@ -23,19 +23,22 @@ class BulkCSVGeneratorTool(BaseTool):
 
     name = "generate_bulk_csv"
     read_only = False
-    # Adds a new file; the Studio job never overwrites (it picks a unique name).
+    # Adds a new file under a name that no file and no running bulk job holds.
     destructive = False
     description = (
         "Start a background job (the Studio's Bulk Generation job) that writes a WordPress import CSV "
         "with Guaardvark's local LLM: a header row, then one page per row with ID, Title, Content "
         "(HTML), Excerpt, Category, Tags, slug. Row N is about '<topic> - Part N' (with quantity 1, the "
         "topic itself). When client matches a client saved in Guaardvark, its saved details go into "
-        "the prompt. Returns at once with job_id and the file's path in the outputs folder; if that "
-        "name is taken when the job starts, a -001 style suffix is added. Rows are generated one at a "
-        "time and the file is written when the job ends; each model call can take up to 180 s and a "
-        "row that fails is regenerated. Poll get_generation_status with job_id; 'complete' reports "
-        "how many rows the file holds. For one page returned as text use generate_wordpress_content "
-        "or generate_enhanced_wordpress_content; for a table of arbitrary data, generate_csv."
+        "the prompt. Returns at once with job_id and the file's path in the outputs folder; the name "
+        "gets a -001 style suffix if a file or a running bulk job already has it. Rows are generated "
+        "one at a time and the file is written when the job ends; each model call can take up to "
+        "180 s, a failing row is tried up to 4 times and then left out, and a job where fewer than a "
+        "quarter of the rows succeed (30% above 10 rows) fails and leaves no file. Over MCP the "
+        "Guaardvark backend must be running. Poll get_generation_status with job_id; 'complete' "
+        "reports how many rows the file holds. For one page returned as text use "
+        "generate_wordpress_content or generate_enhanced_wordpress_content; for a table of arbitrary "
+        "data, generate_csv."
     )
 
     parameters = {
@@ -43,7 +46,7 @@ class BulkCSVGeneratorTool(BaseTool):
             name="filename",
             type="string",
             required=True,
-            description="Plain file name for the CSV, e.g. 'spring-pages.csv' (no folders). Unsafe characters are replaced; if the name is taken, a unique one is used and returned."
+            description="Plain file name for the CSV, e.g. 'spring-pages.csv' (no folders). Unsafe characters are replaced; if a file or a running bulk job has the name, a -001 style suffix is added and the name used is returned."
         ),
         "quantity": ToolParameter(
             name="quantity",
@@ -51,7 +54,7 @@ class BulkCSVGeneratorTool(BaseTool):
             required=True,
             minimum=1,
             maximum=5000,
-            description="How many pages (rows) to write, 1-5000. With 1 the topic is used as is; otherwise row N is about '<topic> - Part N'."
+            description="How many pages (rows) to ask for, 1-5000; a row that keeps failing is left out. With 1 the topic is used as is; otherwise row N is about '<topic> - Part N'."
         ),
         "topic": ToolParameter(
             name="topic",
@@ -141,7 +144,7 @@ class BulkCSVGeneratorTool(BaseTool):
             output={
                 "job_id": body["job_id"],
                 "status": "processing",
-                "rows": quantity,
+                "rows_requested": quantity,
                 "output_file": f"{shown_dir}/{output_name}",
                 "next": "Poll get_generation_status with this job_id; the file is complete when it reports complete.",
             },

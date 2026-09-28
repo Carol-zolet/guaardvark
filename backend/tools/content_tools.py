@@ -47,10 +47,17 @@ def _csv_row(reply: str, columns: int, row_id: Any) -> Optional[str]:
 
     def plausible(fields: list) -> bool:
         # A page row has an ID, a title and HTML content where the prompt put them;
-        # content that does not end in a tag was split at a comma inside it.
-        return (len(fields) == columns and fields[0].strip().isdigit()
+        # content that does not end in a tag was split at a comma inside it. HTML or
+        # a line break in any other column, or a slug with spaces or quotes, means
+        # the fields shifted (content split in two, or prose after the row).
+        if not (len(fields) == columns and fields[0].strip().isdigit()
                 and bool(fields[1].strip()) and "<" in fields[2]
-                and fields[2].rstrip().endswith(">"))
+                and fields[2].rstrip().endswith(">")):
+            return False
+        others = [fields[1]] + fields[3:]
+        if any("<" in f or "\n" in f.strip() for f in others):
+            return False
+        return re.fullmatch(r'[^\s"<>]+', fields[-1].strip()) is not None
 
     # The prompt asks for double-quoted fields; an unquoted row cannot be split safely.
     if not re.search(r'"\s*\d+\s*"\s*,', text):
@@ -110,14 +117,15 @@ class WordPressContentTool(BaseTool):
     name = "generate_wordpress_content"
     read_only = True
     description = (
-        "Write one WordPress page with Guaardvark's local LLM and return it as a single CSV row of "
+        "Compose one WordPress page with Guaardvark's local LLM and return it as a single CSV row of "
         "text, six double-quoted columns with no header: ID, title, HTML content, meta description, "
         "keywords, slug. Nothing is written to disk. The page comes from the parameters alone, with no "
         "document lookup; to ground it in the user's indexed documents and keep it to named services "
         "use generate_enhanced_wordpress_content, and for many pages in one import file use "
         "generate_bulk_csv. The ID column is always row_id; a reply without six fields, a title and "
-        "HTML content after one retry is an error. Usually 20-40 s; each model call is cut off after "
-        "180 s, and over MCP a call still running at the timeout (120 s by default) returns an error."
+        "HTML content, or with HTML or line breaks outside the content column, after one retry is an "
+        "error. Each model call is cut off after 180 s, and over MCP a call still running at the "
+        "timeout (120 s by default) returns an error."
     )
 
     parameters = {
@@ -144,6 +152,7 @@ class WordPressContentTool(BaseTool):
             name="row_id",
             type="int",
             required=True,
+            minimum=0,
             description="Value written to the ID column. Use increasing numbers when building an import file one page at a time."
         ),
         "word_count": ToolParameter(
@@ -247,16 +256,19 @@ class EnhancedWordPressContentTool(BaseTool):
     name = "generate_enhanced_wordpress_content"
     read_only = True
     description = (
-        "Write one WordPress page grounded in the user's own indexed documents: it searches the whole "
-        "knowledge base for the client, topic and services, gives Guaardvark's local LLM the 6 nearest "
-        "passages (there is no relevance cut-off, so check the sources) and tells it to take specific "
-        "facts only from them and to write only about primary_service and secondary_service. Returns a "
+        "Compose one WordPress page grounded in the user's own indexed documents: it searches the whole "
+        "knowledge base for the client, topic and services, gives Guaardvark's local LLM up to 6 "
+        "passages the reranker rates related (check the sources: two clients' documents in one index "
+        "can mix), asks for 500+ words of HTML content, and tells it to take specific facts only from "
+        "the passages and, when services are given, to write only about primary_service and "
+        "secondary_service. Returns a "
         "single CSV row of text, seven double-quoted columns with no header: ID, title, HTML content, "
         "excerpt, category, tags, slug; over MCP it comes as JSON {row, sources} naming the files the "
         "passages came from. Nothing is written to disk. The ID column is always row_id; a reply "
-        "without seven fields, a title and HTML content after one retry is an error, and so is a "
-        "knowledge base that cannot be searched. Usually 25-40 s; each model call is cut off after "
-        "180 s, and over MCP a call still running at the timeout (120 s by default) returns an error. "
+        "without seven fields, a title and HTML content, or with HTML or line breaks outside the "
+        "content column, after one retry is an error, and so is a knowledge base that cannot be "
+        "searched or has fallen back to an empty index. Each model call is cut off after 180 s, and "
+        "over MCP a call still running at the timeout (120 s by default) returns an error. "
         "Without grounding or service limits use generate_wordpress_content; for many pages in one "
         "import file, generate_bulk_csv."
     )
@@ -285,6 +297,7 @@ class EnhancedWordPressContentTool(BaseTool):
             name="row_id",
             type="int",
             required=True,
+            minimum=0,
             description="Value written to the ID column. Use increasing numbers when building an import file one page at a time."
         ),
         "industry": ToolParameter(
@@ -353,12 +366,18 @@ class EnhancedWordPressContentTool(BaseTool):
         result = search.execute(query=query, top_k=GROUNDING_PASSAGES)
         if not result.success:
             return [], result.error or "the knowledge-base search failed"
-        # An empty result with a retrieval error is a broken index, not "nothing matched".
+        # A retrieval error, or the empty in-memory store standing in for the
+        # persisted index, is a broken index, not "nothing matched". Other degraded
+        # modes (keyword-only or vector-only under pressure) still return real passages.
         trace = (result.metadata or {}).get("retrieval") or {}
         if trace.get("error"):
             return [], str(trace["error"])
+        if trace.get("vector_store") == "simple_fallback":
+            return [], trace.get("degraded_reason") or "the persisted vector index is not in use"
+        from backend.utils.reranker import drop_unrelated
+        hits, _dropped = drop_unrelated((result.metadata or {}).get("results") or [])
         passages = []
-        for hit in ((result.metadata or {}).get("results") or [])[:GROUNDING_PASSAGES]:
+        for hit in hits[:GROUNDING_PASSAGES]:
             meta = hit.get("metadata") or {}
             text = (hit.get("text") or "").strip()
             if text:
@@ -405,6 +424,18 @@ class EnhancedWordPressContentTool(BaseTool):
                     "not invent prices, dates, awards, certifications, numbers or other specifics."
                 )
 
+            services = [s for s in (primary_service, secondary_service) if s]
+            rules = []
+            if services:
+                rules += [
+                    f"ONLY write about services explicitly listed: {' and '.join(services)}",
+                    "FORBIDDEN: Do NOT write about ANY service not listed in Primary/Secondary Service",
+                ]
+            if industry:
+                rules.append(f'Industry Context: ALL content MUST align with "{industry}"')
+            rules.append("Take specific facts only from the FACTS section above")
+            constraints = "\n".join(f"{i}. {r}" for i, r in enumerate(rules, 1))
+
             llm = self._get_llm()
 
             # Build enhanced prompt with business intelligence
@@ -424,9 +455,7 @@ TASK: Generate professional CSV content for {client}: {website}
 {grounding}
 
 **CRITICAL CONSTRAINTS:**
-1. ONLY write about services explicitly listed: {primary_service} and {secondary_service}
-2. FORBIDDEN: Do NOT write about ANY service not listed in Primary/Secondary Service
-3. Industry Context: ALL content MUST align with "{industry}"
+{constraints}
 
 **CSV OUTPUT FORMAT (7 COLUMNS):**
 "{row_id}","[TITLE]","[CONTENT]","[EXCERPT]","[CATEGORY]","[TAGS]","[SLUG]"
@@ -443,7 +472,7 @@ TASK: Generate professional CSV content for {client}: {website}
 **CONTENT QUALITY:**
 - Professional tone matching {brand_tone}
 - Target audience: {target_audience}
-- Focus on {topic} within {primary_service} context
+- Focus on {topic}{f" within {primary_service} context" if primary_service else ""}
 - Location for SEO: {location}
 
 Generate the single CSV row now:"""
@@ -461,8 +490,8 @@ Generate the single CSV row now:"""
             from backend.utils.backend_http import is_mcp_transport
             return ToolResult(
                 success=True,
-                # Chat and the Studio treat this output as CSV; an MCP client also
-                # needs to know which documents the facts came from.
+                # Chat treats this output as CSV; an MCP client also needs to know
+                # which documents the facts came from.
                 output={"row": row, "sources": sources} if is_mcp_transport(self) else row,
                 metadata={
                     "client": client,
