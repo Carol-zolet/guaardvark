@@ -165,7 +165,7 @@ def client(fake_gen):
 
 def test_generate_text_omitted_model_uses_resolver(client, fake_gen, monkeypatch):
     from backend.api import batch_video_generation_api as api
-    monkeypatch.setattr(api, "resolve_active_video_model", lambda role, explicit=None, surface=None: ("wan22-5b", None))
+    monkeypatch.setattr(api, "resolve_active_video_model", lambda role, explicit=None, surface=None, comfyui_down_ok=False: ("wan22-5b", None))
     captured = {}
     orig = fake_gen.start_batch_from_prompts
 

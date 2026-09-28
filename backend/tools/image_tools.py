@@ -1155,7 +1155,7 @@ class VideoGeneratorTool(BaseTool):
         model_id = (model or "").strip()
         if not model_id:
             role = "i2v" if first_image else "t2v"
-            picked, _resolve_err = resolve_active_video_model(role)
+            picked, _resolve_err = resolve_active_video_model(role, comfyui_down_ok=True)
             model_id = picked or DEFAULT_T2V_MODEL
         entry = VIDEO_MODEL_REGISTRY.get(model_id)
         if not entry:
