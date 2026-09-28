@@ -17,21 +17,54 @@ from backend.utils.text_focus import focus_window
 web_search_bp = Blueprint("web_search_api", __name__, url_prefix="/api/web-search")
 logger = logging.getLogger(__name__)
 
-def extract_website_content(url: str, query: Optional[str] = None) -> Dict[str, Any]:
+MAX_REDIRECTS = 5
+
+
+def extract_website_content(url: str, query: Optional[str] = None, public_only: bool = False) -> Dict[str, Any]:
     """Fetch a page and return its title, description and up to 2,000 characters of its text.
+
+    ``public_only`` refuses any address that is not globally routable, on every
+    redirect hop (the fetch_url and analyze_website tools ask for it).
 
     With ``query`` the text is the stretch of the page about the query
     (:func:`backend.utils.text_focus.focus_window`); without it, the head of the page.
     """
     try:
-        if not url.startswith(('http://', 'https://')):
+        url = url.strip()
+        scheme = re.match(r"^([A-Za-z][A-Za-z0-9+.-]*)://", url)
+        if scheme and scheme.group(1).lower() not in ("http", "https"):
+            return {"success": False, "url": url, "error": "Refused: only http and https URLs can be fetched"}
+        if scheme:
+            url = scheme.group(1).lower() + url[len(scheme.group(1)):]
+        else:
             url = 'https://' + url
             
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
         }
-        
-        response = requests.get(url, headers=headers, timeout=15, allow_redirects=True)
+
+        current = url
+        if public_only:
+            # Redirects are followed one hop at a time so every hop is checked: a
+            # public page must not be able to bounce the fetch onto this machine.
+            from urllib.parse import urljoin
+            from backend.utils.hosts import private_address_reason
+            with requests.Session() as session:
+                for _hop in range(MAX_REDIRECTS + 1):
+                    refused = private_address_reason(current)
+                    if refused:
+                        return {"success": False, "url": url, "error": f"Refused to fetch {current}: {refused}"}
+                    response = session.get(current, headers=headers, timeout=15, allow_redirects=False)
+                    location = session.get_redirect_target(response)
+                    if location:
+                        current = urljoin(current, location)
+                        continue
+                    break
+                else:
+                    return {"success": False, "url": url, "error": f"Too many redirects (more than {MAX_REDIRECTS})"}
+        else:
+            response = requests.get(url, headers=headers, timeout=15, allow_redirects=True)
+            current = response.url
         response.raise_for_status()
         
         soup = BeautifulSoup(response.content, 'html.parser', from_encoding='utf-8')
@@ -40,7 +73,7 @@ def extract_website_content(url: str, query: Optional[str] = None) -> Dict[str, 
             script.decompose()
         
         title = soup.find('title')
-        title_text = title.get_text().strip() if title else "No title found"
+        title_text = title.get_text().strip() if title else ""
         
         meta_desc = soup.find('meta', attrs={'name': 'description'})
         description = meta_desc['content'].strip() if meta_desc and meta_desc.get('content') else ""
@@ -62,15 +95,18 @@ def extract_website_content(url: str, query: Optional[str] = None) -> Dict[str, 
             content_text = soup.get_text(separator=' ', strip=True)
         
         content_text = re.sub(r'\s+', ' ', content_text)
+        page_word_count = len(content_text.split())
         content_text = focus_window(content_text, query, 2000) if query else content_text[:2000]
         
         return {
             "success": True,
             "url": url,
+            "final_url": current,
             "title": title_text,
             "description": description,
             "content": content_text,
-            "content_length": len(content_text)
+            "content_length": len(content_text),
+            "page_word_count": page_word_count,
         }
         
     except requests.RequestException as e:
