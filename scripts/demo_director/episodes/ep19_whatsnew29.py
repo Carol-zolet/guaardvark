@@ -1,20 +1,27 @@
 """Episode 19 — Everything New in 2.9 (≈5:00).
 
 What landed since Ep 13, shown on the real product: thumbs that say what they
-taught, photo editing inside chat (edit, outpaint, cut-out), a consent card in
-front of any likeness, the MCP client connecting an outside server and chat
-calling it, and a closer on the running version.
+taught, a web page read at the passage that answers, the MCP client
+connecting an outside server and chat using its tool, a Hugging Face model
+looked up (and one refused by name) before anything downloads, photo editing
+inside chat (edit, outpaint, cut-out), a face carried into a new scene, and a
+MiniMax H3 clip with its own voice rendered from Video Gen with ComfyUI
+started by the render itself.
 
 Every countable thing is read when this file loads or checked in `verify`:
 the version from /api/health, the MCP server's tool count from the connect
-response, the "taught" note from what the page rendered.
+response, the "taught" note from what the page rendered, the H3 clip's line
+from local speech-to-text on its soundtrack.
 
 GPU cast: Ollama (chat beats) + Audio Foundry (narration); ComfyUI for the
-photo beats (Qwen-Image-Edit pack installed). One heavy service per take:
-the photo beats run after the chat beats.
+photo and video beats (Qwen-Image-Edit, PuLID and MiniMax H3 installed). One
+heavy service per take: chat beats first, the models look-up (no GPU), then
+the ComfyUI beats; the video beat stops ComfyUI in its reset.
 
 Assets (made on this box, no real person): data/demo_assets/ep19/
-cafe_street.png and portrait_fictional.png, Z-Image renders.
+cafe_street.png and portrait_fictional.png, Z-Image renders. The web beat
+reads the public Wikipedia page for the aardvark; the models beat looks up two
+public Hugging Face repos and installs nothing.
 
 Requires: `staging.py status` READY; zvec_grep's MCP server configured.
 
@@ -35,7 +42,7 @@ import requests as rq
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from director import API, Beat, Episode, Stage  # noqa: E402
 from helpers import (  # noqa: E402
-    REPO, api_get, close_dialogs, goto as st_goto, require, set_nav_chrome,
+    REPO, api_get, close_dialogs, goto as st_goto, open_workspace, require, set_nav_chrome,
     verify_no_private_names, verify_path)
 
 ASSETS = REPO / "data" / "demo_assets" / "ep19"
@@ -58,6 +65,22 @@ CUTOUT_ASK = os.environ.get("EP19_CUTOUT_ASK", "Remove the background.")
 IDENTITY_ASK = os.environ.get(
     "EP19_IDENTITY_ASK", "Put this person in a sunlit greenhouse full of ferns, same face.")
 MCP_SERVER = "zvec_grep"
+WEB_ASK = os.environ.get(
+    "EP19_WEB_ASK", "What does an aardvark eat? Read https://en.wikipedia.org/wiki/Aardvark")
+MCP_ASK = os.environ.get(
+    "EP19_MCP_ASK", "Use zvec_grep to find the code that reads a web page.")
+# Add new model: one Hugging Face repo the product can run (a single-file
+# LTX-2.3 LoRA, Apache-2.0) and one it refuses by name. Looked up, never
+# installed, on camera.
+HF_OK = os.environ.get("EP19_HF_OK", "https://huggingface.co/joyfox/LTX-2.3-Transition-LORA")
+HF_NO = os.environ.get("EP19_HF_NO", "https://huggingface.co/genmo/mochi-1-preview")
+H3_LABEL = "MiniMax H3 (Int8, 16GB)"
+VIDEO_ASK = os.environ.get(
+    "EP19_VIDEO_ASK",
+    "A cartoon aardvark chef in a tiny white hat stirs a steaming pot in a cozy kitchen, "
+    "looks at the camera and says: \"Dinner is served. Ants, of course.\"")
+# What the clip must be heard to say (local speech-to-text on its soundtrack).
+VIDEO_LINE = ("dinner", "served", "ants")
 
 
 def load_numbers() -> dict:
@@ -152,6 +175,31 @@ def wait_reply(st: Stage, before: int, timeout: float = 150):
     raise RuntimeError("no finished assistant reply")
 
 
+def wait_turn(st: Stage, before: int, timeout: float = 240):
+    """A finished reply: one more thumbed reply than before and the composer
+    enabled again (a tool card can land before the answer does)."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if assistant_rows(st).count() > before and chat_box(st).is_enabled():
+            time.sleep(1.0)
+            return
+        time.sleep(0.5)
+    raise RuntimeError("no finished assistant reply")
+
+
+def last_reply_text(st: Stage) -> str:
+    return st.page.evaluate("""() => {
+        const rows = [...document.querySelectorAll('button')].filter(b =>
+            b.querySelector("[data-testid='ThumbUpOutlinedIcon'],[data-testid='ThumbUpIcon']"));
+        let el = rows[rows.length - 1];
+        for (let k = 0; el && k < 8; k++) {
+            el = el.parentElement;
+            if (el && el.innerText && el.innerText.length > 40) return el.innerText;
+        }
+        return "";
+    }""")
+
+
 def attach(st: Stage, path: Path):
     """Glide to the paperclip on camera, then hand the file to its hidden
     input: a native file dialog would open outside the kiosk frame."""
@@ -237,6 +285,40 @@ def v_teach(st: Stage):
     print(f"  taught notes: {_TAUGHT['texts']}")
     require(len(_TAUGHT["texts"]) == 2,
             f"expected a taught note and a withdrawal, saw {_TAUGHT['texts']}")
+    verify_path(st, "/chat")
+
+
+# -------------------------------------------------------------- beat: web
+
+_WEB = {"reply": ""}
+
+
+def reset_web(st: Stage):
+    fresh_chat(st)
+    _WEB["reply"] = ""
+
+
+def act_web(st: Stage):
+    before = assistant_rows(st).count()
+    st.cue(1)
+    ask(st, WEB_ASK, delay_ms=18)
+    with st.fast_forward():
+        wait_turn(st, before)
+    card = st.page.get_by_text("fetch_url").last
+    st.cue(2, focus=card)
+    st.hover_over(card, dur=0.8)
+    time.sleep(2.0)
+    answer = st.page.get_by_text(re.compile(r"termite", re.IGNORECASE)).last
+    st.cue(3, focus=answer)
+    time.sleep(3.0)
+    _WEB["reply"] = last_reply_text(st)
+
+
+def v_web(st: Stage):
+    reply = _WEB["reply"].lower()
+    print(f"  web reply: {_WEB['reply'][:200]!r}")
+    require("ant" in reply and "termite" in reply, "the reply does not say what the page says it eats")
+    require(st.page.get_by_text("fetch_url").count() > 0, "no fetch_url tool card on screen")
     verify_path(st, "/chat")
 
 
@@ -335,6 +417,7 @@ _MCP = {"tools": None}
 
 def reset_mcp(st: Stage):
     close_dialogs(st)
+    _MCP["reply"] = ""
     rq.post(f"{API}/api/automation/mcp/disconnect", json={"server": MCP_SERVER}, timeout=20)
     set_nav_chrome(st, "software", path="/agents/mcp")
     st.page.get_by_text(MCP_SERVER, exact=True).first.wait_for(state="visible", timeout=30_000)
@@ -353,7 +436,29 @@ def act_mcp(st: Stage):
     st.focus_on(st.page.get_by_text("zvec_grep_search", exact=True).first, hold=3.5)
     time.sleep(4.2)
     close_dialogs(st)
-    time.sleep(1.5)
+    time.sleep(1.0)
+    # Into chat on camera, through the top bar.
+    open_workspace(st, "Chat", "/chat")
+    chat_box(st).wait_for(state="visible", timeout=30_000)
+    new_chat(st)
+    before = assistant_rows(st).count()
+    st.cue(3)
+    ask(st, MCP_ASK, delay_ms=18)
+    approve = st.page.locator("[data-testid='tool-approval-card']").last
+    deadline = time.monotonic() + 120
+    with st.fast_forward():
+        while time.monotonic() < deadline:
+            if approve.count() and approve.is_visible():
+                st.glide_click(approve.get_by_role("button").first, dur=0.7)
+                break
+            if assistant_rows(st).count() > before and chat_box(st).is_enabled():
+                break
+            time.sleep(0.5)
+        wait_turn(st, before)
+    answer = st.page.get_by_text(re.compile(r"web_tools\.py|web_search_api")).last
+    st.cue(4, focus=answer)
+    time.sleep(3.5)
+    _MCP["reply"] = last_reply_text(st)
 
 
 def v_mcp(st: Stage):
@@ -361,7 +466,193 @@ def v_mcp(st: Stage):
     srv = [s for s in body.get("servers", []) if s.get("name") == MCP_SERVER]
     require(srv and srv[0].get("connected"), f"{MCP_SERVER} not connected")
     _MCP["tools"] = srv[0].get("tool_count")
+    print(f"  mcp reply: {_MCP.get('reply', '')[:200]!r}")
+    require(re.search(r"web_tools\.py|web_search_api", _MCP.get("reply", "")), "the reply does not name the file the tool found")
     verify_no_private_names(st)
+
+
+# ----------------------------------------------------------- beat: models
+
+_MODELS = {"ok": "", "no": ""}
+
+
+def reset_models(st: Stage):
+    close_dialogs(st)
+    set_nav_chrome(st, "software", path="/video")
+    st.page.get_by_role("button", name="Manage models").first.wait_for(state="attached", timeout=30_000)
+    check_scale(st)
+    _MODELS.update(ok="", no="")
+
+
+def _look_up(st: Stage, dlg, url: str):
+    box = dlg.get_by_label("Hugging Face URL")
+    st.glide_click(box, dur=0.6)
+    box.fill("")
+    box.press_sequentially(url, delay=12)
+    time.sleep(0.4)
+    st.glide_click(dlg.get_by_role("button", name="Look up"), dur=0.6)
+
+
+def act_models(st: Stage):
+    manage = st.page.get_by_role("button", name="Manage models").first
+    manage.scroll_into_view_if_needed()
+    time.sleep(0.8)
+    st.cue(1, focus=manage)
+    st.glide_click(manage, dur=0.8)
+    st.page.get_by_role("button", name="Add new model").first.wait_for(state="visible", timeout=20_000)
+    time.sleep(1.0)
+    st.glide_click(st.page.get_by_role("button", name="Add new model").first, dur=0.8)
+    dlg = st.page.locator("[role=dialog]").filter(has_text="Hugging Face URL").last
+    dlg.wait_for(state="visible", timeout=10_000)
+    st.cue(2)
+    _look_up(st, dlg, HF_OK)
+    licence = dlg.get_by_text(re.compile(r"licence apache-2.0"))
+    licence.wait_for(state="visible", timeout=60_000)
+    st.cue(3, focus=licence)
+    time.sleep(3.0)
+    _MODELS["ok"] = dlg.inner_text()
+    _look_up(st, dlg, HF_NO)
+    refusal = dlg.get_by_text(re.compile(r"cannot load"))
+    refusal.wait_for(state="visible", timeout=60_000)
+    st.cue(4, focus=refusal)
+    time.sleep(3.0)
+    _MODELS["no"] = dlg.inner_text()
+    st.glide_click(dlg.get_by_role("button", name="Cancel"), dur=0.6)
+    time.sleep(0.8)
+    close_dialogs(st)
+
+
+def v_models(st: Stage):
+    ok, no = _MODELS["ok"], _MODELS["no"]
+    require("LTX" in ok and "apache-2.0" in ok, f"the look-up did not name the family and licence: {ok[:300]!r}")
+    require("Mochi" in no and "cannot load" in no, f"Mochi was not refused by name: {no[:300]!r}")
+    verify_path(st, "/video")
+    verify_no_private_names(st)
+
+
+# ------------------------------------------------------------ beat: video
+
+_VIDEO = {"before": set(), "batch": None, "clip": None, "heard": "", "comfy_before": None}
+PROMPT_LABEL = "What do you want to see? (one prompt per line)"
+
+
+def _batches() -> list:
+    return rq.get(f"{API}/api/batch-video/list", timeout=10).json()["data"]["batches"]
+
+
+def reset_video(st: Stage):
+    close_dialogs(st)
+    # ComfyUI off before the take: the take shows the render starting it.
+    rq.post(f"{API}/api/plugins/comfyui/stop", timeout=120)
+    for _ in range(60):
+        if plugin_status("comfyui") != "running":
+            break
+        time.sleep(1)
+    _VIDEO.update(before={b["batch_id"] for b in _batches()}, batch=None, clip=None, heard="",
+                  comfy_before=plugin_status("comfyui"))
+    require(_VIDEO["comfy_before"] != "running", "ComfyUI did not stop")
+    _beat("video").audio_overlays.clear()
+    set_nav_chrome(st, "software", path="/video")
+    st.page.get_by_label(PROMPT_LABEL).wait_for(state="visible", timeout=30_000)
+    model = st.page.get_by_role("combobox").filter(
+        has_text=re.compile(r"Wan|LTX|MiniMax|Hunyuan|CogVideo")).first
+    model.click()
+    st.page.get_by_role("option").filter(has_text=H3_LABEL).first.click()
+    time.sleep(1.5)
+    require(H3_LABEL in model.inner_text(), f"model picker shows {model.inner_text()!r}")
+    st.page.evaluate("() => window.scrollTo(0, 0)")
+    time.sleep(1.0)
+    check_scale(st)
+
+
+def _clip_audio(clip: Path) -> Path:
+    wav = ASSETS / "h3_clip_audio.wav"
+    import subprocess
+    subprocess.run(["ffmpeg", "-y", "-v", "error", "-i", str(clip), "-vn", "-ac", "2", "-ar", "48000",
+                    str(wav)], check=True)
+    return wav
+
+
+def act_video(st: Stage):
+    strip = st.page.get_by_text(re.compile(r"^MiniMax H3")).first
+    st.cue(0, focus=strip)
+    time.sleep(1.5)
+    box = st.page.get_by_label(PROMPT_LABEL)
+    st.cue(1, focus=box)
+    st.glide_click(box, dur=0.7)
+    # Word by word: this page re-renders on every key, and per-key typing of
+    # the prompt ran 27 s of silence on camera.
+    for k, word in enumerate(VIDEO_ASK.split(" ")):
+        st.page.keyboard.insert_text(("" if k == 0 else " ") + word)
+        time.sleep(0.06)
+    time.sleep(0.6)
+    add = st.page.get_by_role("button", name="Add to queue").first
+    st.cue(2, focus=add)
+    st.glide_click(add, dur=0.8)
+    st.cursor.glide(1500, 700, dur=0.6)
+    deadline = time.monotonic() + 900
+    with st.fast_forward():
+        while time.monotonic() < deadline:
+            new = [b for b in _batches() if b["batch_id"] not in _VIDEO["before"]]
+            if new and new[0]["status"] in ("completed", "error", "cancelled", "failed"):
+                _VIDEO["batch"] = new[0]
+                break
+            time.sleep(2.0)
+        time.sleep(3.0)
+    require(_VIDEO["batch"] and _VIDEO["batch"]["status"] == "completed", f"render ended {_VIDEO['batch']}")
+    status = api_get(f"/api/batch-video/status/{_VIDEO['batch']['batch_id']}")
+    rel = next(r["video_path"] for r in status.get("results", []) if r.get("success"))
+    clip = REPO / "data" / "uploads" / "Videos" / _VIDEO["batch"]["batch_id"] / rel
+    _VIDEO["clip"] = clip
+    wav = _clip_audio(clip)
+    from director import ffprobe_duration
+    clip_s = ffprobe_duration(clip)
+    # The clip's own voice plays in a gap: the line before it has finished.
+    plan, hits = getattr(st, "cue_plan", None), getattr(st, "cue_hits", {})
+    if plan and 2 in hits:
+        end2 = hits[2] + plan[2]["dur"] + 0.3
+        while st.out_clock() < end2:
+            time.sleep(0.05)
+    play = st.page.get_by_role("button", name="Play").first
+    play.scroll_into_view_if_needed()
+    time.sleep(0.5)
+    st.hover_over(play, dur=0.7)
+    st.cursor.click()
+    video = st.page.locator("video").last
+    for _ in range(40):
+        if video.count() and not video.evaluate("v => v.paused"):
+            break
+        time.sleep(0.1)
+    started = st.out_clock()
+    if getattr(st, "recorder", None) is not None:
+        _beat("video").audio_overlays.append((str(wav), started, 1.0))
+    st.focus_on(video, hold=clip_s)
+    st.cursor.glide(1500, 1000, dur=0.6)
+    time.sleep(clip_s + 0.6)
+    st.cue(3, focus=video)
+    time.sleep(3.0)
+
+
+def v_video(st: Stage):
+    require(_VIDEO["comfy_before"] != "running", "ComfyUI was running before the take")
+    require(plugin_status("comfyui") == "running", "ComfyUI is not running after the render")
+    clip = _VIDEO["clip"]
+    require(clip and clip.exists(), f"no clip on disk: {clip}")
+    import subprocess
+    streams = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "stream=codec_type", "-of", "csv=p=0",
+                              str(clip)], capture_output=True, text=True).stdout.split()
+    require("audio" in streams, "the clip has no soundtrack")
+    from director import _stt
+    heard = _stt(ASSETS / "h3_clip_audio.wav").lower()
+    _VIDEO["heard"] = heard
+    print(f"  clip says: {heard!r}")
+    require(all(w in heard for w in VIDEO_LINE), f"the clip does not say the line: {heard!r}")
+    verify_path(st, "/video")
+    verify_no_private_names(st)
+
+
+def _beat(name: str) -> Beat:
+    return next(b for b in BEATS if b.name == name)
 
 
 def spoken_version(v: str) -> str:
@@ -372,6 +663,8 @@ BEATS = [
     # Plain words throughout: a first-time viewer with no background in the
     # project must follow every line. Numbers in comments are the spoken-line
     # indexes the actions cue on (blank lines do not count).
+    # GPU order: chat beats (Ollama), the models look-up (no GPU), then the
+    # ComfyUI beats, the video last because its reset stops ComfyUI.
     Beat(
         name="teach",
         narration=[
@@ -383,6 +676,41 @@ BEATS = [
             "Change your mind? Click it again, and that is undone.",                # 3
         ],
         action=act_teach, verify=v_teach, reset=reset_teach,
+    ),
+    Beat(
+        name="web",
+        narration=[
+            "It can read web pages for you, too.",                                  # 0
+            "Ask your question, and give it the page.",                             # 1
+            "It opens the page, and finds the part that answers you.",              # 2
+            "Ants and termites. Straight from the page.",                           # 3
+        ],
+        action=act_web, verify=v_web, reset=reset_web,
+    ),
+    Beat(
+        name="mcp",
+        narration=[
+            "Guard-vark can also use tools from other programs, through M C P, "
+            "a common way for A I apps to share tools.",                            # 0
+            "Pick one, and click connect.",                                         # 1
+            "Its tools show up right here.",                                        # 2
+            "Then just ask. This one searches the code of this very project.",      # 3
+            "It found the file that reads web pages, and says where it is.",        # 4
+        ],
+        action=act_mcp, verify=v_mcp, reset=reset_mcp,
+    ),
+    Beat(
+        name="models",
+        narration=[
+            "Found a new video model online? You can add it yourself.",             # 0
+            "Open Manage models, and choose add new model.",                        # 1
+            "Paste its link from Hugging Face.",                                    # 2
+            "Guard-vark checks what it is, its size and its license, before "
+            "anything downloads.",                                                  # 3
+            "And if it can't run a model, it tells you why, instead of "
+            "downloading it for nothing.",                                          # 4
+        ],
+        action=act_models, verify=v_models, reset=reset_models,
     ),
     Beat(
         name="photo",
@@ -405,14 +733,15 @@ BEATS = [
         action=act_consent, verify=v_consent, reset=reset_consent,
     ),
     Beat(
-        name="mcp",
+        name="video",
         narration=[
-            "Guard-vark can also use tools from other programs, through M C P, "
-            "a common way for A I apps to share tools.",                            # 0
-            "Pick one, and click connect.",                                         # 1
-            "Its tools show up right here, ready to use when you ask.",             # 2
+            "And the big one. Video, with its own sound, from MiniMax H3.",         # 0
+            "Describe the scene, and what the character says.",                     # 1
+            "Add it to the queue. The video engine was switched off, so "
+            "Guard-vark starts it for you.",                                        # 2
+            "Picture, voice and kitchen sounds, all made on this computer.",        # 3
         ],
-        action=act_mcp, verify=v_mcp, reset=reset_mcp,
+        action=act_video, verify=v_video, reset=reset_video,
     ),
 ]
 
@@ -428,6 +757,16 @@ RESULTS = REPO / "data" / "outputs" / "generated_images"
 def _newest(prefix: str, since: float) -> str | None:
     found = sorted((p for p in RESULTS.glob(f"{prefix}_*.png") if p.stat().st_mtime >= since),
                    key=lambda p: p.stat().st_mtime)
+    return str(found[-1]) if found else None
+
+
+def _newest_clip(since: float) -> str | None:
+    """The H3 clip this run rendered: the one the video beat saw, else the
+    newest MiniMax clip with a soundtrack written since the run started."""
+    if _VIDEO.get("clip") and Path(_VIDEO["clip"]).exists():
+        return str(_VIDEO["clip"])
+    found = sorted((p for p in (REPO / "data" / "uploads" / "Videos").glob("*/*/videos/minimax_h3_*-audio.mp4")
+                    if p.stat().st_mtime >= since), key=lambda p: p.stat().st_mtime)
     return str(found[-1]) if found else None
 
 
@@ -448,15 +787,18 @@ def finish(ep: Episode, body: Path) -> Path:
                         "One machine, no cloud."], signoff)
     plates = {k: v["clip"] for k, v in json.loads(PLATES.read_text()).items()}
     # The run started when its folder was named (slug_YYYYmmdd_HHMMSS); the
-    # folder's mtime moves with every file written into it.
-    since = time.mktime(time.strptime(ep.dir.name[-15:], "%Y%m%d_%H%M%S"))
+    # folder's mtime moves with every file written into it. Takes reused from
+    # an earlier run (DEMO_RESUME_DIR) made their results when that run did.
+    first = Path(os.environ.get("DEMO_RESUME_DIR") or ep.dir).name
+    since = time.mktime(time.strptime(first[-15:], "%Y%m%d_%H%M%S"))
     results = [_newest("edit", since), _newest("outpaint", since), _newest("nobg", since),
-               _newest("identity", since)]
-    require(all(results), f"missing a result image for the ending: {results}")
+               _newest("identity", since), _newest_clip(since)]
+    require(all(results), f"missing a result for the ending: {results}")
     shots = [
         {"src": plates["01_one_machine"], "beats": 2, "move": "in"},
         {"src": results[0], "beats": 1, "move": "left"},
         {"src": plates["02_fifteen_skills"], "beats": 1, "move": "in"},
+        {"src": results[4], "beats": 3, "move": "in"},
         {"src": results[1], "beats": 1, "move": "right"},
         {"src": plates["05_nothing_leaves"], "beats": 1, "move": "out"},
         {"src": results[2], "beats": 1, "move": "in"},
@@ -479,7 +821,7 @@ def main():
     ep = Episode("ep19_whatsnew29", BEATS, out_root=REPO / "data" / "outputs" / "demos")
     stage = Stage()
     try:
-        for warm in ("/", "/chat", "/agents/mcp"):
+        for warm in ("/", "/chat", "/agents/mcp", "/video"):
             st_goto(stage, warm)
         stage.cursor.jump(960, 700)
         stage.cursor.click()

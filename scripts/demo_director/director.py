@@ -822,7 +822,9 @@ class Beat:
     min_hold: float = 2.0       # extra floor beyond narration
     lead_in: float = 0.8        # settle time recorded before actions start
     retakes: int = 3
-    # Demo audio mixed into the beat at mux time: [(wav_path, start_s), ...].
+    # Demo audio mixed into the beat at mux time: [(wav_path, start_s), ...],
+    # or (wav_path, start_s, volume) for sound that is the subject rather than
+    # a bed (a rendered clip's own voice); beds default to 0.55.
     # x11grab records VIDEO ONLY — anything the UI "plays" is silent unless
     # it is scheduled here (essential for the audio episodes).
     audio_overlays: list = field(default_factory=list)
@@ -930,13 +932,14 @@ class Episode:
         cmd = ["ffmpeg", "-y", "-i", str(raw), "-i", str(b.audio_path)]
         filters = ["[1:a]apad[nar]"]
         mix_inputs = "[nar]"
-        for k, (opath, start_s) in enumerate(b.audio_overlays):
+        for k, overlay in enumerate(b.audio_overlays):
+            opath, start_s = overlay[0], overlay[1]
+            # ducked by default: beds and ambience sit under the narration
+            volume = float(overlay[2]) if len(overlay) > 2 else 0.55
             cmd += ["-i", str(opath)]
             ms = int(float(start_s) * 1000)
-            # ducked: overlays are background (music beds, ambience) and must
-            # sit under the narration, never compete with it
             filters.append(
-                f"[{k + 2}:a]volume=0.55,adelay={ms}|{ms}[ov{k}]")
+                f"[{k + 2}:a]volume={volume},adelay={ms}|{ms}[ov{k}]")
             mix_inputs += f"[ov{k}]"
         n = 1 + len(b.audio_overlays)
         filters.append(
@@ -1067,6 +1070,10 @@ class Episode:
             if prev and prev.exists():
                 dst = self.dir / prev.name
                 dst.write_bytes(prev.read_bytes())
+                # The finish pushes in on what each line is about: keep the cues.
+                cues = prev.with_name(prev.stem + ".cues.json")
+                if cues.exists():
+                    (self.dir / cues.name).write_bytes(cues.read_bytes())
                 b.audio_dur = ffprobe_duration(dst)
                 reused.add(i)
                 print(f"  beat {b.name}: REUSED from {resume_dir.name}")
