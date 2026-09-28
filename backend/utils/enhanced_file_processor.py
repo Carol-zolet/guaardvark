@@ -345,7 +345,8 @@ class XMLProcessor(FileProcessor):
             root = tree.getroot()
             
             # Extract text content
-            text_content = ET.tostring(root, encoding='unicode', method='text')
+            # One space between element texts; tostring(method="text") glued them.
+            text_content = " ".join(t.strip() for t in root.itertext() if t.strip())
             
             # Create structured representation
             structured_data = self._element_to_dict(root)
