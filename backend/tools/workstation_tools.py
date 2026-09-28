@@ -58,7 +58,10 @@ def _safe_root(root_arg: Optional[str]) -> Path:
     base = _repo_root()
     if not root_arg:
         return base
-    candidate = Path(root_arg).expanduser().resolve()
+    candidate = Path(root_arg).expanduser()
+    if not candidate.is_absolute():
+        candidate = base / candidate
+    candidate = candidate.resolve()
     try:
         candidate.relative_to(base)
     except ValueError as exc:
@@ -116,22 +119,27 @@ class MapCodebaseTool(BaseTool):
     name = "map_codebase"
     read_only = True
     description = (
-        "Run the System Mapper (same snapshot as /system-map) and return stats plus "
-        "ranked findings. Use when the user says 'use the system mapper', 'map the "
-        "codebase', 'what's wrong with this repo', or 'constellation findings'."
+        "Run the System Mapper over Guaardvark's own source checkout, or a folder inside it, and "
+        "return JSON: file_count, languages, per-analyzer stats, finding_count and the top findings, "
+        "most severe first, each with id, kind (e.g. import-cycle, ghost-endpoint, dead-symbol, "
+        "untested-module), severity, summary and up to 6 paths; dismissed findings are left out. "
+        "Mostly static analysis of the files; mapping the whole checkout also loads its tool registry "
+        "in an offline subprocess. Needs no backend, network or GPU. Results are cached for 5 minutes; "
+        "refresh=true recomputes. For an uploaded Code Repository folder use get_repository_map or "
+        "get_dependency_graph; to find code by meaning, search_codebase."
     )
     parameters = {
         "refresh": ToolParameter(
             name="refresh", type="bool", required=False, default=False,
-            description="Ignore the 5-minute disk cache and recompute.",
+            description="true: recompute now, rescanning every source file under root. false (default): reuse a result under 5 minutes old.",
         ),
         "root": ToolParameter(
             name="root", type="string", required=False, default="",
-            description="Code root. Defaults to GUAARDVARK_ROOT. Must stay inside that tree.",
+            description="Folder inside the Guaardvark checkout to map instead of all of it, absolute or relative to the checkout (e.g. 'backend/api'); paths outside are refused. Folders named data, logs, backups, outputs, build, dist, env, venv, node_modules, migrations, plans, audit, voice or ComfyUI, among others, are always skipped.",
         ),
         "limit": ToolParameter(
-            name="limit", type="int", required=False, default=15,
-            description="Max findings to return (default 15).",
+            name="limit", type="int", required=False, default=15, minimum=1, maximum=40,
+            description="How many findings to return, most severe first, 1-40 (default 15). finding_count still gives the total.",
         ),
     }
 
@@ -162,7 +170,11 @@ class MapCodebaseTool(BaseTool):
                 "finding_count": len(findings),
                 "findings": slim,
                 "cache": snapshot.get("_cache"),
+                # dispatch_map_finding needs a person's approval and is not offered over MCP.
                 "hint": (
+                    "To hand a dispatchable finding to self-improvement, open the System Map page "
+                    "(/system-map) in Guaardvark."
+                    if is_mcp_transport(self) else
                     "Call dispatch_map_finding with a finding id to hand a "
                     "dispatchable finding to self-improvement (PendingFix)."
                 ),
