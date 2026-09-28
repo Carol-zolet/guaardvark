@@ -48,10 +48,11 @@
   scene. The likeness consent card renders on the direct path, tool cards show paths relative to
   the checkout (live and after a reload), and approval cards and in-progress replies use the
   theme's primary colour instead of error red.
-- **Video renders start ComfyUI themselves.** Queuing a video from Video Gen, chat, MCP, a music
-  video or the Film Crew starts ComfyUI when it is all the render lacks
-  (`GUAARDVARK_PLUGIN_AUTO_ORCHESTRATOR=0` keeps the old error). A finished render's job ends
-  complete instead of sitting at 99% and being reported later as stalled.
+- **Video renders start ComfyUI themselves.** Queuing a video from Video Gen, chat or MCP starts
+  ComfyUI when it is all the render lacks (`GUAARDVARK_PLUGIN_AUTO_ORCHESTRATOR=0` keeps the old
+  error); music videos and the Film Crew still ask for it to be started, and with
+  `GUAARDVARK_JOB_SERVICE_START=1` the Film Crew editor starts it too. A finished render's job
+  ends complete instead of sitting at 99% and being reported later as stalled.
 - **Video limits in data, failures by name, frames checked.** Per-model render limits (canvas,
   frames, steps, guidance, fps, VRAM floor, attention pin) are registry data enforced in one
   place; `GUAARDVARK_VIDEO_STRICT_LIMITS=1` enforces the rest. A request that names no guidance
