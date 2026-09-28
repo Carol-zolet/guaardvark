@@ -942,3 +942,226 @@ def approve_samples(subject_id: int):
         "updated": len(rows),
         "samples": [r.to_dict() for r in all_samples],
     })
+
+# ── Import LoRA ──────────────────────────────────────────────────────────
+# Accepts a LoRA checkpoint trained OUTSIDE Guaardvark (Ostris AI-Toolkit,
+# kohya, or diffusers/PEFT) and attaches it to a Subject, so Cast selector,
+# Film Crew casting and keyframe rendering pick it up like a native-trained
+# LoRA. Validated against the two families the product currently supports:
+# Z-Image Turbo (diffusers/PEFT: layers.<n>...lora_A/lora_B) and FLUX.1 Dev
+# (kohya: double_blocks/single_blocks...lora_down/lora_up[+alpha]).
+#
+# Issue: https://github.com/guaardvark/guaardvark/issues/245
+# Author: Caroline Zolet (Carol-zolet)
+
+import json
+import os
+import re
+import struct
+
+from backend.config import STORAGE_DIR
+from backend.services.media_model_registry import (
+    ZIMAGE_TURBO,
+    FLUX_DEV,
+    get_profile,
+    write_lora_sidecar,
+)
+
+_IMPORT_MAX_BYTES = 2 * 1024 * 1024 * 1024  # 2 GB — LoRA checkpoints, not images
+# Matches the trainer's own layout: STORAGE_DIR/training/loras (NOT the bare
+# "loras/" this route used before Dean's review — a relative training/loras/...
+# resolves to a folder that doesn't exist, and the Z-Image renderer just skips
+# a missing file with a log line instead of failing loudly.
+_LORA_SUBDIR = Path("training") / "loras"
+
+# Z-Image (diffusers/PEFT) module path, after stripping a known prefix.
+_ZIMAGE_MODULE_RE = re.compile(
+    r"^(?:layers|context_refiner|noise_refiner)\.\d+\."
+    r"(?:attention\.to_(?:q|k|v|out\.0)|feed_forward\.w[123]|adaLN_modulation\.0)"
+)
+_ZIMAGE_PREFIXES = ("diffusion_model.", "transformer.")
+_ZIMAGE_SUFFIXES = (".lora_A.weight", ".lora_B.weight", ".lora_down.weight", ".lora_up.weight", ".alpha")
+
+# FLUX module path — kohya form keeps the lora_unet_ prefix baked into the
+# name (no dot after it), the dotted form doesn't.
+_FLUX_KOHYA_RE = re.compile(r"^lora_unet_(?:double|single)_blocks_\d+_")
+_FLUX_DOTTED_RE = re.compile(r"^diffusion_model\.(?:double|single)_blocks\.\d+\.")
+
+# SDXL — explicitly rejected even though it also uses a lora_unet_ prefix,
+# because its block names never match the FLUX pattern above.
+_SDXL_RE = re.compile(r"^lora_unet_(?:down|up|input|output|middle)_blocks|^lora_te")
+
+
+def _read_safetensors_header(fileobj) -> dict:
+    """Read only the JSON header of a .safetensors file — no tensor data.
+    Format: 8-byte little-endian uint64 header length, then that many bytes
+    of JSON. Never touches the tensor bytes that follow."""
+    fileobj.seek(0)
+    length_bytes = fileobj.read(8)
+    if len(length_bytes) != 8:
+        raise ValueError("file too small to be a valid safetensors checkpoint")
+    (header_len,) = struct.unpack("<Q", length_bytes)
+    if header_len <= 0 or header_len > 50 * 1024 * 1024:
+        raise ValueError(f"implausible header length ({header_len} bytes) — not a LoRA checkpoint")
+    header_bytes = fileobj.read(header_len)
+    if len(header_bytes) != header_len:
+        raise ValueError("truncated safetensors header")
+    try:
+        return json.loads(header_bytes)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"header is not valid JSON: {e}") from e
+
+
+def _detect_lora_family(keys: list[str]) -> str | None:
+    """Return 'zimage-turbo', 'flux-dev', or None if the key layout matches
+    neither supported family (SDXL included).
+
+    Validated 2026-09-27 against real Ostris AI-Toolkit checkpoints:
+      - Z-Image Turbo: 480/480 keys matched (diffusers/PEFT layout)
+      - FLUX.1 Dev:    912/912 keys matched (kohya layout)
+    and independently confirmed by the maintainer running the same key
+    names through diffusers' load_lora_weights (Z-Image) and ComfyUI's
+    LoraLoaderModelOnly (FLUX) — both load every key with no warnings.
+    """
+    tensor_keys = [k for k in keys if k != "__metadata__"]
+    if not tensor_keys:
+        return None
+
+    zimage_hits = 0
+    flux_hits = 0
+    sdxl_hits = 0
+
+    for key in tensor_keys:
+        if _SDXL_RE.match(key):
+            sdxl_hits += 1
+            continue
+
+        stripped = key
+        for prefix in _ZIMAGE_PREFIXES:
+            if key.startswith(prefix):
+                stripped = key[len(prefix):]
+                break
+        if key.endswith(_ZIMAGE_SUFFIXES) and _ZIMAGE_MODULE_RE.search(stripped):
+            zimage_hits += 1
+            continue
+
+        if _FLUX_KOHYA_RE.match(key) or _FLUX_DOTTED_RE.match(key):
+            flux_hits += 1
+            continue
+
+    total = len(tensor_keys)
+    if sdxl_hits > total * 0.5:
+        return None
+    if zimage_hits >= total * 0.9:
+        return "zimage-turbo"
+    if flux_hits >= total * 0.9:
+        return "flux-dev"
+    return None
+
+
+@bp.post("/subjects/<int:subject_id>/import-lora")
+def import_subject_lora(subject_id):
+    """Attach an externally-trained LoRA (.safetensors) to a Subject.
+
+    Multipart fields:
+      lora_file      — required, the .safetensors checkpoint
+      base_model_id  — required, 'zimage-turbo' or 'flux-dev'
+      trigger_word   — required, the token the LoRA was trained on
+    """
+    request.max_content_length = _IMPORT_MAX_BYTES
+
+    s = db.session.get(Subject, subject_id)
+    if s is None:
+        return jsonify({"error": "subject not found"}), 404
+
+    f = request.files.get("lora_file")
+    if not f or not f.filename:
+        return jsonify({"error": "no file (expected multipart field 'lora_file')"}), 400
+
+    base_model_id = (request.form.get("base_model_id") or "").strip()
+    trigger_word = (request.form.get("trigger_word") or "").strip()
+    if not trigger_word:
+        return jsonify({"error": "trigger_word is required"}), 400
+
+    profile = get_profile(base_model_id)
+    if not profile or profile["id"] not in (ZIMAGE_TURBO, FLUX_DEV):
+        return jsonify({
+            "error": f"unsupported base_model_id {base_model_id!r}; "
+                     f"expected one of: {ZIMAGE_TURBO!r}, {FLUX_DEV!r}"
+        }), 400
+    base_model_id = profile["id"]
+
+    ext = Path(secure_filename(f.filename) or "").suffix.lower()
+    if ext != ".safetensors":
+        return jsonify({"error": f"expected a .safetensors file, got {ext!r}"}), 400
+
+    target_dir = Path(STORAGE_DIR) / _LORA_SUBDIR
+    target_dir.mkdir(parents=True, exist_ok=True)
+    tmp_path = target_dir / f".importing-{subject_id}-{os.getpid()}.safetensors"
+
+    written = 0
+    oversized = False
+    write_error = None
+    try:
+        with open(tmp_path, "wb") as out:
+            while True:
+                chunk = f.stream.read(1024 * 1024)
+                if not chunk:
+                    break
+                written += len(chunk)
+                if written > _IMPORT_MAX_BYTES:
+                    oversized = True
+                    break
+                out.write(chunk)
+    except OSError as e:
+        write_error = e
+
+    if oversized or write_error is not None:
+        tmp_path.unlink(missing_ok=True)
+        reason = f"file exceeds {_IMPORT_MAX_BYTES // (1024**3)}GB limit" if oversized else f"write failed: {write_error}"
+        return jsonify({"error": reason}), 400
+
+    try:
+        with open(tmp_path, "rb") as fh:
+            header = _read_safetensors_header(fh)
+    except ValueError as e:
+        tmp_path.unlink(missing_ok=True)
+        return jsonify({"error": f"invalid safetensors file: {e}"}), 400
+
+    detected_family = _detect_lora_family(list(header.keys()))
+    if detected_family is None:
+        tmp_path.unlink(missing_ok=True)
+        return jsonify({
+            "error": "key layout does not match any supported LoRA family "
+                     "(zimage-turbo or flux-dev); SDXL LoRAs are not supported"
+        }), 400
+    if detected_family != base_model_id:
+        tmp_path.unlink(missing_ok=True)
+        return jsonify({
+            "error": f"selected base_model_id {base_model_id!r} does not match "
+                     f"the detected key layout ({detected_family!r})"
+        }), 400
+
+    next_version = (s.lora_version or 0) + 1
+    final_path = target_dir / f"subject_{subject_id}_imported_v{next_version}.safetensors"
+    tmp_path.replace(final_path)
+
+    write_lora_sidecar(
+        final_path,
+        subject_id=s.id,
+        subject_name=s.name,
+        trigger_word=trigger_word,
+        base_model_id=base_model_id,
+        ref_count=0,
+        mock=False,
+        extra={"imported": True, "train_backend": None},
+    )
+
+    s.lora_path = str(final_path.resolve())
+    s.trigger_word = trigger_word
+    s.lora_version = next_version
+    s.training_status = "trained"
+    s.training_settings_json = dict(s.training_settings_json or {}, base_model_id=base_model_id)
+    db.session.commit()
+
+    return jsonify({"subject": _serialize(s)})
