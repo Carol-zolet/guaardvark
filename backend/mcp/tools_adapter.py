@@ -354,18 +354,23 @@ def build_tool_handlers(config: MCPConfig) -> tuple[Any, Any, int]:
             logger.warning("MCP: no argument validation for %s: %s", name, exc)
             validators[name] = None
 
-    # Guard state belongs to a client session: one stdio client, or one HTTP
-    # session. Entries go away with their session object.
+    # State belongs to a client session and goes away with its object. The guard
+    # follows the SDK's session object, which mcp 2.x builds per request, so its
+    # duplicate and failure counts cover one call. Keyed calls follow the
+    # connection that session wraps (one stdio client, or one HTTP session), so a
+    # retry with the same idempotency_key finds the first run.
     sessions: weakref.WeakKeyDictionary[Any, _SessionState] = weakref.WeakKeyDictionary()
     sessionless = _SessionState()
     # An MCP call is one-shot: there is no ReACT loop to number it, so the guard's
     # iteration field carries call order instead.
     call_seq = count(1)
 
-    def _state_for(ctx: Any) -> _SessionState:
+    def _state_for(ctx: Any, per_connection: bool = False) -> _SessionState:
         session = getattr(ctx, "session", None)
         if session is None:
             return sessionless
+        if per_connection:
+            session = getattr(session, "_connection", None) or session
         try:
             state = sessions.get(session)
             if state is None:
@@ -387,7 +392,9 @@ def build_tool_handlers(config: MCPConfig) -> tuple[Any, Any, int]:
         params: mcp_types.CallToolRequestParams,
     ) -> mcp_types.CallToolResult:
         name = params.name
-        arguments = dict(params.arguments or {})
+        # A null is an omitted argument: dropped before the published defaults
+        # apply, so validation, the guard and the tool all see the same call.
+        arguments = {k: v for k, v in (params.arguments or {}).items() if v is not None}
         with audit_call(method="tools/call", target=name) as rec:
             rec["bytes_in"] = len(json.dumps(arguments, default=str))
 
@@ -412,11 +419,12 @@ def build_tool_handlers(config: MCPConfig) -> tuple[Any, Any, int]:
                 return _error_result(f"Invalid arguments for '{name}': {problem}")
 
             state = _state_for(ctx)
+            keyed_state = _state_for(ctx, per_connection=True)
             timeout = _call_timeout(config, arguments)
             args_hash = ToolExecutionGuard._hash_call(name, arguments)
 
             if key is not None:
-                earlier = state.keyed.get(key)
+                earlier = keyed_state.keyed.get(key)
                 if earlier is not None:
                     if (earlier.tool, earlier.args_hash) != (name, args_hash):
                         rec["outcome"] = "error"
@@ -440,16 +448,13 @@ def build_tool_handlers(config: MCPConfig) -> tuple[Any, Any, int]:
                     msg += f"\nSuggestion: {suggestion}"
                 return _error_result(msg)
 
-            # Validation already treats a null as an omitted optional argument;
-            # drop it so the tool's own default applies rather than None.
-            arguments = {k: v for k, v in arguments.items() if v is not None}
             # Tools run inside this MCP server process, not inside the backend.
             # Tell them so: a tool that needs the backend calls it over HTTP.
             base_tool.set_context({"transport": "mcp"})
             task = asyncio.ensure_future(asyncio.to_thread(base_tool.execute, **arguments))
             task.add_done_callback(partial(_record_outcome, state.guard, name, dict(arguments), call_seq))
             if key is not None:
-                state.remember(key, _KeyedCall(name, args_hash, task))
+                keyed_state.remember(key, _KeyedCall(name, args_hash, task))
             return await _await_result(task, name, timeout, read_only, key, rec)
 
     return on_list_tools, on_call_tool, len(by_name)
