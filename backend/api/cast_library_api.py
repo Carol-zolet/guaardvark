@@ -968,10 +968,9 @@ from backend.services.media_model_registry import (
 )
 
 _IMPORT_MAX_BYTES = 2 * 1024 * 1024 * 1024  # 2 GB — LoRA checkpoints, not images
-# Matches the trainer's own layout: STORAGE_DIR/training/loras (NOT the bare
-# "loras/" this route used before Dean's review — a relative training/loras/...
-# resolves to a folder that doesn't exist, and the Z-Image renderer just skips
-# a missing file with a log line instead of failing loudly.
+# Matches the trainer's own layout. A relative path here resolves against
+# the process cwd, not STORAGE_DIR — the Z-Image renderer then skips a
+# missing file with only a log line instead of failing loudly.
 _LORA_SUBDIR = Path("training") / "loras"
 
 # Z-Image (diffusers/PEFT) module path, after stripping a known prefix.
