@@ -277,3 +277,9 @@ def test_wan_lora_stays_a_lora():
     m = _video(src="split_files/loras/wan2.2_i2v_lightx2v_4steps_lora_v1_high_noise.safetensors",
                repo="Comfy-Org/Wan_2.2_ComfyUI_Repackaged")
     assert (m[0]["role"], m[0]["like"]) == ("lora", "wan22-14b-i2v")
+
+
+def test_wan_5b_lora_is_filed_under_the_5b():
+    m = _video(["HSToric_Color_Wan2.2_5B_LoRA.safetensors"],
+               repo="AlekseyCalvin/HSToric_Color_Wan2.2_5B_LoRA_BySilverAgePoets")
+    assert (m[0]["role"], m[0]["like"]) == ("lora", "wan22-5b")

@@ -225,6 +225,8 @@ VIDEO_FAMILIES = (
                 {"like": "wan22-14b", "any": ("14b", "wan"), "moe": True},
             ),
             "lora": (
+                # A LoRA trained on the 5B cannot load on the 14B experts.
+                {"like": "wan22-5b", "any": ("5b", "ti2v")},
                 {"like": "wan22-14b-i2v", "any": ("i2v",)},
                 {"like": "wan22-14b", "any": ("wan", "t2v", "14b")},
             ),
