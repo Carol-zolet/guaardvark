@@ -187,7 +187,7 @@ def get_active_video_model_route():
     overrides = get_active_video_model_overrides()
     resolved = {}
     for role in ("t2v", "i2v", "scene"):
-        mid, err = resolve_active_video_model(role)
+        mid, err = resolve_active_video_model(role, comfyui_down_ok=True)
         resolved[role] = {"model": mid, "error": err}
     return success_response({
         "model": get_active_video_model(),

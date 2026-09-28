@@ -2152,12 +2152,13 @@ def _probe_total_vram_mb():
         return 0
 
 
-def _accept_or_refuse(model_id: str, role: str) -> tuple:
+def _accept_or_refuse(model_id: str, role: str, comfyui_down_ok: bool = False) -> tuple:
     ready, err = preflight_video_model(model_id)
-    # ComfyUI being stopped says nothing about the choice of model, and the
-    # queue step (prepare_video_model) starts it: refusing here would stop a
-    # Video Gen batch, a music video or a Film Crew before that start.
-    if not ready and getattr(err, "kind", None) != RenderErrorKind.COMFYUI_DOWN:
+    # A caller that runs prepare_video_model next starts a stopped ComfyUI
+    # itself; refusing here would stop it before that start. Callers without
+    # that step keep the refusal, or they fail later, mid-job.
+    comfyui_down = getattr(err, "kind", None) == RenderErrorKind.COMFYUI_DOWN
+    if not ready and not (comfyui_down_ok and comfyui_down):
         return None, err
     if not _role_ok(model_id, role):
         name = (VIDEO_MODEL_REGISTRY.get(model_id) or {}).get("name") or model_id
@@ -2196,6 +2197,7 @@ def resolve_active_video_model(
     explicit: str | None = None,
     *,
     surface: str | None = None,
+    comfyui_down_ok: bool = False,
 ) -> tuple:
     """Pick the video model for this job.
 
@@ -2203,40 +2205,44 @@ def resolve_active_video_model(
     setting → first installed model that fits the card. A typed id that
     cannot run is refused in one sentence; families are never swapped
     silently. Returns ``(model_id, None)`` or ``(None, message)``.
+
+    ``comfyui_down_ok`` accepts a model whose only problem is a stopped
+    ComfyUI: for callers that run prepare_video_model next, and for
+    displays of the chosen model.
     """
     if role not in ("t2v", "i2v", "scene"):
         return None, f"Unknown video role '{role}'."
     explicit = (explicit or "").strip() or None
     if explicit:
-        return _accept_or_refuse(explicit, role)
+        return _accept_or_refuse(explicit, role, comfyui_down_ok)
 
     if surface:
         key = _SURFACE_SETTING.get(surface)
         if key:
             override = _video_setting(key)
             if override:
-                return _accept_or_refuse(override, role)
+                return _accept_or_refuse(override, role, comfyui_down_ok)
 
     if role == "i2v":
         i2v_override = _video_setting("active_video_model_i2v")
         if i2v_override:
-            return _accept_or_refuse(i2v_override, "i2v")
+            return _accept_or_refuse(i2v_override, "i2v", comfyui_down_ok)
         global_id = _video_setting("active_video_model")
         if global_id:
             if _role_ok(global_id, "i2v"):
-                return _accept_or_refuse(global_id, "i2v")
+                return _accept_or_refuse(global_id, "i2v", comfyui_down_ok)
             sibling = i2v_model_for(global_id, default="")
             if sibling:
-                return _accept_or_refuse(sibling, "i2v")
+                return _accept_or_refuse(sibling, "i2v", comfyui_down_ok)
     else:
         global_id = _video_setting("active_video_model")
         if global_id:
             if _role_ok(global_id, role):
-                return _accept_or_refuse(global_id, role)
+                return _accept_or_refuse(global_id, role, comfyui_down_ok)
             if role == "scene":
                 sibling = i2v_model_for(global_id, default="")
                 if sibling and _role_ok(sibling, "scene"):
-                    return _accept_or_refuse(sibling, "scene")
+                    return _accept_or_refuse(sibling, "scene", comfyui_down_ok)
 
     fallback = _hardware_fallback(role, _probe_total_vram_mb())
     if fallback:
