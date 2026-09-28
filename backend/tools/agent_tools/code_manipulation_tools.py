@@ -669,16 +669,21 @@ class GetRepositoryMapTool(BaseTool):
     name = "get_repository_map"
     read_only = True
     description = (
-        "Retrieve the PageRank-based architectural repository map for a given folder ID. "
-        "This map shows the most important functions and classes in the codebase and their relationships. "
-        "Use this tool to get a high-level understanding of a Code Repository."
+        "Return the stored architecture overview of an uploaded Code Repository folder: Markdown listing "
+        "its files by PageRank, each with up to 10 top-ranked classes, functions and methods, cut off at "
+        "about 4,096 tokens. Take folder_id from list_code_repositories, using an entry with "
+        "has_metadata=true. Read-only; needs the Guaardvark backend running, and shows the folder as of "
+        "its last analysis, not later edits. Fails with a message if the folder is not a Code Repository "
+        "or not analysed yet, and says so when the analysis found no code symbols. For import edges use "
+        "get_dependency_graph; for one Python symbol's source, read_ast_node; for Guaardvark's own "
+        "checkout, map_codebase."
     )
     parameters = {
         "folder_id": ToolParameter(
             name="folder_id",
             type="int",
             required=True,
-            description="The integer ID of the Code Repository folder."
+            description="Integer id of an analysed Code Repository folder (has_metadata=true in list_code_repositories). Subfolders of a marked folder are listed too but are usually not analysed on their own; use the top folder's id."
         )
     }
 
@@ -699,8 +704,14 @@ class GetRepositoryMapTool(BaseTool):
                 return ToolResult(success=False, error=f"Folder {folder_id} has no repository metadata generated yet.")
 
             repo_map = folder["metadata"].get("repository_map")
-            
+
             if not repo_map:
+                if "repository_map" in folder["metadata"]:
+                    return ToolResult(
+                        success=True,
+                        output="The analysis found no classes or functions to map in this folder.",
+                        metadata={"folder_id": folder_id},
+                    )
                 return ToolResult(success=False, error="No repository map found in the metadata. It may still be generating.")
 
             return ToolResult(
@@ -719,16 +730,21 @@ class GetDependencyGraphTool(BaseTool):
     name = "get_dependency_graph"
     read_only = True
     description = (
-        "Retrieve the file-level import dependency graph for a given folder ID. "
-        "This returns a JSON string mapping files to the files they import. "
-        "Use this tool to trace dependencies and understand how files interact."
+        "Return the file-level import graph of an uploaded Code Repository folder as JSON "
+        "{file: [in-repository files it imports]}, paths starting with the folder's own path. Only "
+        "Python and JavaScript/TypeScript imports are parsed; third-party imports and files that import "
+        "nothing in the repository are left out, and a repository with no internal imports returns {}. "
+        "Take folder_id from list_code_repositories. Read-only; needs the Guaardvark backend running, "
+        "reflects the last analysis, and fails with a message if the folder is not analysed. For a "
+        "ranked symbol overview use get_repository_map; for import cycles in Guaardvark's own checkout, "
+        "map_codebase."
     )
     parameters = {
         "folder_id": ToolParameter(
             name="folder_id",
             type="int",
             required=True,
-            description="The integer ID of the Code Repository folder."
+            description="Integer id of an analysed Code Repository folder (has_metadata=true in list_code_repositories). Subfolders of a marked folder are listed too but are usually not analysed on their own; use the top folder's id."
         )
     }
 
@@ -749,8 +765,9 @@ class GetDependencyGraphTool(BaseTool):
                 return ToolResult(success=False, error=f"Folder {folder_id} has no repository metadata generated yet.")
 
             dep_graph = folder["metadata"].get("dependency_graph")
-            
-            if not dep_graph:
+
+            # An empty graph is an answer: nothing in the repository imports anything else in it.
+            if dep_graph is None:
                 return ToolResult(success=False, error="No dependency graph found in the metadata.")
 
             return ToolResult(
@@ -769,28 +786,32 @@ class ReadASTNodeTool(BaseTool):
     name = "read_ast_node"
     read_only = True
     description = (
-        "Read the exact source code of a specific class or function from a Python file in a Code Repository folder. "
-        "This is more precise and token-efficient than reading the entire file. "
-        "Only supports Python (.py) files currently and requires a repository-relative filepath."
+        "Return the source of one Python class or function, decorators included, from a file in an "
+        "uploaded Code Repository folder, instead of the whole file. Matches the bare name at any depth "
+        "(methods, nested functions); each definition comes back headed '# Match N: <type> lines A-B'. "
+        "Reads the file as it is on disk now; needs the Guaardvark backend running to locate the folder. "
+        "Fails with a message for non-.py or absolute paths, paths outside the folder, a missing file, "
+        "syntax errors or a name not found. Find names with get_repository_map; for the whole file, "
+        "read_code with 'data/uploads/' plus the path get_repository_map shows."
     )
     parameters = {
         "folder_id": ToolParameter(
             name="folder_id",
             type="int",
             required=True,
-            description="The integer ID of the Code Repository folder."
+            description="Integer id of the Code Repository folder, from list_code_repositories. It does not need to be analysed."
         ),
         "filepath": ToolParameter(
             name="filepath",
             type="string",
             required=True,
-            description="Path to the Python file, relative to the Code Repository folder."
+            description="Path of a .py file relative to the folder's root, e.g. 'app/main.py'. Paths shown by get_repository_map and get_dependency_graph begin with the folder's own path (e.g. 'Repo/app/main.py'); drop that prefix."
         ),
         "node_name": ToolParameter(
             name="node_name",
             type="string",
             required=True,
-            description="The name of the class or function to extract (e.g., 'MyClass' or 'my_function')."
+            description="Exact, case-sensitive name of a class or function, e.g. 'Worker' or 'build_graph'. Use the bare name: 'Worker.run' does not match; 'run' does, along with any other definition named run."
         )
     }
 
@@ -829,7 +850,10 @@ class ReadASTNodeTool(BaseTool):
             if not full_path.exists():
                 return ToolResult(success=False, error=f"File not found: {filepath}")
 
-            source = full_path.read_text(encoding="utf-8")
+            try:
+                source = full_path.read_text(encoding="utf-8")
+            except UnicodeDecodeError:
+                return ToolResult(success=False, error=f"{filepath} is not UTF-8 text.")
 
             try:
                 tree = ast.parse(source)
@@ -854,13 +878,11 @@ class ReadASTNodeTool(BaseTool):
                         })
 
             if matches:
-                if len(matches) == 1:
-                    output = matches[0]["source"]
-                else:
-                    output = "\n\n".join(
-                        f"# Match {idx}: {match['type']} lines {match['start_line']}-{match['end_line']}\n{match['source']}"
-                        for idx, match in enumerate(matches, start=1)
-                    )
+                # Every match carries its line range: MCP clients see only this text.
+                output = "\n\n".join(
+                    f"# Match {idx}: {match['type']} lines {match['start_line']}-{match['end_line']}\n{match['source']}"
+                    for idx, match in enumerate(matches, start=1)
+                )
                 return ToolResult(
                     success=True,
                     output=output,
@@ -888,11 +910,13 @@ class ListCodeRepositoriesTool(BaseTool):
     name = "list_code_repositories"
     read_only = True
     description = (
-        "List all Code Repository folders that have been marked as such (is_repository=True) and analyzed. "
-        "Returns id, name, path, and whether repo_metadata is available. "
-        "Use this first when the user refers to 'the uploaded code', 'guaardvark upload folder', 'the code repo in data/uploads/Code', "
-        "or similar to discover the folder_id(s) needed for get_repository_map, get_dependency_graph, read_ast_node, etc. "
-        "This helps the agent get a full picture of available code repositories before analyzing or editing."
+        "List the folders marked as Code Repositories in Guaardvark, as a JSON array of {id, name, path, "
+        "has_metadata, description}. Call it first to get the integer folder_id that get_repository_map, "
+        "get_dependency_graph and read_ast_node take. Marking a folder on the Documents page also marks "
+        "each subfolder, listed separately; only entries with has_metadata=true have been analysed (the "
+        "map and graph are built at the end of that analysis), so use the top folder's id for those. The last entry, id 'live', is Guaardvark's own source root, "
+        "not a folder id: explore it with search_code, read_code or map_codebase. Read-only; needs the "
+        "Guaardvark backend running. Folders are marked on the Documents page or by bulk indexing."
     )
     parameters = {}
 
