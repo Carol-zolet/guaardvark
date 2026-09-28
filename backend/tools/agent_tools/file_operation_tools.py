@@ -255,7 +255,9 @@ class ProcessFileTool(BaseTool):
         "[N pages,] M words)'; nothing is written or indexed. PDF: the text layer of every page, no OCR "
         "(a scanned PDF comes back empty). DOCX: body paragraphs, then table rows. XML: the text of its "
         "elements, tags dropped. CSV, .txt, .md, .rst, .json, .yaml, .toml, .ini, .log and .html: the "
-        "file as-is (UTF-8, up to 10 MB). Excel: each sheet's size, column names and first 20 rows. "
+        "file as-is (UTF-8, up to 10 MB). Excel (.xlsx, .xlsm): a workbook summary, then for each sheet "
+        "with data its size, column names and first 20 rows (up to 50 sheets and 10,000 rows a sheet "
+        "are read); .xls and .xlsb need the xlrd or pyxlsb package, which a stock install lacks. "
         "Image text (.jpg, .jpeg, .png, .gif, .bmp, .webp) is read by a vision model in the local "
         "Ollama, and fails with an error when none is available. For documents already indexed use "
         "search_knowledge_base or read_document_section; for source code, read_code."
@@ -267,12 +269,14 @@ class ProcessFileTool(BaseTool):
             required=True,
             description=(
                 "File to read: a path relative to the Guaardvark folder (tried first, e.g. "
-                "'data/uploads/report.pdf'), else relative to its uploads folder (e.g. 'Guaardvark "
-                "Docs/INSTALL.md'), or an absolute path inside Guaardvark's uploads, outputs or install "
-                "folder. Credential, key and .env files are refused everywhere; inside the install folder "
-                "so are git-ignored data (other than uploads and outputs) and .git, venv, logs and similar "
+                "'data/uploads/report.pdf'), else relative to its uploads folder (e.g. "
+                "'reports/q3.pdf'), or an absolute path inside Guaardvark's uploads, outputs or install "
+                "folder. Files named like keys or credentials (.env*, *.pem, *.key, id_rsa*, "
+                "credentials*, .netrc and similar) are refused everywhere; inside the install folder so "
+                "are git-ignored data (other than uploads and outputs) and .git, venv, logs and similar "
                 "folders. In Guaardvark's own chat an absolute path elsewhere also works, except system "
-                "and key folders; over MCP it is refused."
+                "folders and anything under a hidden folder or named with a leading '.', and not with "
+                "Settings > Project folder only on; over MCP it is refused."
             ),
         )
     }
@@ -301,6 +305,10 @@ class ProcessFileTool(BaseTool):
             return "it is outside Guaardvark's uploads, outputs and install folder, which is all this tool reads over MCP"
         if external_path_reason(path):
             return "system folders and key folders (.ssh, .aws, .gnupg and similar) are not read"
+        # Hidden folders hold application credentials under names no list can
+        # cover (~/.config/gh, ~/.claude, gcloud's config), so none are read.
+        if any(part.startswith(".") for part in path.parts):
+            return "hidden folders and files (names starting with '.') outside the install are not read"
         from backend.tools.code_tools import _confine_candidates
         if not _confine_candidates([str(path)]):
             return "it is outside the project folder (Settings: Project folder only)"
@@ -317,11 +325,17 @@ class ProcessFileTool(BaseTool):
         raw = str(file_path or "").strip()
         if not raw or "\x00" in raw:
             return None, "file_path is empty or not a valid path"
-        candidate = Path(raw).expanduser()
+        try:
+            candidate = Path(raw).expanduser()
+        except RuntimeError as e:  # ~user with no such user
+            return None, f"'{file_path}' is not a valid path: {e}"
         # A relative path is tried in the Guaardvark folder, then in its uploads.
         options = [(candidate, None)] if candidate.is_absolute() else [(root / candidate, root), (uploads / candidate, uploads)]
         for option, base in options:
-            path = option.resolve()
+            try:
+                path = option.resolve()
+            except (RuntimeError, OSError) as e:  # a symlink loop, for one
+                return None, f"'{file_path}' could not be resolved: {e}"
             if base is not None and not path.is_relative_to(base):
                 return None, f"'{file_path}' was refused: a relative path may not leave the Guaardvark folder"
             reason = self._refusal(path, root, uploads, outputs)
@@ -379,6 +393,11 @@ class ProcessFileTool(BaseTool):
         meta = result.metadata
         fmt = meta.format.value
         text = result.text_content or ""
+        if fmt in ("xlsx", "xls", "xlsm", "xlsb"):
+            extraction = result.extraction_results or {}
+            if not extraction.get("success"):
+                reason = extraction.get("error") or "the workbook could not be read"
+                return ToolResult(success=False, error=f"Could not read {shown}: {reason}")
         if fmt in ("jpg", "jpeg", "png", "gif", "bmp", "webp", "svg"):
             extraction = result.extraction_results or {}
             if not extraction.get("success"):

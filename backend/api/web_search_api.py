@@ -48,13 +48,25 @@ def extract_website_content(url: str, query: Optional[str] = None, public_only: 
             # Redirects are followed one hop at a time so every hop is checked: a
             # public page must not be able to bounce the fetch onto this machine.
             from urllib.parse import urljoin
-            from backend.utils.hosts import private_address_reason
-            with requests.Session() as session:
+            from backend.utils.hosts import (
+                PrivateAddressError, private_address_reason, public_only_session,
+            )
+            with public_only_session() as session:
                 for _hop in range(MAX_REDIRECTS + 1):
                     refused = private_address_reason(current)
                     if refused:
                         return {"success": False, "url": url, "error": f"Refused to fetch {current}: {refused}"}
-                    response = session.get(current, headers=headers, timeout=15, allow_redirects=False)
+                    try:
+                        response = session.get(current, headers=headers, timeout=15, allow_redirects=False)
+                    except requests.exceptions.ConnectionError as e:
+                        # The connect-time check: the name resolved differently from
+                        # the check above, or requests decoded the host differently.
+                        reason = getattr(e.args[0], "reason", None) if e.args else None
+                        if isinstance(reason, PrivateAddressError):
+                            return {"success": False, "url": url,
+                                    "error": f"Refused to fetch {current}: {reason.host_name} resolves "
+                                             f"to a private or local address ({reason.address})"}
+                        raise
                     location = session.get_redirect_target(response)
                     if location:
                         current = urljoin(current, location)
@@ -174,8 +186,11 @@ def get_weather_info(location: str) -> Dict[str, Any]:
             "error": f"Weather service error: {str(e)}"
         }
 
-def enhanced_web_search(query: str) -> Dict[str, Any]:
-    
+def enhanced_web_search(query: str, public_only: bool = False) -> Dict[str, Any]:
+    """Answer ``query`` from the web. A URL in the query is fetched directly;
+    ``public_only`` refuses that fetch for addresses that are not globally
+    routable, as fetch_url does."""
+
     results = {
         "query": query,
         "strategy_used": "",
@@ -196,8 +211,14 @@ def enhanced_web_search(query: str) -> Dict[str, Any]:
             url = 'https://' + url
             
         logger.info(f"Direct website access for: {url}")
-        website_data = extract_website_content(url)
-        
+        website_data = extract_website_content(url, public_only=public_only)
+        if not website_data["success"] and str(website_data.get("error", "")).startswith("Refused"):
+            # A refused address ends the call: searching the web for the URL's text
+            # would answer a question nobody asked.
+            results["error"] = website_data["error"]
+            results["data"] = {"message": website_data["error"]}
+            return results
+
         if website_data["success"]:
             results.update({
                 "strategy_used": "direct_website",

@@ -167,7 +167,7 @@ class WebAnalysisTool(BaseTool):
     name = "analyze_website"
     read_only = True
     description = (
-        "Fetch one public web page live and return a JSON SEO report, computed without an LLM: "
+        "Audit one public web page's SEO live and return a JSON report, computed without an LLM: "
         "url (as requested, https:// added to a bare domain) and final_url (after redirects), title, meta "
         "description, a 500-character preview; a metadata block (on by default) checking title and "
         "meta-description lengths against 30-60 and 120-160 characters; and, by analysis_type, an seo "
@@ -176,7 +176,8 @@ class WebAnalysisTool(BaseTool):
         "and an insights block (sentence stats, readability and keyword hints for article, product or "
         "landing page, from the ~2000-character extract). Use it to audit a page's title and "
         "description; to read the page use fetch_url, to find pages web_search. Needs web access on "
-        "in Settings (off by default); private and local addresses are refused."
+        "in Settings (off by default), and over MCP the Guaardvark backend running; private and local "
+        "addresses are refused, including after a redirect or a DNS change."
     )
 
     parameters = {
@@ -401,14 +402,15 @@ class FetchUrlTool(BaseTool):
     name = "fetch_url"
     read_only = True
     description = (
-        "Fetch one public web page live and return JSON {url, final_url, title, description, content, "
-        "content_length}: the title ('' if the page has none), the meta description and up to ~2000 "
-        "characters of main text (scripts, styles, nav, footers and asides removed; JavaScript is not "
-        "run). Use this for ANY question about a specific webpage or domain. Pass query with the "
-        "user's question to get the stretch of the page that contains the most of its words instead "
-        "of the top of the page. For open-ended searches use web_search; for a title and "
-        "meta-description audit use analyze_website. Needs web access on in Settings (off by default); "
-        "private and local addresses are refused."
+        "Read one public web page live, for ANY question about a specific webpage or domain (e.g. "
+        "'what's on example.com', 'read https://site.com/page'). Returns JSON {url, final_url, title, "
+        "description, content, content_length}: the title ('' if the page has none), the meta "
+        "description and up to ~2000 characters of main text (scripts, styles, nav, footers and asides "
+        "removed; JavaScript is not run). Pass query with the user's question to get the stretch of the "
+        "page that contains the most of its words instead of the top of the page. For open-ended "
+        "searches use web_search; for a title and meta-description audit use analyze_website. Needs web "
+        "access on in Settings (off by default), and over MCP the Guaardvark backend running; private "
+        "and local addresses are refused, including after a redirect or a DNS change."
     )
 
     parameters = {
@@ -543,8 +545,11 @@ class WebSearchTool(BaseTool):
 
         try:
             from backend.api.web_search_api import enhanced_web_search
+            from backend.utils.backend_http import is_mcp_transport
 
-            search_results = enhanced_web_search(query)
+            # A URL in the query is fetched directly; over MCP only a public
+            # address may be, as with fetch_url.
+            search_results = enhanced_web_search(query, public_only=is_mcp_transport(self))
 
             if not search_results or not search_results.get("success"):
                 error_msg = search_results.get("error") if search_results else "Web search failed"

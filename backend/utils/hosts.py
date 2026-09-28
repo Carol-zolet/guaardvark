@@ -6,6 +6,17 @@ import ipaddress
 import socket
 from urllib.parse import urlparse
 
+from urllib3.exceptions import NewConnectionError
+
+
+class PrivateAddressError(NewConnectionError):
+    """A connection refused because the host resolved to a non-public address."""
+
+    def __init__(self, conn, host: str, address: str):
+        self.host_name = host
+        self.address = address
+        super().__init__(conn, f"{host} resolves to a private or local address ({address})")
+
 
 def url_host(url: str | None) -> str:
     """Lower-cased hostname of ``url``, or "" when it has none."""
@@ -68,11 +79,89 @@ def private_address_reason(url: str | None) -> str | None:
     except (socket.gaierror, UnicodeError) as e:
         return f"could not resolve {host}: {e}"
     for info in infos:
-        ip = ipaddress.ip_address(info[4][0].split("%")[0])
-        mapped = getattr(ip, "ipv4_mapped", None)
-        if mapped is not None:
-            ip = mapped
-        if (not ip.is_global or ip.is_multicast
-                or (ip.version == 6 and ip.is_site_local)):
-            return f"{host} resolves to a private or local address ({ip})"
+        if not is_public_address(info[4][0]):
+            return f"{host} resolves to a private or local address ({info[4][0]})"
     return None
+
+
+_NAT64 = (ipaddress.ip_network("64:ff9b::/96"), ipaddress.ip_network("64:ff9b:1::/48"))
+_IPV4_COMPATIBLE = ipaddress.ip_network("::/96")
+
+
+def is_public_address(address: str) -> bool:
+    """True when ``address`` is globally routable, including the IPv4 address an
+    IPv6 form carries (mapped, IPv4-compatible, NAT64, 6to4, Teredo)."""
+    try:
+        ip = ipaddress.ip_address(str(address).split("%")[0])
+    except ValueError:
+        return False
+    candidates = [ip]
+    if ip.version == 6:
+        embedded = [ip.ipv4_mapped, ip.sixtofour, ip.teredo[1] if ip.teredo else None]
+        if ip in _IPV4_COMPATIBLE or any(ip in net for net in _NAT64):
+            embedded.append(ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF))
+        candidates += [e for e in embedded if e is not None]
+    return all(
+        c.is_global and not c.is_multicast and not (c.version == 6 and c.is_site_local)
+        for c in candidates
+    )
+
+
+def public_only_session():
+    """A requests Session that connects only to globally routable addresses.
+
+    The address is checked when the connection is made, and the socket goes to
+    exactly the address that was checked, so a name that resolves differently
+    between a check and the fetch (DNS rebinding) or a host that requests
+    decodes differently from the checker (percent-encoding) cannot reach this
+    machine or its networks. TLS is still verified against the host name. A
+    configured HTTP proxy connects on its own and gets only the name check
+    private_address_reason makes.
+    """
+    import requests
+    from requests.adapters import HTTPAdapter
+    from urllib3.connection import HTTPConnection, HTTPSConnection
+    from urllib3.connectionpool import HTTPConnectionPool, HTTPSConnectionPool
+    from urllib3.exceptions import NameResolutionError
+    from urllib3.util import connection as u3conn
+
+    class _PublicOnly:
+        def _new_conn(self):
+            try:
+                infos = socket.getaddrinfo(self._dns_host, self.port, type=socket.SOCK_STREAM)
+            except socket.gaierror as e:
+                raise NameResolutionError(self.host, self, e) from e
+            for info in infos:
+                if not is_public_address(info[4][0]):
+                    raise PrivateAddressError(self, self._dns_host, info[4][0])
+            error = None
+            for info in infos:
+                try:
+                    return u3conn.create_connection(
+                        (info[4][0], self.port), self.timeout,
+                        source_address=self.source_address, socket_options=self.socket_options)
+                except OSError as e:
+                    error = e
+            raise NewConnectionError(self, f"Failed to establish a new connection: {error}")
+
+    class _HTTP(_PublicOnly, HTTPConnection):
+        pass
+
+    class _HTTPS(_PublicOnly, HTTPSConnection):
+        pass
+
+    class _HTTPPool(HTTPConnectionPool):
+        ConnectionCls = _HTTP
+
+    class _HTTPSPool(HTTPSConnectionPool):
+        ConnectionCls = _HTTPS
+
+    class _Adapter(HTTPAdapter):
+        def init_poolmanager(self, *args, **kwargs):
+            super().init_poolmanager(*args, **kwargs)
+            self.poolmanager.pool_classes_by_scheme = {"http": _HTTPPool, "https": _HTTPSPool}
+
+    session = requests.Session()
+    session.mount("http://", _Adapter())
+    session.mount("https://", _Adapter())
+    return session
