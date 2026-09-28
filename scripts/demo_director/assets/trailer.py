@@ -8,8 +8,10 @@ PICKS.json:
      "open": ["00_intro", "03_your_gpu"],            # launch plates, 2 beats each
      "picks": [{"src": "beat_00_teach.raw.mp4", "t": 12.0, "beats": 6,
                 "caption": "A THUMB SAYS WHAT IT TAUGHT",
-                "zoom": [x, y, w, h]},              # optional 16:9 region, source px
-               ...],
+                "zoom": [x, y, w, h],               # optional 16:9 region, source px
+                "zoom_tall": [x, y, w, h],          # optional region for 9:16, any shape
+                "audio": 1.0},                      # optional: the take's own sound at
+               ...],                                # this gain, music ducked under it
      "end": ["ONE MACHINE. NO CLOUD.", "guaardvark.com"]}
 
 Take picks only from beats whose verify passed in that run: the privacy check
@@ -73,7 +75,7 @@ def text_png(lines: list[tuple[str, str, int, tuple]], size: tuple[int, int], y0
 
 
 def segment(src: str, start: float, dur: float, shape: str, zoom, caption_png: Path | None,
-            out: Path):
+            out: Path, loop: bool = False):
     w, h = SHAPES[shape]
     region = ""
     if zoom:
@@ -91,7 +93,8 @@ def segment(src: str, start: float, dur: float, shape: str, zoom, caption_png: P
               f"boxblur=30:2,eq=brightness=-0.25[bg];"
               f"[b]scale={w}:-2:flags=lanczos[fg];"
               f"[bg][fg]overlay=0:(H-h)/2,fps={FPS},setsar=1[base]")
-    cmd = ["ffmpeg", "-y", "-i", src]
+    # A loop plate is shorter than the end card it sits under; repeat it to fill.
+    cmd = ["ffmpeg", "-y"] + (["-stream_loop", "-1"] if loop else []) + ["-i", src]
     if caption_png:
         cmd += ["-i", str(caption_png)]
         vf += ";[base][1:v]overlay=0:0,format=yuv420p[v]"
@@ -100,6 +103,17 @@ def segment(src: str, start: float, dur: float, shape: str, zoom, caption_png: P
     cmd += ["-filter_complex", vf, "-map", "[v]", "-an", "-c:v", "libx264",
             "-preset", "medium", "-crf", "18", "-t", f"{dur:.4f}", str(out)]
     run(cmd)
+
+
+def probe(path: Path) -> float:
+    return float(subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0",
+         str(path)], capture_output=True, text=True).stdout)
+
+
+# The music under a pick that plays its own sound (a clip's voice) sits this low.
+MUSIC_UNDER_VOICE = 0.25
+DUCK_RAMP_S = 0.25
 
 
 def build(picks_file: Path, out_dir: Path):
@@ -111,6 +125,7 @@ def build(picks_file: Path, out_dir: Path):
         with tempfile.TemporaryDirectory(prefix="trailer_") as tmp:
             tmp = Path(tmp)
             parts: list[Path] = []
+            voiced: dict[int, tuple[str, float, float]] = {}  # part index -> src, start, gain
             big = 64 if shape == "wide" else 76
             for k, key in enumerate(spec.get("open", [])):
                 p = tmp / f"open_{k}.mp4"
@@ -121,29 +136,65 @@ def build(picks_file: Path, out_dir: Path):
                 text_png([(pick["caption"], F_TITLE, big, (255, 255, 255))], (w, h),
                          0.80 if shape == "wide" else 0.14, cap, band=shape == "wide")
                 p = tmp / f"pick_{k}.mp4"
+                zoom = pick.get("zoom_tall") if shape == "tall" and pick.get("zoom_tall") \
+                    else pick.get("zoom")
                 segment(str(run_dir / pick["src"]), pick["t"], pick["beats"] * BEAT, shape,
-                        pick.get("zoom"), cap, p)
+                        zoom, cap, p)
+                if pick.get("audio"):
+                    voiced[len(parts)] = (str(run_dir / pick["src"]), pick["t"],
+                                          float(pick["audio"]))
                 parts.append(p)
             end_png = tmp / "end.png"
             l1, l2 = spec.get("end", ["ONE MACHINE. NO CLOUD.", "guaardvark.com"])
             text_png([(l1, F_TITLE, big + 16 if shape == "wide" else big - 6, (255, 255, 255)),
                       (l2, F_SUB, big - 14, CYAN)],
-                     (w, h), 0.42, end_png, band=False)
+                     # Tall: under the picture band, clear of the sun's stripes.
+                     (w, h), 0.42 if shape == "wide" else 0.70, end_png, band=False)
             p = tmp / "end.mp4"
-            segment(plates["12_loop_grid"], 0.4, 8 * BEAT, shape, None, end_png, p)
+            segment(plates["12_loop_grid"], 0.4, 8 * BEAT, shape, None, end_png, p, loop=True)
             parts.append(p)
 
-            total = sum(float(subprocess.run(
-                ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of",
-                 "csv=p=0", str(q)], capture_output=True, text=True).stdout) for q in parts)
+            durs = [probe(q) for q in parts]
+            total = sum(durs)
             lst = tmp / "list.txt"
             lst.write_text("".join(f"file '{q}'\n" for q in parts))
+            # A second track, part for part: the take's own sound where a pick asks for
+            # it, silence elsewhere, cut to each video part's real length so it stays
+            # in sync after concatenation.
+            windows, vparts = [], []
+            at = 0.0
+            for i, d in enumerate(durs):
+                a = tmp / f"voice_{i}.wav"
+                if i in voiced:
+                    src, start, gain = voiced[i]
+                    run(["ffmpeg", "-y", "-i", src, "-vn", "-af",
+                         f"atrim=start={start}:duration={d:.4f},asetpts=PTS-STARTPTS,"
+                         f"volume={gain},aresample=48000,apad=whole_dur={d:.4f}",
+                         "-ac", "2", "-ar", "48000", str(a)])
+                    windows.append((at, at + d))
+                else:
+                    run(["ffmpeg", "-y", "-f", "lavfi", "-i",
+                         "anullsrc=r=48000:cl=stereo", "-t", f"{d:.4f}", str(a)])
+                vparts.append(a)
+                at += d
+            vlst = tmp / "voice.txt"
+            vlst.write_text("".join(f"file '{q}'\n" for q in vparts))
+            # Ramp the music down over DUCK_RAMP_S before each voiced window and back
+            # up after it, so the dip is not a hard step.
+            r = DUCK_RAMP_S
+            duck = "".join(
+                f",volume='1-{1 - MUSIC_UNDER_VOICE}*clip(min((t-{a0 - r:.3f})/{r},"
+                f"({a1 + r:.3f}-t)/{r}),0,1)':eval=frame"
+                for a0, a1 in windows)
             out = out_dir / f"trailer_{shape}.mp4"
             run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(lst),
                  "-ss", f"{TRACK_START}", "-t", f"{total:.3f}", "-i", str(TRACK),
+                 "-f", "concat", "-safe", "0", "-i", str(vlst),
                  "-filter_complex",
                  f"[0:v]fade=t=out:st={total - 0.6:.3f}:d=0.6[v];"
-                 f"[1:a]afade=t=out:st={total - 1.5:.3f}:d=1.5[a]",
+                 f"[1:a]aresample=48000{duck}[m];"
+                 f"[m][2:a]amix=inputs=2:duration=first:normalize=0,"
+                 f"afade=t=out:st={total - 1.5:.3f}:d=1.5[a]",
                  "-map", "[v]", "-map", "[a]", "-c:v", "libx264", "-preset", "medium",
                  "-crf", "19", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k",
                  "-movflags", "+faststart", str(out)])
