@@ -2482,6 +2482,9 @@ class ComfyUIVideoGenerator(ComfyUIVideoWorkflowMixin):
                 def stop(self):
                     return None
 
+                def finish(self, *args, **kwargs):
+                    return None
+
             client_id = _uuid.uuid4().hex
             progress_bridge = _NoOpProgressBridge()
             try:
@@ -2543,7 +2546,8 @@ class ComfyUIVideoGenerator(ComfyUIVideoWorkflowMixin):
                 prompt_id, timeout=gen_timeout, hard_ceiling_s=hard_ceiling
             )
             self._forget_prompt(prompt_id)
-            progress_bridge.stop()  # /history poll owns completion; bridge is done
+            # The /history poll decides the outcome; the bridge closes its job with it.
+            progress_bridge.finish(bool(outputs))
 
             if not outputs:
                 failure = getattr(self, "_last_wait_failure", None) or RenderFailure(
