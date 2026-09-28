@@ -75,12 +75,22 @@ def read_code(filepath: str, allow_external: bool = True) -> str:
         except GuardedCodeError as e:
             # Maybe the user just uploaded this to chat — those land under
             # data/uploads/, not PROJECT_ROOT, and have a Document row.
-            if e.code == "FILE_NOT_FOUND":
+            # Only a bare file name is looked up this way, and only a file inside the
+            # uploads is read, so a missing path never falls through to another
+            # document that happens to share its name.
+            if e.code == "FILE_NOT_FOUND" and "/" not in filepath.replace("\\", "/"):
+                from backend import config
+                from backend.utils.path_safety import is_within
                 from backend.utils.uploaded_file_resolver import find_uploaded_file
                 uploaded = find_uploaded_file(filepath)
+                upload_dir = getattr(config, "UPLOAD_DIR", "")
+                if uploaded and uploaded[1] and not (upload_dir and is_within(uploaded[1], [upload_dir])):
+                    uploaded = None
                 if uploaded:
                     content, on_disk = uploaded
                     if content is None and on_disk:
+                        if is_sensitive(on_disk):
+                            return f"ERROR reading '{filepath}': Credential and key files are not read by the code tools"
                         with open(on_disk, 'r', encoding='utf-8') as f:
                             content = f.read()
                     if content is not None:

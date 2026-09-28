@@ -207,7 +207,7 @@ class SearchCodeTool(BaseTool):
         "(long lines cut at 300 characters). Matching is one line at a time. 'No matches found' is a "
         "normal result; an invalid pattern, or an absolute, ~ or '..' glob, is an error. Use it for exact "
         "names and patterns; search_codebase asks by meaning when the zvec_grep plugin is connected; "
-        "read_code opens a hit."
+        "read_code opens a hit that is UTF-8 text."
     )
     parameters = {
         "pattern": ToolParameter(
@@ -487,7 +487,7 @@ class ListCodeFilesTool(BaseTool):
     read_only = True
     description = (
         "Show a folder of this Guaardvark install's own source as an indented tree: folders first, then "
-        "files with sizes. It lists the same files search_code searches, so git-ignored data (uploads "
+        "files with sizes. It lists the files search_code searches plus binary files, so git-ignored data (uploads "
         "and outputs included), folders holding no source, venv, node_modules, dist, build, logs and "
         "__pycache__ folders, symlinks and .env or credential files are left out. max_depth 0 lists only "
         "the folder's direct entries and each step adds a level; output stops at 1,500 entries with a "
@@ -561,7 +561,7 @@ class VerifyChangeTool(BaseTool):
         "an edit landed (should_exist=true) or that removed text is gone (should_exist=false). Plain case- "
         "and whitespace-sensitive substring (line endings read as \\n), not a regex. Reads only and needs "
         "no Guaardvark backend. "
-        "Returns one line starting '✓ VERIFIED' or '✗ VERIFICATION FAILED'; 'ERROR during verification' "
+        "Returns a line starting '✓ VERIFIED' or '✗ VERIFICATION FAILED'; 'ERROR during verification' "
         "(file missing, refused, not UTF-8, or over 10 MB) comes back as an error result. Same path rules "
         "as read_code. To see the file use read_code; to find text across files, search_code."
     )

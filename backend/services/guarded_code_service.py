@@ -310,24 +310,27 @@ def private_relative_paths(relative_paths: list[str], repo_root: str | Path | No
     """Return the repo-relative paths that are local data rather than source.
 
     A path is private when git ignores it (``.gitignore`` or ``.git/info/exclude``)
-    and it is not under READABLE_IGNORED_PREFIXES. Directory paths should end in
-    "/" so directory-only ignore patterns match them.
+    and it is not under READABLE_IGNORED_PREFIXES. Each path is also asked about
+    as a folder ("p/"), so a directory-only pattern such as "backups/" gives the
+    same answer whether or not the folder exists.
     """
     root = Path(repo_root).expanduser().resolve() if repo_root else default_repo_root()
     candidates = [p.replace("\\", "/").lstrip("/") for p in relative_paths if p]
     candidates = [p for p in candidates if not p.startswith(READABLE_IGNORED_PREFIXES)]
     if not candidates:
         return set()
+    queries = candidates + [p + "/" for p in candidates if not p.endswith("/")]
     try:
         proc = subprocess.run(
             ["git", "-C", str(root), "check-ignore", "--stdin", "-z"],
-            input="\0".join(candidates) + "\0",
+            input="\0".join(queries) + "\0",
             capture_output=True, text=True, timeout=20,
         )
     except (OSError, subprocess.TimeoutExpired):
         proc = None
     if proc is not None and proc.returncode in (0, 1):
-        return {p for p in proc.stdout.split("\0") if p}
+        ignored = {p for p in proc.stdout.split("\0") if p}
+        return {p for p in candidates if p in ignored or p + "/" in ignored}
     return {p for p in candidates if (p + "/").startswith(FALLBACK_PRIVATE_PREFIXES)}
 
 

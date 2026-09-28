@@ -133,11 +133,13 @@ class CodeGeneratorTool(BaseTool):
         "Ask Guaardvark's local LLM (Ollama) for a complete version of a code file and save its reply "
         "as data/outputs/code/<output_filename>, replacing any file of that name there; input_file is "
         "only read and can never be the output. With input_file the prompt holds that file's full text "
-        "plus your instructions; without it the model writes a new file from the instructions alone, "
-        "and the call is refused if the instructions name an existing file. An empty reply is an error "
+        "(a file longer than the model's context window is cut by Ollama) plus your instructions; "
+        "without it the model writes a new file from the instructions alone, and the call is refused "
+        "if the instructions name a file that exists in the checkout or the uploads. An empty reply is an error "
         "and writes nothing. Returns output_path, filename, language, line and character counts and "
         "the first 500 characters. The model call stops after 180 s; over MCP the call returns an "
-        "error after its timeout (120 s by default) while the run continues and still saves, and "
+        "error after its timeout (120 s by default); the run is not cancelled and saves if the model "
+        "answers within 180 s of the start, and "
         "repeating the call with the same idempotency_key waits for that run instead of starting "
         "another. For review notes without writing, use analyze_code; for non-code files, generate_file."
     )
@@ -147,7 +149,7 @@ class CodeGeneratorTool(BaseTool):
             name="input_file",
             type="string",
             required=False,
-            description="Existing file to rewrite: a path relative to the Guaardvark checkout (e.g. 'backend/app.py'; refused like read_code: .env, key files, git-ignored data other than uploads and outputs), or a path inside the uploads folder (e.g. 'Code/app.py'). In Guaardvark's own chat an absolute path also works; over MCP it does not. Leave empty to write a new file. A named file that is missing, unreadable or empty is an error.",
+            description="Existing file to rewrite: a path relative to the Guaardvark checkout (e.g. 'backend/app.py'; refused like read_code: .env, key files, git-ignored data other than uploads and outputs), or a path inside the uploads folder (e.g. 'Code/app.py'). Over MCP an absolute path works only inside the checkout; in Guaardvark's own chat one elsewhere works too, except system and key folders, and not with Settings > Project folder only on. Leave empty to write a new file. A named file that is missing, unreadable or empty is an error.",
             default=""
         ),
         "output_filename": ToolParameter(
@@ -233,24 +235,15 @@ class CodeGeneratorTool(BaseTool):
             cand = cand.strip()
             if not cand:
                 continue
+            # Looked up exactly as input_file would be (checkout, then uploads), so a
+            # refused path (outside the checkout over MCP, git-ignored, credentials)
+            # reads as absent and the answer never reveals whether it exists.
             try:
-                from backend.utils.uploaded_file_resolver import find_uploaded_file
-                if find_uploaded_file(cand):
-                    return cand
-            except Exception:
-                pass
-            # Checked under read_code's rules, so the answer never reveals whether a
-            # refused path (outside the checkout over MCP, git-ignored, credentials) exists.
-            from backend.services.guarded_code_service import GuardedCodeError
-            from backend.tools.llama_code_tools import _read_source_file
-            from backend.utils.backend_http import is_mcp_transport
-            try:
-                _read_source_file(cand, allow_external=not is_mcp_transport(self))
-            except GuardedCodeError:
-                continue
+                _content, _error, found = _read_code_input(self, cand)
             except Exception:
                 continue
-            return cand
+            if found:
+                return cand
         return None
 
     def execute(self, **kwargs) -> ToolResult:
@@ -379,12 +372,6 @@ OUTPUT THE COMPLETE FILE NOW (no explanations, no markdown fences, just code):""
             else:
                 code_content = ""
 
-            if not code_content.strip():
-                return ToolResult(
-                    success=False,
-                    error="The model returned no code, so nothing was written. Try again or reword the instructions.",
-                )
-
             # Clean up markdown artifacts
             if code_content.startswith("```"):
                 lines = code_content.split('\n')
@@ -393,6 +380,13 @@ OUTPUT THE COMPLETE FILE NOW (no explanations, no markdown fences, just code):""
                 if lines and lines[-1].strip() == "```":
                     lines = lines[:-1]
                 code_content = '\n'.join(lines)
+
+            # Checked after the fence is removed: a reply of only a fence is empty too.
+            if not code_content.strip():
+                return ToolResult(
+                    success=False,
+                    error="The model returned no code, so nothing was written. Try again or reword the instructions.",
+                )
 
             os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
@@ -438,13 +432,14 @@ class CodeAnalysisTool(BaseTool):
     read_only = True
     description = (
         "Review one text file with Guaardvark's local LLM (Ollama) and return its written findings; "
-        "nothing is changed or written. The model is told to cite a line number for each finding, "
+        "nothing is changed or written, and an empty reply is an error. The model is told to cite a line number for each finding, "
         "which is not checked. analysis_type picks the focus. A file over 48,000 characters is not "
         "sent whole: the model gets its first 28,800 and last 14,400 characters plus an outline of "
         "imports, classes and function lines, and the result has truncated=true. Returns file, "
         "language, analysis_type, analysis, line_count, char_count, truncated and visible_lines. The "
         "model call stops after 180 s; over MCP a call that outlasts its timeout (120 s by default) "
-        "returns an error. To read the file yourself use read_code; for a changed copy, codegen."
+        "returns an error. To read the file yourself use read_code (for an upload, 'data/uploads/<path>'); "
+        "for a changed copy, codegen."
     )
 
     parameters = {
@@ -452,7 +447,7 @@ class CodeAnalysisTool(BaseTool):
             name="file_path",
             type="string",
             required=True,
-            description="File to review: a path relative to the Guaardvark checkout (e.g. 'backend/app.py'; refused like read_code: .env, key files, git-ignored data other than uploads and outputs), or a path inside the uploads folder (e.g. 'Code/app.py'). In Guaardvark's own chat an absolute path also works; over MCP it does not."
+            description="File to review: a path relative to the Guaardvark checkout (e.g. 'backend/app.py'; refused like read_code: .env, key files, git-ignored data other than uploads and outputs), or a path inside the uploads folder (e.g. 'Code/app.py'). Over MCP an absolute path works only inside the checkout; in Guaardvark's own chat one elsewhere works too, except system and key folders, and not with Settings > Project folder only on."
         ),
         "analysis_type": ToolParameter(
             name="analysis_type",
@@ -518,7 +513,9 @@ class CodeAnalysisTool(BaseTool):
 
             llm = self._get_llm()
             original_size = len(content)
-            line_count = len(content.split('\n'))
+            # A final newline ends the last line; it does not start another.
+            ends_with_newline = content.endswith('\n')
+            line_count = content.count('\n') + (0 if ends_with_newline else 1)
 
             ext = os.path.splitext(file_path)[1].lower()
             language = CodeGeneratorTool.LANGUAGE_MAP.get(ext, 'unknown')
@@ -545,7 +542,7 @@ class CodeAnalysisTool(BaseTool):
                 head_text = content[:first_portion]
                 tail_text = content[-last_portion:]
                 head_last_line = head_text.count('\n') + 1
-                tail_first_line = line_count - tail_text.count('\n')
+                tail_first_line = line_count - tail_text.count('\n') + (1 if ends_with_newline else 0)
                 omitted_lines = max(tail_first_line - head_last_line - 1, 0)
                 content = (
                     head_text +
@@ -602,6 +599,8 @@ Provide a structured analysis grounded in the visible code, with line citations 
                     analysis = analysis.strip()
             else:
                 analysis = ""
+            if not analysis:
+                return ToolResult(success=False, error="The model returned no analysis. Try again.")
 
             return ToolResult(
                 success=True,
