@@ -24,6 +24,7 @@ from backend.tools.llama_code_tools import (
     verify_change
 )
 from backend.models import db, Folder
+from backend.utils.backend_http import is_mcp_transport
 import json
 import ast
 from backend.services.guarded_code_service import (
@@ -140,17 +141,22 @@ class ReadCodeTool(BaseTool):
     name = "read_code"
     read_only = True
     description = (
-        "Read the complete contents of a source code file. "
-        "Returns file content with line count and character count. "
-        "Use this to understand existing code before making modifications. "
-        "Accepts paths relative to the project root and explicit absolute paths for user-referenced external files."
+        "Read one UTF-8 text file (up to 10 MB) from this Guaardvark install's own checkout, in full. "
+        "Returns a header (path, line and character counts, SHA-256 of the text, mtime) and the content "
+        "between START/END markers, without line numbers. Paths are relative to the checkout root; an "
+        "absolute path works when it lies inside the checkout. Refused: git-ignored local data (files "
+        "under data/uploads and data/outputs stay readable), .env and credential or key files (*.pem, "
+        "*.key, id_rsa, .netrc, credentials.*), and anything under .git, venv, node_modules, dist, logs "
+        "or __pycache__. In Guaardvark's own chat an absolute path outside the checkout also works, "
+        "except system and key folders; over MCP it is refused. To find a file use search_code or "
+        "search_codebase; for PDF or Office files process_file; for logs read_logs."
     )
     parameters = {
         "filepath": ToolParameter(
             name="filepath",
             type="string",
             required=True,
-            description="Path relative to project root, or an explicit absolute path for an external text file"
+            description="File to read, relative to the checkout root, e.g. 'backend/app.py' or 'frontend/src/App.jsx'. A relative path may not leave the checkout."
         )
     }
 
@@ -164,7 +170,7 @@ class ReadCodeTool(BaseTool):
             )
 
         try:
-            result = read_code(filepath)
+            result = read_code(filepath, allow_external=not is_mcp_transport(self))
 
             # Check if result indicates an error
             if result.startswith("ERROR"):
@@ -194,23 +200,28 @@ class SearchCodeTool(BaseTool):
     name = "search_code"
     read_only = True
     description = (
-        "Search for code patterns across the project using case-insensitive regex. "
-        "Returns all matches with file paths, line numbers, and matched content. "
-        "Use this to find where code patterns exist before making changes."
+        "Find lines matching a case-insensitive Python regular expression in this Guaardvark install's "
+        "own source files: tracked files and untracked ones git does not ignore, skipping venv, "
+        "node_modules, dist, build, logs and __pycache__ folders, binary files, symlinks, and .env or "
+        "credential files. Returns the total, then up to 100 numbered 'path:line' hits with the line text "
+        "(long lines cut at 300 characters). Matching is one line at a time. 'No matches found' is a "
+        "normal result; an invalid pattern, or an absolute, ~ or '..' glob, is an error. Use it for exact "
+        "names and patterns; search_codebase asks by meaning when the zvec_grep plugin is connected; "
+        "read_code opens a hit."
     )
     parameters = {
         "pattern": ToolParameter(
             name="pattern",
             type="string",
             required=True,
-            description="Text or regex pattern to search for (e.g., 'handleClick', 'Button.*onClick')"
+            description="Python regular expression, matched case-insensitively against one line at a time, e.g. 'def\\s+load_config' or 'Button.*onClick'. Escape ( [ . and the like to match them literally."
         ),
         "file_glob": ToolParameter(
             name="file_glob",
             type="string",
             required=False,
             default="**/*.{py,jsx,js,tsx,ts}",
-            description="Glob pattern for files to search (default: '**/*.{py,jsx,js,tsx,ts}')"
+            description="Which files to search, as a glob relative to the checkout root, e.g. 'backend/**/*.py' or 'frontend/**/*.{js,jsx}'. '**/' spans zero or more folders, '*' and '?' stay within one folder name, and {a,b} groups expand anywhere; [abc] classes are not supported. Default '**/*.{py,jsx,js,tsx,ts}'."
         )
     }
 
@@ -226,6 +237,8 @@ class SearchCodeTool(BaseTool):
 
         try:
             result = search_code(pattern, file_glob)
+            if result.startswith("ERROR"):
+                return ToolResult(success=False, error=result, metadata={"pattern": pattern})
 
             # Check for no matches (not necessarily an error)
             is_no_match = "No matches found" in result
@@ -473,9 +486,13 @@ class ListCodeFilesTool(BaseTool):
     name = "list_code_files"
     read_only = True
     description = (
-        "List files and directories to understand project structure. "
-        "Returns a formatted tree view of the directory contents. "
-        "Use this to explore the codebase and find relevant files."
+        "Show a folder of this Guaardvark install's own source as an indented tree: folders first, then "
+        "files with sizes. It lists the same files search_code searches, so git-ignored data (uploads "
+        "and outputs included), folders holding no source, venv, node_modules, dist, build, logs and "
+        "__pycache__ folders, symlinks and .env or credential files are left out. max_depth 0 lists only "
+        "the folder's direct entries and each step adds a level; output stops at 1,500 entries with a "
+        "note of how many more there are. Use read_code to open a file, search_code or search_codebase "
+        "to find one by content, and list_code_repositories for repositories indexed in the Library."
     )
     parameters = {
         "directory": ToolParameter(
@@ -483,14 +500,15 @@ class ListCodeFilesTool(BaseTool):
             type="string",
             required=False,
             default="frontend/src",
-            description="Relative path from project root (default: 'frontend/src')"
+            description="Folder relative to the checkout root, e.g. 'backend/api', or '.' for the whole checkout. Paths outside the checkout are refused. Default 'frontend/src'."
         ),
         "max_depth": ToolParameter(
             name="max_depth",
             type="int",
             required=False,
             default=5,
-            description="Maximum directory depth to show (default: 5)"
+            minimum=0,
+            description="Levels below directory to expand: 0 shows only its direct entries, 1 adds their contents, and so on. Default 5; use 1-2 on large folders such as '.'."
         )
     }
 
@@ -539,30 +557,33 @@ class VerifyChangeTool(BaseTool):
     name = "verify_change"
     read_only = True
     description = (
-        "Verify that a code change was successful by checking if text exists in file. "
-        "Use after edit_code to confirm changes were applied correctly. "
-        "Set should_exist=False to verify that text was successfully removed. "
-        "Accepts paths relative to the project root and explicit absolute paths for user-referenced external files."
+        "Check whether a text file in this Guaardvark install's checkout contains an exact string: confirm "
+        "an edit landed (should_exist=true) or that removed text is gone (should_exist=false). Plain case- "
+        "and whitespace-sensitive substring (line endings read as \\n), not a regex. Reads only and needs "
+        "no Guaardvark backend. "
+        "Returns one line starting '✓ VERIFIED' or '✗ VERIFICATION FAILED'; 'ERROR during verification' "
+        "(file missing, refused, not UTF-8, or over 10 MB) comes back as an error result. Same path rules "
+        "as read_code. To see the file use read_code; to find text across files, search_code."
     )
     parameters = {
         "filepath": ToolParameter(
             name="filepath",
             type="string",
             required=True,
-            description="Path relative to project root, or an explicit absolute path for an external text file"
+            description="File to check, relative to the checkout root, e.g. 'backend/app.py'. Same rules as read_code."
         ),
         "expected_text": ToolParameter(
             name="expected_text",
             type="string",
             required=True,
-            description="Text to check for in the file"
+            description="Exact text to look for: a case- and whitespace-sensitive substring, not a regex."
         ),
         "should_exist": ToolParameter(
             name="should_exist",
             type="bool",
             required=False,
             default=True,
-            description="True if text should exist, False to verify deletion (default: True)"
+            description="true (default): passes when the text is present. false: passes when it is absent from the file; a missing file is an error, not a pass."
         )
     }
 
@@ -587,15 +608,16 @@ class VerifyChangeTool(BaseTool):
             should_exist = should_exist.lower() in ('true', '1', 'yes')
 
         try:
-            result = verify_change(filepath, expected_text, should_exist)
+            result = verify_change(filepath, expected_text, should_exist, allow_external=not is_mcp_transport(self))
 
-            # Check if verification passed or failed
+            # A completed check is a result, pass or fail; only an unreadable file is an error.
+            if result.startswith("ERROR"):
+                return ToolResult(success=False, error=result, metadata={"filepath": filepath})
             verification_passed = "✓ VERIFIED" in result
 
             return ToolResult(
-                success=verification_passed,
+                success=True,
                 output=result,
-                error=None if verification_passed else result,
                 metadata={
                     "filepath": filepath,
                     "expected_text_preview": expected_text[:50] if expected_text else "",
