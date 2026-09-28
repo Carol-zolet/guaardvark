@@ -33,7 +33,27 @@ API = os.environ.get("GUAARDVARK_API", "http://localhost:5000")
 FRONTEND = os.environ.get("GUAARDVARK_FRONTEND", "http://localhost:5173")
 DISPLAY = os.environ.get("DEMO_DISPLAY", ":98")
 FPS = 30
-CURSOR_SIZE = os.environ.get("DEMO_CURSOR_SIZE", "48")
+# 32 px: 48 read as oversized on a 1080p frame (Dean, Ep 19 review). DMZ-White
+# ships 24, 32 and 48 only; other values snap to one of those.
+CURSOR_SIZE = os.environ.get("DEMO_CURSOR_SIZE", "32")
+# The normal arrow the whole time: pages swap in a pointing hand over links and
+# buttons and an I-beam over text, which read as noise on camera. DEMO_CURSOR_ARROW=0
+# leaves the page cursors alone.
+CURSOR_ARROW = os.environ.get("DEMO_CURSOR_ARROW", "1") != "0"
+_ARROW_CURSOR_SCRIPT = """
+(() => {
+  const css = "*, *::before, *::after { cursor: default !important; }";
+  const add = () => {
+    if (document.getElementById("demo-arrow-cursor")) return;
+    const el = document.createElement("style");
+    el.id = "demo-arrow-cursor";
+    el.textContent = css;
+    (document.head || document.documentElement).appendChild(el);
+  };
+  if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", add);
+  else add();
+})();
+"""
 
 
 def _run(cmd, **kw):
@@ -194,6 +214,11 @@ def _narrate_kokoro(text: str, dest: Path) -> None:
 ALLOW_FALLBACK = os.environ.get("DEMO_ALLOW_FALLBACK") == "1"
 
 
+# Whether this run started Audio Foundry, so release_narrator stops only a
+# service the director brought up.
+_NARRATOR = {"started_here": False}
+
+
 def ensure_narrator_ready() -> None:
     """Hard preflight: the configured narrator engine must actually answer.
 
@@ -214,6 +239,7 @@ def ensure_narrator_ready() -> None:
             pass
         if attempt == 0:
             print("  narrator: audio_foundry down — starting the plugin…")
+            _NARRATOR["started_here"] = True
             try:
                 requests.post(f"{API}/api/plugins/audio_foundry/enable",
                               json={"enabled": True}, timeout=30)
@@ -230,6 +256,29 @@ def ensure_narrator_ready() -> None:
         f"narrator engine '{NARRATOR_ENGINE}' unavailable (audio_foundry not "
         "healthy on :8206) and DEMO_ALLOW_FALLBACK is not set — refusing to "
         "record with the wrong voice")
+
+
+def release_narrator() -> None:
+    """Give the card back before the takes record.
+
+    Qwen-Image-Edit asks for ~13 GB free on a 16 GB card, and Audio Foundry
+    holds ~1 GB even with its voice model unloaded, enough to keep every photo
+    take waiting on VRAM that never frees (Ep 19, 2026-09-27). A foundry this
+    run started is stopped; one that was already running only drops its voice
+    model. generate_narration starts it again for the end card.
+    """
+    if NARRATOR_ENGINE not in ("kokoro", "chatterbox"):
+        return
+    try:
+        if _NARRATOR["started_here"]:
+            r = requests.post(f"{API}/api/plugins/audio_foundry/stop", timeout=60)
+            _NARRATOR["started_here"] = False
+            print(f"  narrator: audio_foundry stopped for the takes (HTTP {r.status_code})")
+        else:
+            r = requests.post("http://127.0.0.1:8206/evict/voice", timeout=30)
+            print(f"  narrator: voice model unloaded for the takes (HTTP {r.status_code})")
+    except Exception as e:
+        print(f"  narrator: could not release the card: {e}")
 
 
 def _synth_one(text: str, dest: Path, voice: str) -> None:
@@ -277,7 +326,7 @@ def _synth_one(text: str, dest: Path, voice: str) -> None:
 
 
 def generate_narration(text, dest: Path, voice: str = "libritts",
-                       line_pause: float = 0.55) -> float:
+                       line_pause: float = 0.55, lines_out: list | None = None) -> float:
     """Synthesize narration to dest. Returns duration in seconds.
 
     `text` may be a single string, or a LIST of lines: each line is
@@ -287,12 +336,23 @@ def generate_narration(text, dest: Path, voice: str = "libritts",
     Engine per DEMO_NARRATOR: 'chatterbox' (series default — cloned female
     narrator) with automatic Piper fallback, or 'piper'.
     """
+    ensure_narrator_ready()      # cheap when up; brings the foundry back after release_narrator
     lines = [text] if isinstance(text, str) else list(text)
     workdir = dest.parent / f".{dest.stem}_parts"
     workdir.mkdir(parents=True, exist_ok=True)
 
     parts: list[Path] = []          # normalized 24k mono segments, in order
     pending_pause = 0.0
+    t_at = 0.0                      # where the next part starts in the track
+    spoken: list[dict] = []         # {"path", "at", "dur"} per spoken line, for cues
+
+    def _add(part: Path, seconds: float | None = None, line: bool = False) -> None:
+        nonlocal t_at
+        d = seconds if seconds is not None else ffprobe_duration(part)
+        if line:
+            spoken.append({"path": part, "at": t_at, "dur": d})
+        parts.append(part)
+        t_at += d
 
     def _silence(seconds: float, idx: int) -> Path:
         p = workdir / f"sil_{idx:02d}.wav"
@@ -312,9 +372,9 @@ def generate_narration(text, dest: Path, voice: str = "libritts",
             _run(["ffmpeg", "-y", "-i", str(raw), "-ar", "24000", "-ac", "1",
                   "-sample_fmt", "s16", str(norm)])
             if parts:
-                parts.append(_silence(0.45 + pending_pause, i))
+                _add(_silence(0.45 + pending_pause, i), 0.45 + pending_pause)
             pending_pause = 0.0
-            parts.append(norm)
+            _add(norm, line=True)
             continue
         if not line.strip():                 # blank line = extra breathing room
             pending_pause += line_pause
@@ -325,10 +385,12 @@ def generate_narration(text, dest: Path, voice: str = "libritts",
         _run(["ffmpeg", "-y", "-i", str(raw), "-ar", "24000", "-ac", "1",
               "-sample_fmt", "s16", str(norm)])
         if parts:
-            parts.append(_silence(line_pause + pending_pause, i))
+            _add(_silence(line_pause + pending_pause, i), line_pause + pending_pause)
         pending_pause = 0.0
-        parts.append(norm)
+        _add(norm, line=True)
 
+    if lines_out is not None:
+        lines_out[:] = spoken
     if not parts:
         raise RuntimeError("narration had no speakable lines")
     concat = workdir / "concat.txt"
@@ -339,6 +401,43 @@ def generate_narration(text, dest: Path, voice: str = "libritts",
     if dur <= 0.2:
         raise RuntimeError(f"narration suspiciously short ({dur}s)")
     return dur
+
+
+def place_lines(lines: list, hits: dict) -> list:
+    """Start of each spoken line on the finished video's clock.
+
+    A line keeps its planned gap after the one before it, and a cued line
+    (hits[k], set by Stage.cue) starts no earlier than the moment its action
+    reached the cue. Uncued lines follow on, so a beat without cues keeps the
+    planned track exactly.
+    """
+    starts: list[float] = []
+    for k, ln in enumerate(lines):
+        if k == 0:
+            t = ln["at"]
+        else:
+            prev = lines[k - 1]
+            gap = max(0.0, ln["at"] - (prev["at"] + prev["dur"]))
+            t = starts[-1] + prev["dur"] + gap
+        if k in hits:
+            t = max(t, hits[k])
+        starts.append(t)
+    return starts
+
+
+def build_placed_narration(lines: list, starts: list, dest: Path) -> float:
+    """Lay each line's audio at its start time; returns the track's length."""
+    cmd = ["ffmpeg", "-y"]
+    filters = []
+    for k, (ln, t) in enumerate(zip(lines, starts)):
+        cmd += ["-i", str(ln["path"])]
+        filters.append(f"[{k}:a]adelay=delays={int(round(t * 1000))}:all=1[l{k}]")
+    mix = "".join(f"[l{k}]" for k in range(len(lines)))
+    filters.append(f"{mix}amix=inputs={len(lines)}:duration=longest:normalize=0[a]")
+    cmd += ["-filter_complex", ";".join(filters), "-map", "[a]",
+            "-ar", "24000", "-ac", "1", "-sample_fmt", "s16", str(dest)]
+    _run(cmd)
+    return ffprobe_duration(dest)
 
 
 # ---------------------------------------------------------------- recorder
@@ -447,11 +546,13 @@ class Stage:
         # playwright's node driver, and launch(env=...) does not reliably
         # reach the main chrome process (observed: window opened on :0).
         os.environ["DISPLAY"] = display
-        # big, high-visibility cursor for the camera. XCURSOR_SIZE alone is
-        # ignored on bare Xvfb — an explicit theme must be named too.
+        # XCURSOR_SIZE alone is ignored on bare Xvfb — an explicit theme must
+        # be named too.
         os.environ["XCURSOR_SIZE"] = CURSOR_SIZE
         os.environ["XCURSOR_THEME"] = os.environ.get("DEMO_CURSOR_THEME",
                                                      "DMZ-White")
+        if CURSOR_ARROW:
+            self._arrow_theme()
         # Host session is Wayland: chromium's ozone would auto-pick wayland and
         # open on the REAL desktop, ignoring DISPLAY. Force X11 and scrub the
         # wayland handles so the window can only land on the Xvfb display.
@@ -486,12 +587,40 @@ class Stage:
                   if os.environ.get("DEMO_DEVICE_SCALE") else []),
             ],
         )
+        if CURSOR_ARROW:
+            self.browser.add_init_script(_ARROW_CURSOR_SCRIPT)
         self.page = (self.browser.pages[0] if self.browser.pages
                      else self.browser.new_page())
+        if CURSOR_ARROW:
+            self.page.evaluate(_ARROW_CURSOR_SCRIPT)
         self.cursor = Cursor(display)
         time.sleep(1.0)
         self._assert_on_display()
         self._ensure_fullscreen()
+
+    def _arrow_theme(self) -> None:
+        """A private cursor theme where "default" is the base theme's arrow.
+
+        The page rule asks for CSS `default`, and DMZ-White ships no cursor by
+        that name: the browser found nothing and the cursor vanished from the
+        recording. This theme links the name to left_ptr and inherits the rest.
+        """
+        import tempfile
+        base = os.environ["XCURSOR_THEME"]
+        src = next((Path(d) / base / "cursors" for d in
+                    (Path.home() / ".icons", Path("/usr/share/icons"))
+                    if (Path(d) / base / "cursors" / "left_ptr").exists()), None)
+        if src is None:
+            return
+        root = Path(tempfile.mkdtemp(prefix="demo_cursor_"))
+        theme = root / "DemoArrow"
+        (theme / "cursors").mkdir(parents=True)
+        (theme / "index.theme").write_text(f"[Icon Theme]\nName=DemoArrow\nInherits={base}\n")
+        for name in ("default", "left_ptr", "arrow"):
+            (theme / "cursors" / name).symlink_to(src / "left_ptr")
+        os.environ["XCURSOR_PATH"] = ":".join(
+            [str(root), str(Path.home() / ".icons"), "/usr/share/icons"])
+        os.environ["XCURSOR_THEME"] = "DemoArrow"
 
     def _ensure_fullscreen(self):
         """--kiosk under openbox still leaves browser chrome (tab + URL bar)
@@ -613,6 +742,59 @@ class Stage:
         x, y = self.screen_xy(locator)
         self.cursor.glide(x, y, dur=dur)
 
+    def out_clock(self) -> float:
+        """Seconds into the finished beat video: the recording clock minus what
+        fast-forward will take out. Mirrors Episode._fast_forward."""
+        rec = getattr(self, "recorder", None)
+        if rec is None:
+            return 0.0
+        saved = 0.0
+        for a, b in getattr(self, "fast_marks", []):
+            d = b - a
+            if d >= 2.0:
+                saved += d - d / max(4.0, d / Episode.FF_TARGET_S)
+        return rec.elapsed() - saved
+
+    def screen_box(self, locator) -> tuple[int, int, int, int] | None:
+        """(x, y, w, h) of an element in screen pixels, or None."""
+        try:
+            box = locator.first.bounding_box()
+            if not box:
+                return None
+            ox, oy = self._offsets()
+            r = self._zoom()
+            return (int(box["x"] * r + ox), int(box["y"] * r + oy),
+                    int(box["width"] * r), int(box["height"] * r))
+        except Exception:
+            return None
+
+    def cue(self, n: int, focus=None) -> None:
+        """Hold the action until spoken line n (0-based, blank lines not
+        counted) can start, and note that moment: assembly starts the line
+        there, so the click that follows lands while the narrator says it.
+
+        `focus` (a locator) is what the line is about; the finish pushes in
+        on its box while the line plays.
+        """
+        plan = getattr(self, "cue_plan", None)
+        if getattr(self, "recorder", None) is None or not plan or n >= len(plan):
+            return
+        earliest = place_lines(plan[: n + 1], dict(self.cue_hits))[n]
+        while self.out_clock() < earliest:
+            time.sleep(0.05)
+        self.cue_hits[n] = max(self.out_clock(), earliest)
+        if focus is not None:
+            self.focus_on(focus, hold=plan[n]["dur"])
+
+    def focus_on(self, locator, hold: float = 2.5) -> None:
+        """Mark a moment for the finish to push in on: this element, now, for
+        `hold` seconds of the finished video."""
+        if getattr(self, "recorder", None) is None:
+            return
+        box = self.screen_box(locator)
+        if box:
+            self.focus_events.append({"t": self.out_clock(), "box": box, "hold": hold})
+
     @contextmanager
     def fast_forward(self):
         """Mark the enclosed wait (a render, a model load) for fast-forward at
@@ -640,7 +822,9 @@ class Beat:
     min_hold: float = 2.0       # extra floor beyond narration
     lead_in: float = 0.8        # settle time recorded before actions start
     retakes: int = 3
-    # Demo audio mixed into the beat at mux time: [(wav_path, start_s), ...].
+    # Demo audio mixed into the beat at mux time: [(wav_path, start_s), ...],
+    # or (wav_path, start_s, volume) for sound that is the subject rather than
+    # a bed (a rendered clip's own voice); beds default to 0.55.
     # x11grab records VIDEO ONLY — anything the UI "plays" is silent unless
     # it is scheduled here (essential for the audio episodes).
     audio_overlays: list = field(default_factory=list)
@@ -650,6 +834,9 @@ class Beat:
     fast_segments: list = field(default_factory=list, repr=False)
     audio_path: Path = field(default=None, repr=False)
     audio_dur: float = 0.0
+    # Spoken lines as {"path", "at", "dur"} from generate_narration; Stage.cue
+    # places them against the action.
+    lines: list = field(default_factory=list, repr=False)
 
 
 class Episode:
@@ -665,7 +852,7 @@ class Episode:
     def prepare_audio(self):
         for i, b in enumerate(self.beats):
             b.audio_path = self.dir / f"beat_{i:02d}_{b.name}.wav"
-            b.audio_dur = generate_narration(b.narration, b.audio_path)
+            b.audio_dur = generate_narration(b.narration, b.audio_path, lines_out=b.lines)
             print(f"  audio {b.name}: {b.audio_dur:.1f}s")
 
     def _record_beat(self, stage: Stage, i: int, b: Beat) -> Path:
@@ -678,13 +865,29 @@ class Episode:
                     b.reset(stage)
                 rec.start()
                 stage.recorder, stage.fast_marks = rec, []
+                stage.cue_plan, stage.cue_hits, stage.focus_events = list(b.lines), {}, []
                 time.sleep(b.lead_in)
                 b.action(stage)
                 if b.verify:
                     b.verify(stage)
-                target = max(b.audio_dur + 0.7, b.min_hold)
-                while rec.elapsed() < target:
-                    time.sleep(0.1)
+                if stage.cue_hits:
+                    starts = place_lines(b.lines, stage.cue_hits)
+                    placed = b.audio_path.with_name(b.audio_path.stem + ".placed.wav")
+                    b.audio_dur = build_placed_narration(b.lines, starts, placed)
+                    b.audio_path = placed
+                    # For the finish: when each line plays and what it is about.
+                    (self.dir / f"beat_{i:02d}_{b.name}.cues.json").write_text(json.dumps({
+                        "starts": starts,
+                        "durs": [ln["dur"] for ln in b.lines],
+                        "focus": stage.focus_events,
+                    }, indent=1))
+                    target = max(b.audio_dur + 0.7, b.min_hold)
+                    while stage.out_clock() < target:
+                        time.sleep(0.1)
+                else:
+                    target = max(b.audio_dur + 0.7, b.min_hold)
+                    while rec.elapsed() < target:
+                        time.sleep(0.1)
                 stage.recorder = None
                 b.fast_segments = list(stage.fast_marks)
                 vdur = rec.stop()
@@ -729,13 +932,14 @@ class Episode:
         cmd = ["ffmpeg", "-y", "-i", str(raw), "-i", str(b.audio_path)]
         filters = ["[1:a]apad[nar]"]
         mix_inputs = "[nar]"
-        for k, (opath, start_s) in enumerate(b.audio_overlays):
+        for k, overlay in enumerate(b.audio_overlays):
+            opath, start_s = overlay[0], overlay[1]
+            # ducked by default: beds and ambience sit under the narration
+            volume = float(overlay[2]) if len(overlay) > 2 else 0.55
             cmd += ["-i", str(opath)]
             ms = int(float(start_s) * 1000)
-            # ducked: overlays are background (music beds, ambience) and must
-            # sit under the narration, never compete with it
             filters.append(
-                f"[{k + 2}:a]volume=0.55,adelay={ms}|{ms}[ov{k}]")
+                f"[{k + 2}:a]volume={volume},adelay={ms}|{ms}[ov{k}]")
             mix_inputs += f"[ov{k}]"
         n = 1 + len(b.audio_overlays)
         filters.append(
@@ -843,7 +1047,7 @@ class Episode:
             if not raw.exists():
                 raise RuntimeError(f"missing raw take: {raw}")
             b.audio_path = self.dir / f"beat_{i:02d}_{b.name}.wav"
-            b.audio_dur = generate_narration(b.narration, b.audio_path)
+            b.audio_dur = generate_narration(b.narration, b.audio_path, lines_out=b.lines)
             print(f"  audio {b.name}: {b.audio_dur:.1f}s "
                   f"(raw video {ffprobe_duration(raw):.1f}s)")
             padded = self.dir / f"beat_{i:02d}_{b.name}.raw.mp4"
@@ -866,13 +1070,18 @@ class Episode:
             if prev and prev.exists():
                 dst = self.dir / prev.name
                 dst.write_bytes(prev.read_bytes())
+                # The finish pushes in on what each line is about: keep the cues.
+                cues = prev.with_name(prev.stem + ".cues.json")
+                if cues.exists():
+                    (self.dir / cues.name).write_bytes(cues.read_bytes())
                 b.audio_dur = ffprobe_duration(dst)
                 reused.add(i)
                 print(f"  beat {b.name}: REUSED from {resume_dir.name}")
                 continue
             b.audio_path = self.dir / f"beat_{i:02d}_{b.name}.wav"
-            b.audio_dur = generate_narration(b.narration, b.audio_path)
+            b.audio_dur = generate_narration(b.narration, b.audio_path, lines_out=b.lines)
             print(f"  audio {b.name}: {b.audio_dur:.1f}s")
+        release_narrator()
         print(f"[{self.slug}] recording {len(self.beats)} beats…")
         for i, b in enumerate(self.beats):
             if i in reused:

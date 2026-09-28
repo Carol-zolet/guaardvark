@@ -130,3 +130,14 @@ def test_snap_frames_follows_each_declared_grid(model, frames, expect_down, expe
 def test_snap_frames_leaves_unruled_models_alone(monkeypatch):
     monkeypatch.setattr(vmr, "model_capabilities", lambda m: {"frame_rule": None})
     assert vmr.snap_frames("anything", 31) == 31
+
+
+def test_a_stopped_comfyui_does_not_refuse_the_model(monkeypatch):
+    """The queue step starts ComfyUI; the resolver only judges the model."""
+    from backend.services.job_types import RenderErrorKind, RenderFailure
+    down = RenderFailure(RenderErrorKind.COMFYUI_DOWN, "requires ComfyUI. Start the ComfyUI plugin, then retry.")
+    missing = RenderFailure(RenderErrorKind.MODEL_NOT_INSTALLED, "is not installed.")
+    monkeypatch.setattr(vmr, "preflight_video_model", lambda m: (False, down))
+    assert vmr.resolve_active_video_model("t2v", "minimax-h3-int8") == ("minimax-h3-int8", None)
+    monkeypatch.setattr(vmr, "preflight_video_model", lambda m: (False, missing))
+    assert vmr.resolve_active_video_model("t2v", "minimax-h3-int8") == (None, missing)

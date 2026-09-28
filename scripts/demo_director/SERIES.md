@@ -773,10 +773,18 @@ Cold open (`assets/coldopen.py`): the launch plates cut on the launch track's be
 title card; prepended after assembly. Trailer (`assets/trailer.py`): picks from takes whose verify
 passed, 16:9 and 9:16, captions burned in.
 
-Beats: teach (a thumb says what it taught; a second click withdraws it) → photo (night edit,
-outpaint, background cut-out in chat) → consent (a likeness stops on the consent card first) →
-mcp (the MCP client connects an outside server; chat calls it by name) → closer (version read
-from `/api/health`; mantra).
+Beats: teach (a thumb says what it taught; a second click withdraws it) → web (a question with a
+Wikipedia link; fetch_url reads the passage that answers) → mcp (the MCP client connects an
+outside server; chat then uses its tool on this repository) → models (Add new model looks up a
+Hugging Face LoRA it can run and refuses Mochi by name; nothing installs) → photo (night edit,
+outpaint, background cut-out in chat) → identity (a face carried into a new scene; the consent
+card is clicked through, not featured) → video (MiniMax H3 from Video Gen with ComfyUI stopped;
+the render starts it, and the clip is heard saying its line) → closer (version read from
+`/api/health`; mantra).
+
+The video beat's reset stops ComfyUI through the plugin API; `verify` checks it was stopped before
+the take and running after, and transcribes the clip's soundtrack locally. The clip's own audio is
+mixed in at full level in a gap in the narration (`Beat.audio_overlays` with a volume).
 
 Say/not additions:
 
@@ -784,10 +792,8 @@ Say/not additions:
 |---|---|
 | the chat model decides; a measured vision model looks and clicks (brain + eye) | "Gemma4 sees and clicks in one call" (Ep 4, retired) |
 | chat runs on local models only; cloud models reach it through MCP | any cloud chat routing (removed 2026-09-23) |
-| the teach question is one the indexed corpus answers | a general-knowledge question: chat refuses those while unrelated chunks are attached (open finding 2026-09-27) |
+| the teach question is one the indexed corpus answers | that it only answers from your files: general questions are answered too (fixed 2026-09-27) |
 | the thumb note as the page prints it ("N memories credited", "feedback withdrawn") | a count typed into the script |
-
-Dropped from this episode after checking the real path (2026-09-27): bring-your-own Hugging Face
-model (the Wan 2.2 5B single file is matched to the 14B workflow; the LTX-Video repo root is
-suggested as a LoRA).
+| "checks what it is, its size and its license, before anything downloads" (the look-up reads metadata only) | "installs any model": families it cannot load are refused by name |
+| "the video engine was switched off, so it starts it for you" (Video Gen with ComfyUI stopped) | that opening a page starts it |
 

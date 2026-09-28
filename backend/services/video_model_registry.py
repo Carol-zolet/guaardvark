@@ -2154,7 +2154,10 @@ def _probe_total_vram_mb():
 
 def _accept_or_refuse(model_id: str, role: str) -> tuple:
     ready, err = preflight_video_model(model_id)
-    if not ready:
+    # ComfyUI being stopped says nothing about the choice of model, and the
+    # queue step (prepare_video_model) starts it: refusing here would stop a
+    # Video Gen batch, a music video or a Film Crew before that start.
+    if not ready and getattr(err, "kind", None) != RenderErrorKind.COMFYUI_DOWN:
         return None, err
     if not _role_ok(model_id, role):
         name = (VIDEO_MODEL_REGISTRY.get(model_id) or {}).get("name") or model_id
