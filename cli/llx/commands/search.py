@@ -11,6 +11,16 @@ from llx import output
 console = make_console()
 
 
+def _snippet(text: str, width: int = 110) -> str:
+    """The passage body on one line: the index's "Document: … Section: …" label
+    (already in the source column) and line breaks dropped."""
+    head, sep, body = text.partition("\n\n")
+    if sep and head.startswith(("Document:", "[")):
+        text = body
+    text = " ".join(text.split())
+    return text if len(text) <= width else text[:width].rstrip() + "…"
+
+
 def search(
     query: str = typer.Argument(..., help="Search query"),
     limit: int = typer.Option(5, "--limit", "-n", help="Max results"),
@@ -36,7 +46,7 @@ def search(
         rows = [{
             "source": p["source"] + (f" p.{p['page']}" if p["page"] else ""),
             "score": f"{p['score']:.3f}" if isinstance(p["score"], (int, float)) else "—",
-            "passage": (p["text"][:90] + "…") if len(p["text"]) > 90 else p["text"],
+            "passage": _snippet(p["text"]),
         } for p in passages]
         output.print_table(rows, columns=["source", "score", "passage"], title=f"Search: {query}")
 
