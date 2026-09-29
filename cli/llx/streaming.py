@@ -279,7 +279,7 @@ class LlxStreamer:
         """Subscribe to job progress updates via Socket.IO."""
         self._done.clear()
 
-        @self.sio.on("progress")
+        @self.sio.on("job_progress")
         def handle_progress(data):
             on_progress(data)
             status = data.get("status", "")

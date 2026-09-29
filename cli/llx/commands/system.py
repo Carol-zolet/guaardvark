@@ -168,6 +168,7 @@ def health(
     server: str = typer.Option(None, "--server", "-s", help="Server URL override"),
     json_out: bool = typer.Option(False, "--json", "-j", help="JSON output"),
 ):
+    """Is the backend up? One line: status, version, uptime."""
     server = server or get_global_server()
     json_out = json_out or get_global_json()
     output.set_json_mode(json_out)
@@ -193,6 +194,7 @@ def status(
     server: str = typer.Option(None, "--server", "-s", help="Server URL override"),
     json_out: bool = typer.Option(False, "--json", "-j", help="JSON output"),
 ):
+    """Everything at a glance: server, chat model, workers, GPU, MCP, version."""
     server = server or get_global_server()
     json_out = json_out or get_global_json()
     output.set_json_mode(json_out)
@@ -259,7 +261,7 @@ def status(
             mcp_line = (f"[llx.kv.key]MCP:[/llx.kv.key]     {mcp_data.get('servers_connected', 0)}/"
                         f"{mcp_data.get('servers_configured', 0)} servers, "
                         f"{mcp_data.get('total_tools_available', 0)} tools"
-                        + ("" if mcp_ok else f"  [{m_style}]{ICON_OFFLINE} see: llx mcp client status[/{m_style}]"))
+                        + ("" if mcp_ok else f"  [{m_style}]{ICON_OFFLINE} see: guaardvark mcp client status[/{m_style}]"))
         else:
             mcp_line = "[llx.kv.key]MCP:[/llx.kv.key]     [llx.dim]disabled or unavailable[/llx.dim]"
 
@@ -275,6 +277,7 @@ def status(
 
 
 def init():
+    """Point the CLI at a Guaardvark server and save it (asks for the URL and API key)."""
     console.print("[llx.brand]Guaardvark Setup[/llx.brand]\n")
 
     config = load_config()

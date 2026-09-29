@@ -97,6 +97,27 @@ def _extract_error(data: dict, fallback: str = "Request failed") -> str:
 
 # --- Health ---
 
+def _write_plan(markdown: str) -> str:
+    """Save a plan sent as text and return its path relative to the install root.
+    Plans go under data/outputs so they never dirty the checkout a self-code
+    swarm refuses to start on."""
+    import time
+    from backend.config import GUAARDVARK_ROOT
+
+    rel = Path("data") / "outputs" / "swarm_plans" / f"plan_{time.strftime('%Y%m%d_%H%M%S')}.md"
+    path = Path(GUAARDVARK_ROOT) / rel
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(markdown, encoding="utf-8")
+    return rel.as_posix()
+
+
+def _plan_from_prompt(prompt: str) -> str:
+    """A one-task plan for a swarm asked for in plain words: one agent, one worktree."""
+    title = " ".join(prompt.split())
+    title = title if len(title) <= 60 else title[:57].rstrip() + "..."
+    return f"# Swarm Plan: {title}\n\n## Task: {title}\n- depends_on: none\n\n{prompt.strip()}\n"
+
+
 @swarm_bp.route("/health", methods=["GET"])
 def health():
     data, status = _proxy_get("/health")
@@ -110,6 +131,15 @@ def health():
 @swarm_bp.route("/launch", methods=["POST"])
 def launch():
     body = flask_request.get_json() or {}
+    # A plan can also arrive as text: the markdown itself, or a sentence that
+    # becomes a one-task plan. Either is saved and launched like a plan file.
+    markdown = str(body.pop("plan_markdown", "") or "")
+    prompt = str(body.pop("prompt", "") or body.pop("goal", "") or "").strip()
+    if not body.get("plan_path"):
+        if markdown.strip():
+            body["plan_path"] = _write_plan(markdown)
+        elif prompt:
+            body["plan_path"] = _write_plan(_plan_from_prompt(prompt))
 
     # Securely resolve target repository path.
     # If the request targets GUAARDVARK_ROOT (or defaults to it), we MUST treat it
