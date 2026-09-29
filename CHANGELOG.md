@@ -22,6 +22,12 @@
   published default, and a retry with the same idempotency key does not run twice. The WordPress
   and bulk CSV tools produce real output (bulk CSVs no longer double their quotes); memory,
   document and repository tools say what they return; media tools leave your own players alone.
+- **Install.** `start.sh` requires Node 20.19+ or 22.12+ (Vite 8). On Linux it installs Node 22 to
+  `~/.local/node` when the system Node is older; the previous fallback installed 20.18.0, which
+  broke the frontend build (#255). Frontend packages are reinstalled when Node changes, a failed
+  frontend build is reported, and a fresh clone no longer runs an early build that can only fail.
+  `stop.sh` and the ComfyUI plugin stop only a ComfyUI started from this install, leaving one you
+  run separately alone.
 - **Fixes.** Outpaint fills the new border instead of returning the picture between grey bars.
   ACE-Step music loads in half precision and fits a 16 GB card. Reading free VRAM no longer opens a
   CUDA context in every process. An uploaded file's indexing job finishes instead of staying
