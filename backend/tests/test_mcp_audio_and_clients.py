@@ -191,3 +191,22 @@ def test_edit_resolves_a_batch_image_url(monkeypatch, tmp_path):
     assert tool._resolve_image("http://127.0.0.1:5000/api/batch-image/image/ImageBatch_1/a.png") == str(img.resolve())
     assert tool._resolve_image("/api/batch-image/image/ImageBatch_1/..%2F..%2Fsecret") is None
     assert tool._resolve_image("/api/batch-image/image/ImageBatch_1/missing.png") is None
+
+
+def test_status_can_wait_for_a_job_to_finish(monkeypatch):
+    from backend.tools import image_tools
+
+    answers = iter(["running", "running", "done"])
+    monkeypatch.setattr(image_tools, "_http_json", lambda method, path, *a, **k: {
+        "intent": "music", "status": next(answers),
+        "result": {"path": "/x/song.wav", "document_id": 3}})
+    monkeypatch.setattr(image_tools, "STATUS_POLL_S", 0)
+    monkeypatch.setattr(image_tools.time, "sleep", lambda s: None)
+    tool = image_tools.GenerationStatusTool()
+    tool.set_context({"transport": "mcp"})
+    res = tool.execute(batch_id="d" * 32, wait_seconds=30)
+    assert res.success and "complete" in res.output and "Still running" not in res.output
+
+    answers = iter(["running"])
+    res = tool.execute(batch_id="d" * 32)
+    assert "Still running" in res.output

@@ -5,6 +5,7 @@ import logging
 import os
 import re
 import shutil
+import time
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -609,6 +610,13 @@ def _quality_summary(quality) -> Optional[dict]:
     return {"checked": bool((quality.get("frames") or {}).get("readable")) or bool(flags), "flags": flags}
 
 
+# get_generation_status can wait for a job, for clients that cannot pause between
+# checks. Kept under the MCP per-call limit (120 s by default) with room to answer.
+MAX_STATUS_WAIT_S = 100
+STATUS_POLL_S = 3
+_ACTIVE_JOB_STATUSES = {"queued", "pending", "running", "processing", "start", "in_progress"}
+
+
 class GenerationStatusTool(BaseTool):
     """Read the state of a queued image or video batch by id."""
 
@@ -631,6 +639,17 @@ class GenerationStatusTool(BaseTool):
             type="string",
             description="The id a generate tool returned, e.g. ImageBatch_09-11-2026_132620_013, bulk_gen_1790556697_3fa2c1 or a song's job id.",
             required=True,
+        ),
+        "wait_seconds": ToolParameter(
+            name="wait_seconds",
+            type="int",
+            required=False,
+            default=0,
+            minimum=0,
+            maximum=MAX_STATUS_WAIT_S,
+            description=(f"Wait up to this many seconds (0-{MAX_STATUS_WAIT_S}) for the job to finish before "
+                         "answering, instead of reporting 'still running' at once. Useful for a client that "
+                         "cannot pause between checks. Default 0: answer immediately."),
         ),
     }
 
@@ -892,10 +911,8 @@ class GenerationStatusTool(BaseTool):
         resp.raise_for_status()
         return cls._audio_info(job_id, resp.json())
 
-    def execute(self, batch_id: str, **kwargs) -> ToolResult:
-        batch_id = (batch_id or "").strip()
-        if not batch_id:
-            return ToolResult(success=False, error="batch_id is required")
+    def _read(self, batch_id: str):
+        """(info, unreachable): the job from whichever reader knows its id."""
         info = None
         unreachable = None
         remote = self._context.get("transport") == "mcp"
@@ -918,6 +935,23 @@ class GenerationStatusTool(BaseTool):
                 continue
             if info is not None:
                 break
+        return info, unreachable
+
+    def execute(self, batch_id: str, wait_seconds: int = 0, **kwargs) -> ToolResult:
+        batch_id = (batch_id or "").strip()
+        if not batch_id:
+            return ToolResult(success=False, error="batch_id is required")
+        try:
+            wait_seconds = max(0, min(int(wait_seconds or 0), MAX_STATUS_WAIT_S))
+        except (TypeError, ValueError):
+            wait_seconds = 0
+        deadline = time.monotonic() + wait_seconds
+        info, unreachable = self._read(batch_id)
+        while (info is not None and unreachable is None
+               and str(info.get("status")).lower() in _ACTIVE_JOB_STATUSES
+               and time.monotonic() + STATUS_POLL_S < deadline):
+            time.sleep(STATUS_POLL_S)
+            info, unreachable = self._read(batch_id)
         # Without an answer from the backend a live job cannot be told from a lost one,
         # so neither "stopped" nor "no such batch" is reported.
         if unreachable is not None and (info is None or info.get("stopped")):
@@ -969,7 +1003,7 @@ class GenerationStatusTool(BaseTool):
         if info.get("progress") is not None and info["status"] == "running":
             lines.append(f"Progress: {info['progress']}% — {info.get('message') or ''}".rstrip(" —"))
         if info["status"] in ("queued", "pending", "running"):
-            lines.append("Still running; poll again in a few seconds.")
+            lines.append("Still running; poll again in a few seconds, or pass wait_seconds to wait here.")
         lines.append(f"Open Studio: {info['studio_url']}")
         return ToolResult(success=True, output="\n".join(lines), metadata=info)
 
