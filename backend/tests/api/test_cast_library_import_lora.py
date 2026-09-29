@@ -185,7 +185,9 @@ def test_import_rejects_sdxl_layout(client):
         content_type="multipart/form-data",
     )
     assert resp.status_code == 400
-    assert "not supported" in resp.get_json()["error"] or "does not match" in resp.get_json()["error"]
+    # A true SDXL LoRA (no FLUX-shaped U-Net keys underneath) gets the generic
+    # message, not the FLUX-text-encoder hint below.
+    assert "SDXL LoRAs are not supported" in resp.get_json()["error"]
 
 
 def test_import_rejects_flux_with_text_encoder_keys(client):
@@ -201,7 +203,35 @@ def test_import_rejects_flux_with_text_encoder_keys(client):
         content_type="multipart/form-data",
     )
     assert resp.status_code == 400
-    assert "not supported" in resp.get_json()["error"] or "does not match" in resp.get_json()["error"]
+    # Still rejected (pinned behaviour), but with a message that points at the
+    # actual cause instead of the generic SDXL rejection — see the maintainer's
+    # review on PR #253.
+    assert "text encoder" in resp.get_json()["error"]
+    assert "SDXL" not in resp.get_json()["error"]
+
+
+def test_import_returns_409_while_training(client, app):
+    """Mirrors dispatch_train's own guard: importing over a Subject that's
+    mid-training-run must not silently mark it trained and get clobbered when
+    the run finishes — see the maintainer's review on PR #253."""
+    subject_id = _create_subject(client)
+    with app.app_context():
+        s = db.session.get(Subject, subject_id)
+        s.training_status = "training"
+        db.session.commit()
+
+    data = _build_safetensors(_zimage_keys())
+    resp = client.post(
+        f"/api/cast-library/subjects/{subject_id}/import-lora",
+        data={
+            "lora_file": (io.BytesIO(data), "zimage.safetensors"),
+            "base_model_id": "zimage-turbo",
+            "trigger_word": "caroline_1",
+        },
+        content_type="multipart/form-data",
+    )
+    assert resp.status_code == 409
+    assert resp.get_json()["error"] == "already_training"
 
 
 def test_import_requires_trigger_word(client):

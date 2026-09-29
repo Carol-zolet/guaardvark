@@ -1146,9 +1146,13 @@ const CastMemberPage = () => {
             Path: {subject.lora_path || <em>none yet</em>}
           </Typography>
           <Box sx={{ mt: 1.5 }}>
-            <Button size="small" variant="outlined" onClick={() => setImportOpen(true)}>
-              Import LoRA
-            </Button>
+            <Tooltip title={training ? 'Training is in progress — wait for it to finish before importing.' : ''}>
+              <span>
+                <Button size="small" variant="outlined" onClick={() => setImportOpen(true)} disabled={training}>
+                  Import LoRA
+                </Button>
+              </span>
+            </Tooltip>
             {subject.lora_path && (
               <Typography variant="caption" color="text.secondary" sx={{ ml: 1.5 }}>
                 Importing replaces the current LoRA with a new version.

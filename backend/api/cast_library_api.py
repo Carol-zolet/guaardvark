@@ -988,6 +988,12 @@ _FLUX_DOTTED_RE = re.compile(r"^diffusion_model\.(?:double|single)_blocks\.\d+\.
 # because its block names never match the FLUX pattern above.
 _SDXL_RE = re.compile(r"^lora_unet_(?:down|up|input|output|middle)_blocks|^lora_te")
 
+# Text-encoder keys ("lora_te1_"/"lora_te2_") appear both on true SDXL LoRAs
+# and on a FLUX LoRA that was also trained on its text encoder. Used only to
+# give the latter a more accurate rejection message — see
+# _flux_text_encoder_hint below. Not part of the accept/reject decision.
+_TEXT_ENCODER_RE = re.compile(r"^lora_te\d*_")
+
 
 def _read_safetensors_header(fileobj) -> dict:
     """Read only the JSON header of a .safetensors file — no tensor data.
@@ -1062,6 +1068,26 @@ def _detect_lora_family(keys: list[str]) -> str | None:
     return None
 
 
+def _flux_text_encoder_hint(keys: list[str]) -> bool:
+    """True if a rejected file looks like a FLUX LoRA that also trained its
+    text encoder, rather than an actual SDXL checkpoint: its non-text-encoder
+    keys overwhelmingly match the FLUX U-Net block pattern, and only the
+    lora_te*_ keys triggered the SDXL rejection. Used solely to pick a more
+    accurate error message; it does not change what gets accepted."""
+    tensor_keys = [k for k in keys if k != "__metadata__"]
+    te_keys = [k for k in tensor_keys if _TEXT_ENCODER_RE.match(k)]
+    if not te_keys:
+        return False
+    other_keys = [k for k in tensor_keys if k not in te_keys]
+    if not other_keys:
+        return False
+    flux_hits = sum(
+        1 for k in other_keys
+        if _FLUX_KOHYA_RE.match(k) or _FLUX_DOTTED_RE.match(k)
+    )
+    return flux_hits >= len(other_keys) * 0.9
+
+
 @bp.post("/subjects/<int:subject_id>/import-lora")
 def import_subject_lora(subject_id):
     """Attach an externally-trained LoRA (.safetensors) to a Subject.
@@ -1076,6 +1102,8 @@ def import_subject_lora(subject_id):
     s = db.session.get(Subject, subject_id)
     if s is None:
         return jsonify({"error": "subject not found"}), 404
+    if s.training_status == "training":
+        return jsonify({"error": "already_training", "subject_id": subject_id}), 409
 
     f = request.files.get("lora_file")
     if not f or not f.filename:
@@ -1139,6 +1167,12 @@ def import_subject_lora(subject_id):
     detected_family = _detect_lora_family(list(header.keys()))
     if detected_family is None:
         tmp_path.unlink(missing_ok=True)
+        if _flux_text_encoder_hint(list(header.keys())):
+            return jsonify({
+                "error": "this looks like a FLUX LoRA that also trained its text "
+                         "encoder; only the U-Net/transformer weights are supported "
+                         "for import right now, the text-encoder part isn't yet"
+            }), 400
         return jsonify({
             "error": "key layout does not match any supported LoRA family "
                      "(zimage-turbo or flux-dev); SDXL LoRAs are not supported"
