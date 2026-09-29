@@ -638,13 +638,25 @@ class ComfyUIImageGenerator:
         neg_inputs = dict(pos_inputs)
         neg_inputs["prompt"] = ""
         wf["neg"] = {"class_type": "TextEncodeQwenImageEditPlus", "inputs": neg_inputs}
+        latent = ["encode", 0]
+        if "pad" in wf:
+            # Outpaint. The edit model copies what its reference image shows, so a
+            # padded reference came back with its grey bars unfilled (and a full
+            # regenerate could erase the subject). The reference is the original
+            # picture; the padded canvas is sampled only where the pad mask is set.
+            wf["scale_ref"] = {"class_type": "FluxKontextImageScale", "inputs": {"image": ["load1", 0]}}
+            wf["pos"]["inputs"]["image1"] = ["scale_ref", 0]
+            wf["neg"]["inputs"]["image1"] = ["scale_ref", 0]
+            wf["outpaint_mask"] = {"class_type": "SetLatentNoiseMask",
+                                   "inputs": {"samples": ["encode", 0], "mask": ["pad", 1]}}
+            latent = ["outpaint_mask", 0]
         wf["sampler"] = {
             "class_type": "KSampler",
             "inputs": {
                 "seed": seed, "steps": n, "cfg": cfg,
                 "sampler_name": "euler", "scheduler": "simple", "denoise": 1.0,
                 "model": ["shift", 0], "positive": ["pos", 0],
-                "negative": ["neg", 0], "latent_image": ["encode", 0],
+                "negative": ["neg", 0], "latent_image": latent,
             },
         }
         wf["vae"] = {"class_type": "VAEDecode", "inputs": {"samples": ["sampler", 0], "vae": ["vae_loader", 0]}}

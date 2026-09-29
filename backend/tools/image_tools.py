@@ -2089,9 +2089,11 @@ class OutpaintImageTool(BaseTool):
         if not any(pad[k] for k in ("left", "right", "top", "bottom")):
             # Default: grow 256 px on every side when the user didn't specify.
             pad.update({"left": 256, "right": 256, "top": 256, "bottom": 256})
+        # The model is shown the original picture, not the padded canvas, so the
+        # instruction describes a wider view of the scene rather than a border to fill.
         fill = (instruction or "").strip() or (
-            "Fill the extended canvas so it continues the original scene, matching lighting, "
-            "perspective and style. Do not change the original subject."
+            "Show the same scene in a wider shot, continuing it past the edges with matching "
+            "lighting, perspective and style. Keep everything already in the picture unchanged."
         )
         gpu_wait = None
         try:
