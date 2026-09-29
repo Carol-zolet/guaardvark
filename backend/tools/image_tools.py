@@ -611,8 +611,8 @@ def _quality_summary(quality) -> Optional[dict]:
 
 
 # get_generation_status can wait for a job, for clients that cannot pause between
-# checks. Kept under the MCP per-call limit (120 s by default) with room to answer.
-MAX_STATUS_WAIT_S = 100
+# checks. Kept under the 60 s per-call limit common MCP clients apply (Codex, opencode).
+MAX_STATUS_WAIT_S = 50
 STATUS_POLL_S = 3
 _ACTIVE_JOB_STATUSES = {"queued", "pending", "running", "processing", "start", "in_progress"}
 
