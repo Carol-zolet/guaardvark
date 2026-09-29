@@ -104,6 +104,18 @@ if { [ -n "$CI" ] || [ -n "$CODEX_ENV" ]; } && [ "${GUAARDVARK_CI_BOOT:-0}" != 1
   exit 0
 fi
 
+# Run as root (sudo, or a root shell), the install lands under /root and leaves
+# the venv, node_modules and logs owned by root, so the next start as the normal
+# user cannot write them. The script asks for sudo itself for system packages.
+# Machines where root is the only account (some GPU cloud hosts and containers)
+# opt in with GUAARDVARK_ALLOW_ROOT=1.
+if [ "$(id -u)" = 0 ] && [ "${GUAARDVARK_ALLOW_ROOT:-0}" != 1 ]; then
+  vader_error "start.sh is running as root. Run it as your normal user: ./start.sh"
+  vader_info "It asks for your password itself when it needs to install system packages."
+  vader_info "If root is the only account on this machine: GUAARDVARK_ALLOW_ROOT=1 ./start.sh"
+  exit 1
+fi
+
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
 
 # ── Single-instance guard (must run BEFORE any installing layer, including the
