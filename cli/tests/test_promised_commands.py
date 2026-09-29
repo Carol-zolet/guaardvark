@@ -57,7 +57,8 @@ class _Client:
     ("video_gen:VideoBatch_x", "/api/jobs/video_gen:VideoBatch_x"),
 ])
 def test_read_job_picks_the_route_for_each_id(job_id, route):
-    client = _Client(routes={route: {"status": "running"}})
+    # Bulk jobs nest their state under progress_status, as the real route does.
+    client = _Client(routes={route: {"status": "running", "progress_status": {"status": "running"}}})
     info = read_job(client, job_id)
     assert info["id"] == job_id
     assert info["status"] == "running"
