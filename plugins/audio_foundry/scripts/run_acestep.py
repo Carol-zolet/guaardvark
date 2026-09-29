@@ -47,6 +47,7 @@ logging; the parent forwards it to logs/audio_foundry.log.
 from __future__ import annotations
 
 import json
+import os
 import sys
 import traceback
 from typing import Any
@@ -112,20 +113,29 @@ def _do_load(model_id: str) -> dict[str, Any]:
             "error": f"acestep not installed in this venv. ImportError: {e}",
         }
 
+    # ACE-Step reads its dtype string as "bfloat16" or float32: any other value,
+    # "float16" included, loads the 3.5B model in float32 (about 14 GB, more than
+    # a 16 GB card has free). Half precision on CUDA is bf16 where the card
+    # supports it, else fp16 through ACE-Step's own ACE_PIPELINE_DTYPE override.
+    # On MPS ACE-Step picks its own dtype.
+    dtype_name = "bfloat16"
+    if dev == "cuda" and not torch.cuda.is_bf16_supported():
+        os.environ["ACE_PIPELINE_DTYPE"] = "float16"
     try:
         _pipeline = ACEStepPipeline(
             checkpoint_dir=local,
-            dtype="float16",
+            dtype=dtype_name,
         )
     except TypeError:
         # Older ACE-Step releases use a different constructor — be tolerant.
         _pipeline = ACEStepPipeline.from_pretrained(
             local,
-            torch_dtype=torch.float16,
+            torch_dtype=torch.bfloat16 if dtype_name == "bfloat16" else torch.float16,
             local_files_only=True,
         ).to(dev)
 
-    _eprint(f"[run_acestep] {model_id} loaded (fp16, {dev})")
+    loaded_dtype = str(getattr(_pipeline, "dtype", dtype_name)).replace("torch.", "")
+    _eprint(f"[run_acestep] {model_id} loaded ({loaded_dtype}, {dev})")
     return {"ok": True}
 
 
