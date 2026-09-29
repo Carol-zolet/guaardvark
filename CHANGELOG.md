@@ -8,6 +8,8 @@
   scores and says when it did not run; `/imagine` and chat draw the pictures they make right in
   terminals that show images (kitty); `images generate --from-file` and `videos generate --save`
   are new; `status`, `models list|active` and `setup` read the reply's data instead of its message.
+  `search --json` now returns `results` (each passage with its source, page and score) and
+  `retrieval`, where it returned an answer before; `ask` is the command that answers.
 - **MCP for coding agents.** `guaardvark mcp serve` works from any folder, so a client can launch
   it anywhere. `guaardvark mcp install` adds Codex, Antigravity and opencode (and `--skills`).
   Two new tools, `generate_music` and `generate_speech`, run on Audio Foundry while it is running,

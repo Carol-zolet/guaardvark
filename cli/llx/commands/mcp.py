@@ -33,10 +33,13 @@ def _find_checkout() -> Path | None:
     for p in [curr, *curr.parents]:
         if (p / "start.sh").is_file():
             return p
+    return _installed_checkout()
 
-    # MCP clients launch `guaardvark mcp serve` from their own folder, so fall
-    # back to the checkout this CLI is installed from, then to the install that
-    # last ran start.sh.
+
+def _installed_checkout() -> Path | None:
+    """MCP clients launch `guaardvark mcp serve` from their own folder, so fall
+    back to the checkout this CLI is installed from, then to the install that
+    last ran start.sh."""
     own = Path(__file__).resolve().parents[3]
     if (own / "start.sh").is_file() and (own / "backend").is_dir():
         return own
