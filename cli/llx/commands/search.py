@@ -49,6 +49,12 @@ def search(
             "passage": _snippet(p["text"]),
         } for p in passages]
         output.print_table(rows, columns=["source", "score", "passage"], title=f"Search: {query}")
+        rerank = (trace or {}).get("rerank") or {}
+        if rerank.get("applied"):
+            console.print("[llx.dim]Scores come from the reranker: closer to 1 is a better match.[/llx.dim]")
+        else:
+            why = f" ({rerank['reason']})" if rerank.get("reason") else ""
+            console.print(f"[llx.dim]The reranker did not run{why}; these scores only order the results.[/llx.dim]")
 
     except LlxConnectionError as e:
         output.print_error(str(e), code="CONNECTION_ERROR")
