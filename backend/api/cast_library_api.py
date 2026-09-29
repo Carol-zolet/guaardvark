@@ -1,12 +1,23 @@
 """Cast Library — CRUD over Subjects. Reusable across Productions."""
+import json
 import logging
 import os
+import re
+import struct
+import tempfile
 from pathlib import Path
 
 from flask import Blueprint, current_app, request, jsonify, send_file
 from werkzeug.utils import secure_filename
 
+from backend.config import STORAGE_DIR
 from backend.models import db, Subject, SubjectSample
+from backend.services.media_model_registry import (
+    ZIMAGE_TURBO,
+    FLUX_DEV,
+    get_profile,
+    write_lora_sidecar,
+)
 
 bp = Blueprint("cast_library_api", __name__, url_prefix="/api/cast-library")
 log = logging.getLogger(__name__)
@@ -954,19 +965,6 @@ def approve_samples(subject_id: int):
 # Issue: https://github.com/guaardvark/guaardvark/issues/245
 # Author: Caroline Zolet (Carol-zolet)
 
-import json
-import os
-import re
-import struct
-
-from backend.config import STORAGE_DIR
-from backend.services.media_model_registry import (
-    ZIMAGE_TURBO,
-    FLUX_DEV,
-    get_profile,
-    write_lora_sidecar,
-)
-
 _IMPORT_MAX_BYTES = 2 * 1024 * 1024 * 1024  # 2 GB — LoRA checkpoints, not images
 # Matches the trainer's own layout. A relative path here resolves against
 # the process cwd, not STORAGE_DIR — the Z-Image renderer then skips a
@@ -1052,9 +1050,9 @@ def _detect_lora_family(keys: list[str]) -> str | None:
     if sdxl_hits > total * 0.5:
         return None
     if zimage_hits >= total * 0.9:
-        return "zimage-turbo"
+        return ZIMAGE_TURBO
     if flux_hits >= total * 0.9:
-        return "flux-dev"
+        return FLUX_DEV
     return None
 
 
@@ -1096,7 +1094,12 @@ def import_subject_lora(subject_id):
 
     target_dir = Path(STORAGE_DIR) / _LORA_SUBDIR
     target_dir.mkdir(parents=True, exist_ok=True)
-    tmp_path = target_dir / f".importing-{subject_id}-{os.getpid()}.safetensors"
+    # .partial (not .safetensors) so ComfyUI's recursive LoRA scan never lists a
+    # half-written upload, and mkstemp's own uniqueness rules out two uploads to
+    # the same member in one worker process colliding on a name.
+    tmp_fd, _tmp_name = tempfile.mkstemp(dir=target_dir, suffix=".partial")
+    os.close(tmp_fd)
+    tmp_path = Path(_tmp_name)
 
     written = 0
     oversized = False
@@ -1160,7 +1163,7 @@ def import_subject_lora(subject_id):
     s.trigger_word = trigger_word
     s.lora_version = next_version
     s.training_status = "trained"
-    s.training_settings_json = dict(s.training_settings_json or {}, base_model_id=base_model_id)
+    s.training_settings_json = dict(s.training_settings_json or {}, base_model_id=base_model_id, imported=True)
     db.session.commit()
 
     return jsonify({"subject": _serialize(s)})

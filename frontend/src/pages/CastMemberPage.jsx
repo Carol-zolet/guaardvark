@@ -1126,6 +1126,11 @@ const CastMemberPage = () => {
           <Typography variant="subtitle2" gutterBottom>Trained LoRA</Typography>
           <Typography variant="body2">Status: <b>{subject.training_status}</b></Typography>
           <Typography variant="body2">Version: {subject.lora_version || 0}</Typography>
+          {subject.training_settings_json?.imported && (
+            <Typography variant="body2" color="text.secondary">
+              Imported (base: {subject.training_settings_json?.base_model_id || 'unknown'})
+            </Typography>
+          )}
           <Typography variant="body2" sx={{ wordBreak: 'break-all' }}>
             Path: {subject.lora_path || <em>none yet</em>}
           </Typography>
