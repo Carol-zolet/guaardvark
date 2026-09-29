@@ -1,5 +1,31 @@
 # Changelog
 
+## 2.9.3 — The command line does what it says, agents make music and voice, outpaint fills the frame
+
+- **Command line.** `jobs watch` and `jobs status`, `tasks info`, `rag status|query|entities`,
+  `/ingest`, `audio music`, `swarm run` (and a new `swarm templates`), `lessons`, the `outreach`
+  subcommands, `/tool` and `/edit` now do what their help says. `search` shows the reranker's
+  scores and says when it did not run; `/imagine` and chat draw the pictures they make right in
+  terminals that show images (kitty); `images generate --from-file` and `videos generate --save`
+  are new; `status`, `models list|active` and `setup` read the reply's data instead of its message.
+- **MCP for coding agents.** `guaardvark mcp serve` works from any folder, so a client can launch
+  it anywhere. `guaardvark mcp install` adds Codex, Antigravity and opencode (and `--skills`).
+  Two new tools, `generate_music` and `generate_speech`, run on Audio Foundry while it is running,
+  with no network. `get_generation_status` can wait up to 50 s for a job and knows audio jobs; the
+  photo-edit tools take the image links other tools return; every list parameter declares what it
+  holds, which Gemini-based clients require.
+- **Tool hardening.** fetch_url and analyze_website fetch only public addresses, checked when they
+  connect; the code tools, codegen, analyze_code and process_file stay inside the install and
+  refuse key and ignored files. Failed MCP results lead with the error, a null argument takes the
+  published default, and a retry with the same idempotency key does not run twice. The WordPress
+  and bulk CSV tools produce real output (bulk CSVs no longer double their quotes); memory,
+  document and repository tools say what they return; media tools leave your own players alone.
+- **Fixes.** Outpaint fills the new border instead of returning the picture between grey bars.
+  ACE-Step music loads in half precision and fits a 16 GB card. Reading free VRAM no longer opens a
+  CUDA context in every process. An uploaded file's indexing job finishes instead of staying
+  active. Chat's direct-tool reply carries the files it made. The CLA check accepts a sign-off
+  with a trailing line break.
+
 ## 2.9.2 — MCP tools in chat, video that starts its own engine, and answers instead of refusals
 
 - **MCP client, rebuilt on the official SDK.** One session per server with health pings, crash
