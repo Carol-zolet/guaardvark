@@ -2025,6 +2025,14 @@ if [ "$FAST_START" -ne 1 ]; then
         check_frontend_build
         BUILD_STATUS=$?
 
+        # A fresh clone has no node_modules yet: they are installed in step 8,
+        # and the frontend is built before it is served, so a build here can
+        # only fail.
+        if [ "$BUILD_STATUS" -ne 0 ] && [ ! -d "$FRONTEND_DIR/node_modules" ]; then
+            vader_info "Frontend dependencies not installed yet - the build runs after they are."
+            BUILD_STATUS=3  # no case below: nothing to do here
+        fi
+
         case $BUILD_STATUS in
             0)
                 vader_info "Frontend build is up to date"
