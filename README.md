@@ -61,7 +61,7 @@ curl -fsSL https://guaardvark.com/install.sh | bash
 | | | See it |
 |---|---|---|
 | **Media studio** | 11 local video models across five families (Wan 2.2, CogVideoX, LTX, HunyuanVideo, MiniMax H3 with native audio), image generation, full-song music, neural voice with consent-gated cloning, 4K/8K upscaling | Eps [5](https://www.youtube.com/watch?v=s9I_0gD9Iko) · [6](https://www.youtube.com/watch?v=9rae9IJhXow) · [7](https://www.youtube.com/watch?v=BXlm7p-SxtU) |
-| **Directors** | A beat-synced music-video director, a 5-role Film Crew, an auto-editing video editor — and the walkthrough director that produced this README's own video series | Eps [8](https://www.youtube.com/watch?v=l2LqKA9GQDc) · [9](https://www.youtube.com/watch?v=sq104u9N4Qg) |
+| **Directors** | A beat-synced music-video director, a 5-role Film Crew, an auto-editing video editor | Eps [8](https://www.youtube.com/watch?v=l2LqKA9GQDc) · [9](https://www.youtube.com/watch?v=sq104u9N4Qg) |
 | **Coding agent & code intelligence** | Monaco editor, AST-aware analysis and dependency graphs, System Mapper: a live constellation of the whole codebase | Ep [14](https://www.youtube.com/watch?v=yEy1tVKxsF0) |
 | **Agent swarms** | Up to 20 parallel coding agents in isolated git worktrees with dependency-aware merging; fully-local backend via Ollama | [CAPABILITIES.md](CAPABILITIES.md) |
 | **Screen agents** | A real Ubuntu/XFCE desktop of their own, vision + closed-loop servo clicking, live VNC viewer on any page | Ep [4](https://www.youtube.com/watch?v=3VfHrJmqYos) |
