@@ -94,6 +94,17 @@ def test_every_exposed_tool_declares_read_only():
     assert undeclared == []
 
 
+
+def test_every_published_list_says_what_it_holds():
+    """Gemini rejects a whole request when one array parameter has no `items`."""
+    from backend.mcp.server import _ensure_tools_initialized
+    _ensure_tools_initialized()
+    bare = [f"{tool.name}.{name}"
+            for _base, tool in tools_adapter.collect_exposed_tools(MCPConfig())
+            for name, prop in tool.input_schema.get("properties", {}).items()
+            if prop.get("type") == "array" and "items" not in prop]
+    assert bare == []
+
 # ── validation and exposure ───────────────────────────────────────────────────
 
 class _Recording(BaseTool):

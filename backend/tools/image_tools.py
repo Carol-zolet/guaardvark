@@ -211,6 +211,7 @@ class ImageGeneratorTool(BaseTool):
         "subject_ids": ToolParameter(
             name="subject_ids",
             type="list",
+            items="int",
             description=(
                 "Optional. Numeric Cast Library subject IDs with trained LoRAs to lock "
                 "identity (e.g. [26]). Separate parameter — never nest this inside prompt. "
@@ -1285,7 +1286,9 @@ class VideoGeneratorTool(BaseTool):
         "reference_images": ToolParameter(
             name="reference_images",
             type="list",
-            description="Document ids or paths of reference images (identity, look); needs the reference build.",
+            items="string",
+            description=("Document ids or paths of reference images (identity, look), each "
+                         "as a string; needs the reference build."),
             required=False,
         ),
         "reference_audio": ToolParameter(
