@@ -120,6 +120,7 @@ The file is gitignored and merged over the manifest at load, so the override sur
 ## Troubleshooting
 
 - Permission issues: `chmod +x *.sh`
+- **`start.sh is running as root`**: run `./start.sh` as your normal user, without `sudo`; it asks for your password itself when it installs system packages. If root is the only account on the machine (some GPU cloud hosts and containers), run `GUAARDVARK_ALLOW_ROOT=1 ./start.sh`.
 - Health diagnostics: `./start.sh --test`
 - Wrong Python venv (e.g. after upgrade): `rm -rf backend/venv && ./start.sh`
 - Check logs in `logs/`

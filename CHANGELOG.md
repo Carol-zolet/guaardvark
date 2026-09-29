@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- **`start.sh` stops when run as root.** With `sudo`, the install landed under `/root` and left
+  files the normal user could not write. It now says to run it as your normal user; it asks
+  for your password itself when it installs system packages. Machines where root is the only
+  account set `GUAARDVARK_ALLOW_ROOT=1`.
+
 ## 2.9.3 — The command line does what it says, agents make music and voice, outpaint fills the frame
 
 - **Command line.** `jobs watch` and `jobs status`, `tasks info`, `rag status|query|entities`,
