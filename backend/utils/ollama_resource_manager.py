@@ -7,6 +7,7 @@ available system resources before loading.
 """
 
 import logging
+import os
 import re
 import threading
 import time
@@ -146,6 +147,43 @@ def is_text_chat_model(model_name: str) -> bool:
     return not (rec.exists and rec.embedding)
 
 
+def _gpu_memory_mb() -> Optional[tuple]:
+    """(free_mb, total_mb) of the first visible GPU, or None."""
+    index = 0
+    visible = (os.environ.get("CUDA_VISIBLE_DEVICES") or "").split(",")[0].strip()
+    if visible.isdigit():
+        index = int(visible)
+    try:
+        import pynvml
+        pynvml.nvmlInit()
+        try:
+            info = pynvml.nvmlDeviceGetMemoryInfo(pynvml.nvmlDeviceGetHandleByIndex(index))
+            return info.free / (1024 * 1024), info.total / (1024 * 1024)
+        finally:
+            pynvml.nvmlShutdown()
+    except Exception as e:
+        logger.debug("Could not query GPU memory via NVML: %s", e)
+    try:
+        import subprocess
+        out = subprocess.check_output(
+            ["nvidia-smi", f"--id={index}", "--query-gpu=memory.free,memory.total",
+             "--format=csv,nounits,noheader"],
+            timeout=5, text=True,
+        )
+        free, total = (float(x) for x in out.strip().split(","))
+        return free, total
+    except Exception:
+        pass
+    try:
+        import torch
+        if torch.cuda.is_available():
+            mem_free, mem_total = torch.cuda.mem_get_info(0)
+            return mem_free / (1024 * 1024), mem_total / (1024 * 1024)
+    except Exception as e:
+        logger.debug("Could not query GPU memory via torch: %s", e)
+    return None
+
+
 def get_system_resources() -> Dict[str, float]:
     """
     Get available system memory resources in MB.
@@ -159,29 +197,12 @@ def get_system_resources() -> Dict[str, float]:
         "ram_total_mb": 0.0,
     }
 
-    # GPU memory via PyTorch/pynvml
-    try:
-        import torch
-        if torch.cuda.is_available():
-            mem_free, mem_total = torch.cuda.mem_get_info(0)
-            result["gpu_free_mb"] = mem_free / (1024 * 1024)
-            result["gpu_total_mb"] = mem_total / (1024 * 1024)
-    except Exception as e:
-        logger.debug("Could not query GPU memory via torch: %s", e)
-        # Fallback: try nvidia-smi
-        try:
-            import subprocess
-            out = subprocess.check_output(
-                ["nvidia-smi", "--query-gpu=memory.free,memory.total",
-                 "--format=csv,nounits,noheader"],
-                timeout=5, text=True,
-            )
-            parts = out.strip().split(",")
-            if len(parts) == 2:
-                result["gpu_free_mb"] = float(parts[0].strip())
-                result["gpu_total_mb"] = float(parts[1].strip())
-        except Exception:
-            pass
+    # GPU memory. NVML and nvidia-smi read it without touching CUDA; asking torch
+    # first created a ~200 MB CUDA context in every process that imported the
+    # indexing service (each MCP server, scripts) just to read two numbers.
+    gpu = _gpu_memory_mb()
+    if gpu:
+        result["gpu_free_mb"], result["gpu_total_mb"] = gpu
 
     # System RAM via psutil
     try:
