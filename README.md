@@ -525,7 +525,7 @@ Config: `~/.guaardvark/cli.json` (legacy `~/.llx/config.json` is still read). Th
 | Dependency | Version | Notes |
 |-----------|---------|-------|
 | Python | 3.12 only | Backend. 3.13/3.14 not yet supported — the ML stack (numpy<2.0, mediapipe, basicsr/gfpgan) has no wheels for them. |
-| Node.js | 20+ | Frontend build |
+| Node.js | 20.19+ or 22.12+ | Frontend build (Vite 8). On Linux, `start.sh` installs Node 22 to `~/.local/node` when the system one is older. |
 | PostgreSQL | 14+ | Auto-installed |
 | Redis | 5.0+ | Auto-installed |
 | Ollama | latest | Local LLM inference |

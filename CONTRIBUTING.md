@@ -67,7 +67,7 @@ Documentation lives in the README, `docs/ARCHITECTURE.md`, and inline code comme
 ### Prerequisites
 
 - Python 3.12+
-- Node.js 20+
+- Node.js 20.19+ or 22.12+
 - PostgreSQL 14+ (auto-installed by `start.sh`)
 - Redis 5.0+ (auto-installed by `start.sh`)
 - NVIDIA GPU recommended (not required for non-generation features)
