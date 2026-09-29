@@ -536,10 +536,14 @@ check_node_version() {
         return 1
     fi
     local ver
-    ver=$(node --version | sed 's/v//')
-    local major=${ver%%.*}
-    if [ "$major" -lt 20 ]; then
-        vader_error "Node.js >=20 required. Install via: sudo apt-get install -y nodejs"
+    ver=$(node --version 2>/dev/null)
+    if ! node_version_supported "$ver"; then
+        vader_error "Node.js $GUAARDVARK_NODE_FLOOR_TEXT required (found ${ver:-none}); the frontend build tool needs it."
+        if is_macos; then
+            vader_info "Upgrade with: brew upgrade node"
+        else
+            vader_info "Install Node.js 22 LTS from https://nodejs.org, then re-run."
+        fi
         return 1
     fi
 }
@@ -1757,7 +1761,7 @@ if [ "${GUAARDVARK_OS:-linux}" = linux ] && declare -F ensure_node_npm >/dev/nul
     rm -f "$CACHE_DIR/node_check" "$CACHE_DIR/npm_check" 2>/dev/null || true
 fi
 if ! check_with_cache "node_check" check_node_version; then
-    vader_error "Node.js 20+ required. Exiting."
+    vader_error "Node.js $GUAARDVARK_NODE_FLOOR_TEXT required. Exiting."
     exit 1
 fi
 if ! check_with_cache "npm_check" check_npm; then
@@ -2013,8 +2017,11 @@ if [ "$FAST_START" -ne 1 ]; then
             1)
                 if [ "$AUTO_BUILD_FRONTEND" -eq 1 ]; then
                     vader_info "Frontend changes detected - rebuilding..."
-                    (cd "$FRONTEND_DIR" && $NPM_CMD run build >> "$SETUP_LOG" 2>&1)
-                    vader_success "Frontend rebuilt successfully"
+                    if (cd "$FRONTEND_DIR" && $NPM_CMD run build >> "$SETUP_LOG" 2>&1); then
+                        vader_success "Frontend rebuilt successfully"
+                    else
+                        vader_warn "Frontend rebuild failed. See $SETUP_LOG"
+                    fi
                 else
                     vader_warn "Frontend build is stale (src newer than dist). Run: (cd frontend && npm run build)"
                 fi
@@ -2022,8 +2029,11 @@ if [ "$FAST_START" -ne 1 ]; then
             2)
                 if [ "$AUTO_BUILD_FRONTEND" -eq 1 ]; then
                     vader_info "Frontend dist missing - building..."
-                    (cd "$FRONTEND_DIR" && $NPM_CMD run build >> "$SETUP_LOG" 2>&1)
-                    vader_success "Frontend built successfully"
+                    if (cd "$FRONTEND_DIR" && $NPM_CMD run build >> "$SETUP_LOG" 2>&1); then
+                        vader_success "Frontend built successfully"
+                    else
+                        vader_warn "Frontend build failed. See $SETUP_LOG"
+                    fi
                 else
                     vader_warn "Frontend dist missing. Run: (cd frontend && npm run build)"
                 fi
