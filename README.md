@@ -289,7 +289,7 @@ A client's Linux desktop player refused to play a video — the distro was missi
 
 ### Model Context Protocol (MCP)
 
-Guaardvark speaks MCP both ways — exposes its tools to any MCP client (Claude Code, Cursor, Grok, Claude Desktop, Zed, Gemini, etc.) and can call tools from connected external MCP servers.
+Guaardvark speaks MCP both ways — exposes its tools to any MCP client (Claude Code, Codex, Cursor, Grok, Antigravity, opencode, Claude Desktop, Zed, Gemini, etc.) and can call tools from connected external MCP servers.
 
 - **One-command setup** — `python -m backend.mcp install` detects the agent clients on your machine and writes the `guaardvark` server entry into their configs (existing files are backed up, other entries untouched). `python -m backend.mcp doctor` diagnoses a broken setup: server self-test, a real stdio handshake, and a scan of client configs for stale paths.
 - **Claude Code plugin** — two lines, no clone: `/plugin marketplace add guaardvark/guaardvark` then `/plugin install guaardvark@guaardvark`. It asks for the path of your Guaardvark checkout, wires the MCP server from there, and loads every skill below as `/guaardvark:<skill>`.
