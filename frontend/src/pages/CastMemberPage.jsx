@@ -514,6 +514,17 @@ const CastMemberPage = () => {
     }
   };
 
+  const handleTrainClick = () => {
+    if (subject?.training_settings_json?.imported) {
+      const ok = window.confirm(
+        'This character currently uses an imported LoRA. Training will replace it '
+        + 'with a new one trained from Cast reference images. Continue?'
+      );
+      if (!ok) return;
+    }
+    handleTrain();
+  };
+
   const handleTrain = async () => {
     setBusy(true); setError(null);
     try {
@@ -878,7 +889,7 @@ const CastMemberPage = () => {
             </Typography>
           )}
           <Box sx={{ display: 'flex', gap: 1, flexWrap: 'wrap', alignItems: 'center' }}>
-            <Button variant="contained" color="secondary" onClick={handleTrain}
+            <Button variant="contained" color="secondary" onClick={handleTrainClick}
                     disabled={busy || training || !trainable}>
               {training ? 'Training…' : hasPendingAmend ? 'Train LoRA (catch-up/amend)' : 'Train LoRA'}
             </Button>
@@ -1107,7 +1118,7 @@ const CastMemberPage = () => {
 
           <Divider sx={{ my: 3 }} />
           <Box sx={{ display: 'flex', alignItems: 'center', gap: 2 }}>
-            <Button variant="contained" color="secondary" onClick={handleTrain}
+            <Button variant="contained" color="secondary" onClick={handleTrainClick}
                     disabled={busy || training || approvedCount === 0}>
               {training ? 'Training…' : hasPendingAmend ? 'Train LoRA (catch-up/amend)' : 'Train LoRA'}
             </Button>

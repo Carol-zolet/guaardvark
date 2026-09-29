@@ -1019,6 +1019,12 @@ def _detect_lora_family(keys: list[str]) -> str | None:
     and independently confirmed by the maintainer running the same key
     names through diffusers' load_lora_weights (Z-Image) and ComfyUI's
     LoraLoaderModelOnly (FLUX) — both load every key with no warnings.
+
+    Known limitation: a FLUX LoRA that also trains the text encoder carries
+    lora_te1_* keys, which _SDXL_RE matches (it starts with "lora_te"). Today
+    that turns the whole file away as unrecognised/SDXL rather than accepting
+    it as FLUX with an ignored text-encoder component — see
+    test_import_rejects_flux_with_text_encoder_keys for the pinned behaviour.
     """
     tensor_keys = [k for k in keys if k != "__metadata__"]
     if not tensor_keys:

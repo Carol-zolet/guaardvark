@@ -76,6 +76,21 @@ def _sdxl_keys() -> list[str]:
     ]
 
 
+def _flux_keys_with_text_encoder() -> list[str]:
+    """FLUX keys plus a text-encoder component (lora_te1_*), which _SDXL_RE
+    also matches since it starts with "lora_te". A real CLIP-L text encoder
+    has enough layers that this pushes the flux match ratio below the 90%
+    threshold. Pins today's behaviour: the file is turned away rather than
+    accepted as FLUX with the text-encoder component ignored (see the
+    docstring note on _detect_lora_family)."""
+    te_keys = []
+    for layer in range(6):
+        base = f"lora_te1_text_model_encoder_layers_{layer}_mlp_fc1"
+        te_keys.append(f"{base}.lora_down.weight")
+        te_keys.append(f"{base}.lora_up.weight")
+    return _flux_keys() + te_keys
+
+
 @pytest.fixture
 def app(tmp_path, monkeypatch):
     app = Flask(__name__)
@@ -165,6 +180,22 @@ def test_import_rejects_sdxl_layout(client):
         data={
             "lora_file": (io.BytesIO(data), "sdxl.safetensors"),
             "base_model_id": "zimage-turbo",
+            "trigger_word": "caroline_1",
+        },
+        content_type="multipart/form-data",
+    )
+    assert resp.status_code == 400
+    assert "not supported" in resp.get_json()["error"] or "does not match" in resp.get_json()["error"]
+
+
+def test_import_rejects_flux_with_text_encoder_keys(client):
+    subject_id = _create_subject(client)
+    data = _build_safetensors(_flux_keys_with_text_encoder())
+    resp = client.post(
+        f"/api/cast-library/subjects/{subject_id}/import-lora",
+        data={
+            "lora_file": (io.BytesIO(data), "flux_with_te.safetensors"),
+            "base_model_id": "flux-dev",
             "trigger_word": "caroline_1",
         },
         content_type="multipart/form-data",
