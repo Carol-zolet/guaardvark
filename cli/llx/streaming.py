@@ -431,7 +431,9 @@ class ChatRenderer:
         full_text = "".join(self._tokens)
         if full_text.strip():
             self._console.print(Text(f"{_ICON_ASSISTANT} ", style="llx.brand"), end="")
-            self._console.print(Markdown(full_text))
+            # The marker takes two columns of the first line; laid out at full
+            # width, that line's last word broke mid-word at the window edge.
+            self._console.print(Markdown(full_text), width=max(20, self._console.width - 2))
             hint = _maybe_web_access_hint(full_text)
             if hint:
                 self._console.print(f"[llx.dim]{hint}[/llx.dim]")
