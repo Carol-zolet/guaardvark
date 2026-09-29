@@ -353,7 +353,8 @@ def _set_title(title: str):
 class ChatRenderer:
     """Renders streaming chat responses with live markdown and tool-call UI."""
 
-    def __init__(self):
+    def __init__(self, server_url: str | None = None):
+        self.server_url = server_url
         self._console = make_console()
         self._tokens: list[str] = []
         self._tool_lines: list[str] = []
@@ -434,6 +435,18 @@ class ChatRenderer:
             hint = _maybe_web_access_hint(full_text)
             if hint:
                 self._console.print(f"[llx.dim]{hint}[/llx.dim]")
+
+        # Pictures the turn made are drawn once the live display has stopped,
+        # so its redraws cannot overwrite them.
+        images = (self._complete_data or {}).get("generated_images") if isinstance(self._complete_data, dict) else None
+        if images:
+            try:
+                from llx.config import get_server_url
+                from llx.media_preview import show_generated
+
+                show_generated(images, self.server_url or get_server_url(), self._console)
+            except Exception:
+                pass
 
         # Print error if any
         if self._error:

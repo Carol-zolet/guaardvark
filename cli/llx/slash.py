@@ -628,15 +628,9 @@ class SlashRouter:
                 if response:
                     self._console.print(f"[llx.dim]{response}[/llx.dim]")
                 try:
-                    from pathlib import Path as _Path
+                    from llx.media_preview import show_generated
 
-                    from llx.media_preview import extract_media_path, preview_image
-
-                    media = extract_media_path(data, server or "")
-                    if media and not str(media).startswith("http") and _Path(media).is_file():
-                        preview_image(media, console=self._console)
-                    elif media:
-                        self._console.print(f"[link={media}]{media}[/link]")
+                    show_generated(data.get("generated_images"), client.server_url, self._console)
                 except Exception:
                     pass
             else:
