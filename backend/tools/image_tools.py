@@ -618,9 +618,10 @@ class GenerationStatusTool(BaseTool):
     description = (
         "Report the state of a queued generation: an image batch (ImageBatch_...) from "
         "generate_image with wait_for_result=false or started in the Studio, a video batch "
-        "from generate_video, or a bulk CSV job (bulk_gen_...) from generate_bulk_csv. Returns "
-        "status, progress while running, and each finished file (URL for images and video; for a "
-        "CSV, its path and how many rows it holds). Use after a queued generate call, or when the "
+        "from generate_video, a bulk CSV job (bulk_gen_...) from generate_bulk_csv, or a song "
+        "(a 32-character job id) from generate_music. Returns status, progress while running, and "
+        "each finished file (URL for images and video; for a CSV, its path and how many rows it "
+        "holds; for a song, its download link). Use after a queued generate call, or when the "
         "user asks whether a render is done. Read-only; an unknown id is an error, and so is a "
         "backend that does not answer (over MCP the backend must be running)."
     )
@@ -628,7 +629,7 @@ class GenerationStatusTool(BaseTool):
         "batch_id": ToolParameter(
             name="batch_id",
             type="string",
-            description="The id a generate tool returned, e.g. ImageBatch_09-11-2026_132620_013 or bulk_gen_1790556697_3fa2c1.",
+            description="The id a generate tool returned, e.g. ImageBatch_09-11-2026_132620_013, bulk_gen_1790556697_3fa2c1 or a song's job id.",
             required=True,
         ),
     }
@@ -837,6 +838,60 @@ class GenerationStatusTool(BaseTool):
             return None
         return cls._bulk_info(job_id, d["progress_status"], d.get("output_filename"), d.get("num_items"))
 
+    _AUDIO_JOB_ID = re.compile(r"^[0-9a-f]{32}$")
+
+    @staticmethod
+    def _audio_info(job_id: str, job: dict):
+        """A song or voice job from Audio Foundry, in this tool's shape."""
+        from backend.tools.audio_tools import STUDIO_URL, _file_entry
+        status = {"done": "complete", "error": "error", "failed": "error"}.get(job.get("status"), job.get("status"))
+        prog = job.get("progress") or {}
+        pct = None
+        if prog.get("total"):
+            pct = int(100 * (prog.get("current") or 0) / prog["total"])
+        files = []
+        if status == "complete" and job.get("result"):
+            entry = _file_entry(job["result"])
+            entry.setdefault("url", entry["file"])
+            files.append(entry)
+        return {
+            "kind": {"music": "song", "voice": "speech", "fx": "sound effect"}.get(job.get("intent"), "audio"),
+            "batch_id": job_id, "status": status, "progress": pct, "message": prog.get("stage") or "",
+            "error": job.get("error"), "errors": [], "files": files, "studio_url": STUDIO_URL,
+        }
+
+    @classmethod
+    def _audio_status_http(cls, job_id: str):
+        if not cls._AUDIO_JOB_ID.match(job_id):
+            return None
+        try:
+            job = _http_json("GET", f"/api/audio-foundry/jobs/{job_id}")
+        except RuntimeError as e:
+            if "not found" in str(e).lower() or "unknown job" in str(e).lower() or "404" in str(e):
+                return None
+            raise
+        return cls._audio_info(job_id, job) if isinstance(job, dict) and job.get("status") else None
+
+    @classmethod
+    def _audio_status(cls, job_id: str):
+        if not cls._AUDIO_JOB_ID.match(job_id):
+            return None
+        import requests
+        from backend.api.audio_foundry_api import AUDIO_FOUNDRY_URL
+        from backend.services import comfyui_music_generator as m3
+        m3_job = m3.job_status(job_id)
+        if m3_job is not None:
+            job = {"intent": "music", "status": {"failed": "error"}.get(m3_job["status"], m3_job["status"]),
+                   "error": m3_job.get("error"),
+                   "result": {"path": m3_job.get("path"), "document_id": m3_job.get("document_id"),
+                              "duration_s": m3_job.get("seconds")} if m3_job.get("path") else None}
+            return cls._audio_info(job_id, job)
+        resp = requests.get(f"{AUDIO_FOUNDRY_URL}/jobs/{job_id}", timeout=5)
+        if resp.status_code == 404:
+            return None
+        resp.raise_for_status()
+        return cls._audio_info(job_id, resp.json())
+
     def execute(self, batch_id: str, **kwargs) -> ToolResult:
         batch_id = (batch_id or "").strip()
         if not batch_id:
@@ -845,9 +900,11 @@ class GenerationStatusTool(BaseTool):
         unreachable = None
         remote = self._context.get("transport") == "mcp"
         readers = (
-            (self._bulk_status_http, self._bulk_status_tracking, self._image_status_http, self._video_status_http)
+            (self._bulk_status_http, self._bulk_status_tracking, self._audio_status_http,
+             self._image_status_http, self._video_status_http)
             if remote else
-            (self._bulk_status, self._bulk_status_tracking, self._image_status, self._video_status)
+            (self._bulk_status, self._bulk_status_tracking, self._audio_status,
+             self._image_status, self._video_status)
         )
         for reader in readers:
             try:
@@ -868,10 +925,11 @@ class GenerationStatusTool(BaseTool):
                 f"Could not read {batch_id}: the Guaardvark backend did not answer ({unreachable}). "
                 "Try again shortly."))
         if info is None:
-            return ToolResult(success=False, error=f"No image, video or bulk CSV batch named {batch_id}")
+            return ToolResult(success=False, error=f"No image, video, audio or bulk CSV job named {batch_id}")
         total = info.get("total")
         done = info.get("completed") or 0
-        head = f"{info['kind'][0].upper()}{info['kind'][1:]} batch {batch_id}: {info['status']}"
+        noun = "job" if info["kind"] in ("song", "speech", "sound effect", "audio") else "batch"
+        head = f"{info['kind'][0].upper()}{info['kind'][1:]} {noun} {batch_id}: {info['status']}"
         if total:
             head += f" ({done}/{total} finished"
             if info.get("failed"):
@@ -880,6 +938,10 @@ class GenerationStatusTool(BaseTool):
         lines = [head]
         for f in info["files"]:
             lines.append(f"File: {f['url']}")
+            if f.get("download"):
+                lines.append(f"Download: {f['download']}")
+            if f.get("duration_s") is not None:
+                lines.append(f"Length: {f['duration_s']} s")
             if info["kind"] == "bulk CSV" and info.get("message"):
                 lines.append(info["message"])
             if info["kind"] == "image":
@@ -1544,7 +1606,7 @@ class EditImageTool(BaseTool):
         "the user has attached/uploaded an image (or names one) and asks to add, "
         "remove, or change something in it, e.g. 'put a cowboy hat on this character'. "
         "Preserves the original subject and only applies the requested edit. If the "
-        "user did not attach an image, ask them to attach one. Do NOT use this to make "
+        "user did not attach an image, ask them to attach one (an MCP client passes image). Do NOT use this to make "
         "a brand-new image from scratch — use generate_image. For a new scene that "
         "keeps a face from an attached photo, use generate_identity."
     )
@@ -1556,8 +1618,9 @@ class EditImageTool(BaseTool):
         ),
         "image": ToolParameter(
             name="image", type="string",
-            description=("Path, URL, or reference of the image to edit. Usually omit this — "
-                         "the image the user just attached is used automatically."),
+            description=("The image to edit. In chat, omit it to use the image the user just attached. "
+                         "From an MCP client, pass a url that get_generation_status or an edit tool "
+                         "returned (e.g. /api/batch-image/image/<batch>/<file>), or a file path."),
             required=False, default="",
         ),
         "steps": ToolParameter(
@@ -1708,6 +1771,14 @@ class EditImageTool(BaseTool):
             cand = os.path.join(OUTPUT_DIR, image.split("/api/outputs/", 1)[1].split("?", 1)[0])
             if os.path.exists(cand):
                 return cand
+        # an image-batch URL, as get_generation_status reports it → the batch folder
+        batch_ref = re.search(r"/api/batch-image/image/([^/?#]+)/([^/?#]+)", image)
+        if batch_ref:
+            from backend.config import UPLOAD_DIR
+            base = (Path(UPLOAD_DIR) / "Images").resolve()
+            cand = (base / batch_ref.group(1) / "images" / batch_ref.group(2)).resolve()
+            if cand.is_relative_to(base) and cand.is_file():
+                return str(cand)
         # OFFLINE-FIRST: never fetch an external URL. A remote image URL (e.g. a
         # files.oaiusercontent.com / CDN link that rode in with the attachment) must
         # NOT trigger an outbound request. Same-host app URLs were already mapped to
@@ -1861,13 +1932,14 @@ class RemoveBackgroundTool(BaseTool):
     description = (
         "Remove the background from an attached photo and return a transparent PNG. "
         "Use for product shots, stickers, and cut-outs. Does not invent a new scene — "
-        "use generate_identity or edit_image for that. The attached image is used "
-        "automatically if `image` is omitted."
+        "use generate_identity or edit_image for that. In chat the attached image is used "
+        "when `image` is omitted; an MCP client passes `image`."
     )
     parameters = {
         "image": ToolParameter(
             name="image", type="string",
-            description="Path of the photo. Usually omit — the attached image is used.",
+            description=("The photo. In chat, omit it to use the attached image. From an MCP client, pass a "
+                         "url that get_generation_status or an edit tool returned, or a file path."),
             required=False, default="",
         ),
     }
@@ -1920,7 +1992,8 @@ class InpaintImageTool(BaseTool):
         ),
         "image": ToolParameter(
             name="image", type="string",
-            description="Path of the photo. Usually omit — the attached image is used.",
+            description=("The photo. In chat, omit it to use the attached image. From an MCP client, pass a "
+                         "url that get_generation_status or an edit tool returned, or a file path."),
             required=False, default="",
         ),
         "steps": ToolParameter(
@@ -1951,7 +2024,8 @@ class OutpaintImageTool(BaseTool):
     parameters = {
         "image": ToolParameter(
             name="image", type="string",
-            description="Path of the photo. Usually omit — the attached image is used.",
+            description=("The photo. In chat, omit it to use the attached image. From an MCP client, pass a "
+                         "url that get_generation_status or an edit tool returned, or a file path."),
             required=False, default="",
         ),
         "instruction": ToolParameter(
@@ -2062,7 +2136,8 @@ class GenerateIdentityTool(BaseTool):
         ),
         "image": ToolParameter(
             name="image", type="string",
-            description="Face reference. Usually omit — the attached image is used.",
+            description=("Face reference. In chat, omit it to use the attached image; otherwise a url an "
+                         "image tool returned, or a file path."),
             required=False, default="",
         ),
         "consented": ToolParameter(

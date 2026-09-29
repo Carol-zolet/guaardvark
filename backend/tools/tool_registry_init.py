@@ -613,6 +613,30 @@ def register_image_tools() -> List[str]:
     return registered
 
 
+def register_audio_tools() -> List[str]:
+    """Register music and speech for MCP clients.
+
+    Registered only in the MCP server process, so chat's tool choice is unchanged;
+    agents connected over MCP get the Audio Foundry that the Studio's Audio page uses.
+    """
+    from backend.utils.backend_http import in_mcp_process
+
+    registered = []
+    if not in_mcp_process():
+        return registered
+    for _cls_name, _tool_name in (("GenerateMusicTool", "generate_music"),
+                                  ("GenerateSpeechTool", "generate_speech")):
+        try:
+            from backend.tools import audio_tools as _audio_tools
+            register_tool(getattr(_audio_tools, _cls_name)())
+            registered.append(_tool_name)
+            _tool_categories[_tool_name] = "audio"
+            logger.debug("Registered: %s", _cls_name)
+        except Exception as e:
+            logger.warning("Failed to register %s: %s", _tool_name, e)
+    return registered
+
+
 def register_test_execution_tools() -> List[str]:
     """Register sandboxed test execution for code_assistant agent."""
     global _tool_categories
@@ -812,6 +836,7 @@ def initialize_all_tools() -> ToolRegistry:
     _registered_tools.extend(register_rag_tools())
     _registered_tools.extend(register_media_tools())
     _registered_tools.extend(register_image_tools())
+    _registered_tools.extend(register_audio_tools())
     _registered_tools.extend(register_test_execution_tools())
     _registered_tools.extend(register_agent_control_tools())
     _registered_tools.extend(register_outreach_tools())
