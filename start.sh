@@ -1616,9 +1616,20 @@ ensure_frontend_deps() {
         return 0
     fi
 
+    # The stamp records the Node version node_modules was installed with: npm
+    # picks optional native packages (rolldown's binding) for that version, so a
+    # different Node needs a fresh install. An empty stamp from before this was
+    # recorded is adopted as-is, unless this run replaced Node.
+    local cur_node stamp_node="" node_changed=0
+    cur_node=$(node --version 2>/dev/null)
+    [ -f "$stamp" ] && stamp_node=$(cat "$stamp" 2>/dev/null)
+    if [ "${GUAARDVARK_NODE_REPLACED:-0}" = 1 ] || { [ -n "$stamp_node" ] && [ "$stamp_node" != "$cur_node" ]; }; then
+        node_changed=1
+    fi
+
     # Run npm ci (lockfile-strict, same strategy as scripts/dep_reconciler/reconcilers/frontend.py)
-    # only when truly needed: missing node_modules, or lockfile newer than our stamp.
-    if [ ! -d "$nm" ] || [ ! -f "$stamp" ] || [ "$lock" -nt "$stamp" 2>/dev/null ]; then
+    # only when truly needed: missing node_modules, lockfile newer than our stamp, or a new Node.
+    if [ ! -d "$nm" ] || [ ! -f "$stamp" ] || [ "$lock" -nt "$stamp" 2>/dev/null ] || [ "$node_changed" -eq 1 ]; then
         # npm ci deletes node_modules before downloading, so offline it would
         # leave the UI with nothing. Keep the installed tree until the registry
         # is reachable; the stamp stays old, so the next online start updates it.
@@ -1628,17 +1639,21 @@ ensure_frontend_deps() {
         fi
         vader_info "Ensuring frontend dependencies (using npm ci for lockfile safety)..."
         if (cd "$FRONTEND_DIR" && npm ci >> "$SETUP_LOG" 2>&1); then
-            touch "$stamp" 2>/dev/null || true
+            printf '%s\n' "$cur_node" > "$stamp" 2>/dev/null || true
+            GUAARDVARK_NODE_REPLACED=0
             vader_success "Frontend node_modules ready"
         else
             vader_warn "npm ci failed — trying npm install (may touch package-lock.json)"
             if (cd "$FRONTEND_DIR" && npm install >> "$SETUP_LOG" 2>&1); then
-                touch "$stamp" 2>/dev/null || true
+                printf '%s\n' "$cur_node" > "$stamp" 2>/dev/null || true
+                GUAARDVARK_NODE_REPLACED=0
             else
                 vader_error "Frontend dependency installation failed. See $SETUP_LOG"
                 return 1
             fi
         fi
+    elif [ -z "$stamp_node" ]; then
+        printf '%s\n' "$cur_node" > "$stamp" 2>/dev/null || true
     fi
     return 0
 }

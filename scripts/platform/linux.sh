@@ -236,6 +236,9 @@ _linux_ensure_node_via_binary() {
     rm -rf "$node_dir"
     mv "$HOME/.local/node-${ver}-${arch}" "$node_dir"
     export PATH="$node_dir/bin:$PATH"
+    # node_modules was installed for the previous Node; start.sh reinstalls it.
+    GUAARDVARK_NODE_REPLACED=1
+    export GUAARDVARK_NODE_REPLACED
     if command -v node >/dev/null 2>&1 && command -v npm >/dev/null 2>&1; then
         NPM_CMD=npm
         export NPM_CMD
