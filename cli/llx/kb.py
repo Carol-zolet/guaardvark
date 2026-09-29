@@ -30,6 +30,8 @@ def search_passages(client: LlxClient, query: str, top_k: int = 5) -> tuple[list
             "score": r.get("score"),
             "text": (r.get("text") or "").strip(),
         })
+    # Best match first: the retrieval order can differ from the score shown.
+    passages.sort(key=lambda p: p["score"] if isinstance(p["score"], (int, float)) else -1, reverse=True)
     return passages, meta.get("retrieval") or {}
 
 
