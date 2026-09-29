@@ -3659,6 +3659,8 @@ class UnifiedChatEngine:
         except Exception:
             pass
         self._save_message(session_id, "assistant", response, extra_data=extra_data)
+        # The CLI calls this over HTTP with no socket to receive chat:image on,
+        # so the reply carries the files too.
         return {
             "success": result.success,
             "response": response,
@@ -3666,6 +3668,7 @@ class UnifiedChatEngine:
             "steps": [],
             "request_id": request_id,
             "session_id": session_id,
+            "generated_images": generated_images,
         }
 
     def _try_media_direct(self, message: str, session_id: str,
