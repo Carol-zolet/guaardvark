@@ -25,7 +25,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from .core import Finding, FindingKind, Severity
+from .core import Finding, FindingKind, Severity, source_files
 
 
 # Subprocess probe: import the real registry in a sanitized, offline, no-GPU
@@ -333,11 +333,11 @@ def _find_invocations(root: Path, tool_names: set[str]) -> dict[str, list[str]]:
     if not backend.is_dir():
         return out
     name_re = {name: re.compile(rf"""['"]\b{re.escape(name)}\b['"]""") for name in tool_names}
-    for py in backend.rglob("*.py"):
+    # Only these two folders are skipped here, so a tool named in tests or
+    # migrations still counts as referenced.
+    for py in source_files(root, pattern="*.py", under=backend,
+                           exclude_dirs=frozenset({"__pycache__", "venv"})):
         rel = str(py.relative_to(root))
-        # Tested below root, so a checkout under a folder named venv is still read.
-        if "/__pycache__/" in f"/{rel}" or "/venv/" in f"/{rel}":
-            continue
         try:
             text = py.read_text(encoding="utf-8", errors="ignore")
         except Exception:

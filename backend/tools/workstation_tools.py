@@ -102,8 +102,10 @@ def _load_snapshot(root: Path, refresh: bool) -> dict:
 # How long map_codebase waits for a map being computed before answering with
 # what it has. Measured 2026-09-30 on one workstation: a clean checkout
 # (1,454 source files) maps in about 15 s, 7 s of it the tool-registry
-# subprocess; a checkout also holding ~26,000 files of ignored worktree
-# copies took 126 s before that subprocess. MCP clients are cut off at 120 s
+# subprocess; files git ignores are not mapped, so local copies beside the
+# source add nothing. A tree that has to be walked instead (see
+# core.source_files), holding about 49,000 .py files of scratch and worktree
+# copies, took 296 s before that subprocess. MCP clients are cut off at 120 s
 # by default. 60 s is four times the clean-checkout time and half that cutoff.
 _MAP_WAIT_SECONDS = 60.0
 
@@ -284,7 +286,7 @@ class MapCodebaseTool(BaseTool):
         ),
         "root": ToolParameter(
             name="root", type="string", required=False, default="",
-            description="Folder inside the Guaardvark checkout to map instead of all of it, absolute or relative to the checkout (e.g. 'backend/api'); paths outside are refused. Folders named data, logs, backups, outputs, build, dist, env, venv, node_modules, migrations, plans, audit, voice or ComfyUI, among others, are always skipped, and a root inside one is refused.",
+            description="Folder inside the Guaardvark checkout to map instead of all of it, absolute or relative to the checkout (e.g. 'backend/api'); paths outside are refused. Folders named data, logs, backups, outputs, build, dist, env, venv, node_modules, migrations, plans, audit, voice or ComfyUI, among others, are always skipped, and a root inside one is refused. In a git checkout only files git tracks, or has not been told to ignore, are mapped, so a git-ignored folder maps as empty.",
         ),
         "limit": ToolParameter(
             name="limit", type="int", required=False, default=15, minimum=1, maximum=40,
