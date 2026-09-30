@@ -44,8 +44,8 @@ def _matches(row, clauses, params):
         elif clause == "coalesce(metadata_->>'page_label', '') = ''":
             if page:
                 return False
-        elif clause == "metadata_->>'heading_path' ILIKE %s":
-            needle = next(values).strip("%").lower()
+        elif clause == "metadata_->>'heading_path' ILIKE %s ESCAPE '\\'":
+            needle = next(values).strip("%").replace("\\", "").lower()
             if heading is None or needle not in heading.lower():
                 return False
         elif clause == "metadata_->>'page_label' = %s":
@@ -64,6 +64,9 @@ def db(monkeypatch):
         seen.append((sql, params))
         where = re.search(r"WHERE (.*?)(?: ORDER BY| GROUP BY|$)", sql, re.S).group(1)
         clauses = where.split(" AND ")
+        if "GROUP BY 1 ORDER BY 3 DESC" in sql:  # which files carry this name
+            count = sum(1 for row in PASSAGES if _matches(row, clauses, params))
+            return ([("", None, count)] if count else []), None
         if "GROUP BY 1, 2" in sql:  # the outline
             groups = {}
             for row in PASSAGES:
@@ -183,7 +186,8 @@ def test_no_selector_on_an_unknown_file_says_so(db):
 
 def test_no_section_sql_never_uses_ilike(db):
     ReadDocumentSectionTool().execute(source_filename="bike_maintenance.txt", heading_path=NO_SECTION)
-    sql, params = db[0]
+    # db[0] asks which files carry the name; the read is the query after it.
+    sql, params = db[1]
     assert "ILIKE" not in sql
     assert "coalesce(metadata_->>'heading_path', '') = ''" in sql
     assert params[0] == "bike_maintenance.txt"

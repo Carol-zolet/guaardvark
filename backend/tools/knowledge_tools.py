@@ -14,6 +14,8 @@ retrieved" -- a registry row for a file that failed to chunk is not navigable.
 
 import json
 import logging
+import os
+import re
 from typing import Any, Dict, List, Optional, Tuple
 
 from backend.services.agent_tools import BaseTool, ToolParameter, ToolResult
@@ -36,20 +38,17 @@ _NOT_A_SUMMARY = (
 def _table() -> Tuple[Optional[str], Optional[str]]:
     """Return (qualified_table, error)."""
     try:
-        from backend.services.indexing_service import (
-            resolve_existing_vector_table, _vector_backend,
-        )
-        if _vector_backend() != "pgvector":
+        from backend.services.indexing_service import locate_vector_table
+        # The table search reads, or the reason there is none to read. These
+        # tools must show what search_knowledge_base can retrieve, so a table
+        # that is missing, or one of several that cannot be told apart while the
+        # embedding model is unreachable, is reported and not guessed at.
+        found = locate_vector_table(None)
+        if found.table:
+            return f"data_{found.table}", None
+        if found.reason == "not_pgvector":
             return None, "These tools require the pgvector backend."
-        # Discovery rather than derivation: deriving the name needs the embedding
-        # model's dimension, and the MCP server is a bare subprocess with no Flask
-        # context and no initialised index, so that probe returns nothing. These
-        # tools are read-only and the dimension is already in the table name.
-        t = resolve_existing_vector_table(None)
-        if not t:
-            return None, ("No knowledge index found. Index some documents first, "
-                          "or check that the pgvector table exists.")
-        return f"data_{t}", None
+        return None, found.detail
     except Exception as e:
         return None, f"Index unavailable: {e}"
 
@@ -88,6 +87,102 @@ def _meta(raw) -> Dict[str, Any]:
         return {}
 
 
+# Which file a passage came from. source_filename alone does not say: two
+# uploads in different folders or projects can share a name. Every passage
+# carries the stored document id 'doc_<n>_<hash>', where <n> is the file's row in
+# the documents table, the same for all of a file's pages and sections. Passages
+# without such an id (nothing a file upload produces) share the empty key.
+_DOC_KEY = "coalesce(substring(metadata_->>'document_id' from '^doc_([0-9]+)_'), '')"
+
+
+def _contains(text: str) -> str:
+    """An ILIKE pattern that matches ``text`` anywhere, its own '%', '_' and
+    backslash taken literally. The clause using it must say ESCAPE '\\'."""
+    return "%" + text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+
+
+def _shown_path(file_path: Optional[str]) -> str:
+    """A stored file path in a form that tells two same-named files apart without
+    printing the machine's directory layout: relative to the uploads folder when
+    the file is in it, else its folder and name."""
+    if not file_path:
+        return ""
+    path = os.path.normpath(str(file_path))
+    try:
+        from backend.config import UPLOAD_DIR
+        root = os.path.normpath(str(UPLOAD_DIR))
+        if path.startswith(root + os.sep):
+            return path[len(root) + 1:]
+    except Exception:
+        pass
+    return os.sep.join(path.split(os.sep)[-2:])
+
+
+def _document_key(document_id: Any) -> Tuple[Optional[str], Optional[str]]:
+    """(key, error) for a document_id argument: the number list_documents prints,
+    or the stored 'doc_<n>_<hash>' form of it. (None, None) when none was given."""
+    if document_id is None or str(document_id).strip() == "":
+        return None, None
+    match = re.fullmatch(r"(?:doc_)?(\d+)(?:_\w*)?", str(document_id).strip())
+    if not match:
+        return None, f"document_id must be the number list_documents prints, e.g. 12, not '{document_id}'."
+    return str(int(match.group(1))), None
+
+
+def _document_line(key: str, path: Optional[str], passages: int) -> str:
+    shown = _shown_path(path)
+    label = f"document_id {key}" if key else "no document_id (cannot be chosen on its own)"
+    return f"  {label}" + (f" — {shown}" if shown else "") + f" ({passages} passage(s))"
+
+
+def _choose_document(table: str, source_filename: str, document_id: Any):
+    """Settle which indexed file a filename (and optional document_id) means.
+
+    Returns (key, shown path, early result). The early result is set when the
+    call cannot go on: a bad document_id, a name that is not indexed, a
+    document_id the name does not have, or a name several files share with no
+    document_id to choose between them. Otherwise key is the document key to
+    filter on, or None when the name belongs to one file and needs no filter.
+    """
+    key, problem = _document_key(document_id)
+    if problem:
+        return None, None, ToolResult(success=False, error=problem)
+    documents, qerr = _query(
+        f"""SELECT {_DOC_KEY} AS doc, max(metadata_->>'file_path'), count(*)
+            FROM "{table}"
+            WHERE metadata_->>'source_filename' = %s
+            GROUP BY 1 ORDER BY 3 DESC, 1""",
+        (source_filename,),
+    )
+    if qerr:
+        return None, None, ToolResult(success=False, error=f"Query failed: {qerr}")
+    if not documents:
+        return None, None, ToolResult(
+            success=True,
+            output=f"No indexed content for '{source_filename}'. Use list_documents to see available names.",
+        )
+    listed = "\n".join(_document_line(doc, path, count) for doc, path, count in documents)
+    found = {"documents": [{"document_id": doc, "path": _shown_path(path), "passages": count}
+                           for doc, path, count in documents]}
+    if key is not None:
+        for doc, path, _count in documents:
+            if doc == key:
+                return key, _shown_path(path), None
+        return None, None, ToolResult(
+            success=True,
+            output=f"'{source_filename}' has no document_id {key}. Indexed under that name:\n{listed}",
+            metadata=found,
+        )
+    if len(documents) > 1:
+        return None, None, ToolResult(
+            success=True,
+            output=(f"'{source_filename}' is the name of {len(documents)} indexed files, so it does "
+                    f"not say which one is meant. Call again with document_id:\n{listed}"),
+            metadata={"ambiguous": True, **found},
+        )
+    return None, None, None
+
+
 class ListDocumentsTool(BaseTool):
     """Enumerate the documents present in the knowledge base."""
 
@@ -97,7 +192,11 @@ class ListDocumentsTool(BaseTool):
         "List the documents in the local knowledge base, most passages first: one line per file with "
         "its passage count, its section count when above one, and the parser that read it, under a "
         "header giving how many documents match. Use it to see what is indexed, or to get the exact "
-        "filename get_document_outline and read_document_section take. Covers every project. "
+        "filename get_document_outline and read_document_section take. When several files share a "
+        "name (different folders or projects) each gets its own line ending in 'document_id <n>' and "
+        "its folder; pass that number to those tools to choose one. Covers every project on the "
+        "default shared index; an install set to per-project indexes lists only documents that "
+        "belong to no project. "
         "name_contains keeps filenames containing that text; limit and offset page through the list, "
         "and when more remain the reply ends with the offset for the next page. To find content by topic use "
         "search_knowledge_base; corpus summaries are in summarize_corpus, not here."
@@ -105,7 +204,7 @@ class ListDocumentsTool(BaseTool):
     parameters = {
         "name_contains": ToolParameter(
             name="name_contains", type="string", required=False,
-            description="Only list documents whose filename contains this text, case-insensitive, e.g. 'manual' or '.pdf'.",
+            description="Only list documents whose filename contains this text, case-insensitive and taken literally (no wildcards), e.g. 'manual' or '.pdf'.",
         ),
         "limit": ToolParameter(
             name="limit", type="int", required=False, default=40, minimum=1, maximum=200,
@@ -126,18 +225,27 @@ class ListDocumentsTool(BaseTool):
 
         conditions, filter_params = [_NOT_A_SUMMARY], []
         if name_contains:
-            conditions.append("metadata_->>'source_filename' ILIKE %s")
-            filter_params.append(f"%{name_contains}%")
+            conditions.append("metadata_->>'source_filename' ILIKE %s ESCAPE '\\'")
+            filter_params.append(_contains(name_contains))
         where = "WHERE " + " AND ".join(conditions)
         params = filter_params + [limit, offset]
 
+        # One row per file, not per filename: the document key keeps two files
+        # of the same name apart. same_name counts the files sharing a name
+        # across the whole listing, so a line is marked even when its namesake
+        # is on another page.
         rows, qerr = _query(
-            f"""SELECT metadata_->>'source_filename' AS src,
-                       count(*) AS chunks,
-                       count(DISTINCT metadata_->>'heading_path') AS sections,
-                       max(metadata_->>'parsed_by') AS parsed_by
-                FROM "{table}" {where}
-                GROUP BY 1 ORDER BY 2 DESC, 1 LIMIT %s OFFSET %s""",
+            f"""SELECT src, chunks, sections, parsed_by, doc, path,
+                       count(*) OVER (PARTITION BY src) AS same_name
+                FROM (SELECT metadata_->>'source_filename' AS src,
+                             count(*) AS chunks,
+                             count(DISTINCT metadata_->>'heading_path') AS sections,
+                             max(metadata_->>'parsed_by') AS parsed_by,
+                             {_DOC_KEY} AS doc,
+                             max(metadata_->>'file_path') AS path
+                      FROM "{table}" {where}
+                      GROUP BY 1, 5) documents
+                ORDER BY chunks DESC, src, doc LIMIT %s OFFSET %s""",
             tuple(params),
         )
         if qerr:
@@ -145,7 +253,7 @@ class ListDocumentsTool(BaseTool):
 
         # The total counts what the filter matches, so paging hints add up.
         total_rows, count_err = _query(
-            f"SELECT count(DISTINCT metadata_->>'source_filename') FROM \"{table}\" {where}",
+            f"SELECT count(DISTINCT (metadata_->>'source_filename', {_DOC_KEY})) FROM \"{table}\" {where}",
             tuple(filter_params),
         )
         # A failed count used to fall back to the page length, so "how big is the
@@ -170,16 +278,29 @@ class ListDocumentsTool(BaseTool):
         lines = [head
                  + (f", filtered by '{name_contains}'" if name_contains else "")
                  + f" · showing {offset + 1}-{offset + len(rows)}"]
-        for src, chunks, sections, parsed_by in rows:
+        shared = []
+        for src, chunks, sections, parsed_by, doc, path, same_name in rows:
             extra = f", {sections} sections" if sections and sections > 1 else ""
-            lines.append(f"  {src or '(unknown)'} — {chunks} passages{extra} [{parsed_by or '?'}]")
+            line = f"  {src or '(unknown)'} — {chunks} passages{extra} [{parsed_by or '?'}]"
+            if same_name and same_name > 1:
+                shown = _shown_path(path)
+                line += (f" · document_id {doc}" if doc else " · no document_id") + (f" · {shown}" if shown else "")
+                if src not in shared:
+                    shared.append(src)
+            lines.append(line)
+        if shared:
+            lines.append(
+                "\nA name shown with a document_id belongs to more than one file: pass that "
+                "document_id to get_document_outline or read_document_section to choose one."
+            )
         if total is not None and offset + len(rows) < total:
             lines.append(f"\n({total - offset - len(rows)} more — call again with offset={offset + len(rows)})")
         elif total is None and len(rows) == limit:
             lines.append(f"\n(there may be more — call again with offset={offset + len(rows)})")
 
         return ToolResult(success=True, output="\n".join(lines),
-                          metadata={"total": total, "returned": len(rows), "offset": offset})
+                          metadata={"total": total, "returned": len(rows), "offset": offset,
+                                    "shared_names": shared})
 
 
 class DocumentOutlineTool(BaseTool):
@@ -193,30 +314,42 @@ class DocumentOutlineTool(BaseTool):
         "the document's total. Use it after list_documents and before read_document_section, which "
         "takes a heading path, a page label or '(no section)' exactly as this outline prints them "
         "('(no section)' covers passages with neither a heading nor a page, as in a plain .txt file). "
-        "An unknown filename returns a short notice, not an error. To find a topic across documents "
-        "use search_knowledge_base."
+        "An unknown filename returns a short notice, not an error. When several indexed files "
+        "share the filename, the reply lists them with their document_id and no outline: call "
+        "again with document_id. To find a topic across documents use search_knowledge_base."
     )
     parameters = {
         "source_filename": ToolParameter(
             name="source_filename", type="string", required=True,
             description="Exact filename as list_documents prints it, e.g. 'handbook.pdf' (case-sensitive).",
         ),
+        "document_id": ToolParameter(
+            name="document_id", type="int", required=False, minimum=1,
+            description="Only needed when several files share the filename: the number list_documents prints after 'document_id' on that file's line.",
+        ),
     }
 
-    def execute(self, source_filename: str) -> ToolResult:
+    def execute(self, source_filename: str, document_id: Any = None) -> ToolResult:
         table, err = _table()
         if err:
             return ToolResult(success=False, error=err)
+        key, shown, early = _choose_document(table, source_filename, document_id)
+        if early:
+            return early
 
+        clauses, params = ["metadata_->>'source_filename' = %s"], [source_filename]
+        if key is not None:
+            clauses.append(f"{_DOC_KEY} = %s")
+            params.append(key)
         rows, qerr = _query(
             f"""SELECT coalesce(metadata_->>'heading_path', ''),
                        coalesce(metadata_->>'page_label', ''),
                        count(*)
                 FROM "{table}"
-                WHERE metadata_->>'source_filename' = %s
+                WHERE {" AND ".join(clauses)}
                 GROUP BY 1, 2
                 ORDER BY min(id)""",
-            (source_filename,),
+            tuple(params),
         )
         if qerr:
             return ToolResult(success=False, error=f"Query failed: {qerr}")
@@ -226,7 +359,10 @@ class DocumentOutlineTool(BaseTool):
                 output=f"No indexed content for '{source_filename}'. Use list_documents to see available names.",
             )
 
-        lines = [f"OUTLINE — {source_filename} ({sum(r[2] for r in rows)} passages)"]
+        name = source_filename
+        if key is not None:
+            name += f" · document_id {key}" + (f" · {shown}" if shown else "")
+        lines = [f"OUTLINE — {name} ({sum(r[2] for r in rows)} passages)"]
         for heading, page, count in rows:
             label = _section_label(heading, page)
             loc = f" p.{page}" if page and heading else ""
@@ -249,7 +385,9 @@ class ReadDocumentSectionTool(BaseTool):
         "contains the text (case-insensitive), so a short value can return several sections. With "
         "neither, it reads the whole document from the start. Returns up to 25 passages per call, "
         "each cut at 1,200 characters and labelled with its section or page as the outline names "
-        "it; the header gives the total and the offset for the next call. To locate a topic first "
+        "it; the header gives the total and the offset for the next call. When several indexed "
+        "files share the filename, the reply lists them with their document_id and no text: call "
+        "again with document_id. To locate a topic first "
         "use search_knowledge_base; for a file that is not indexed, process_file."
     )
     parameters = {
@@ -257,9 +395,13 @@ class ReadDocumentSectionTool(BaseTool):
             name="source_filename", type="string", required=True,
             description="Exact filename as list_documents prints it (case-sensitive).",
         ),
+        "document_id": ToolParameter(
+            name="document_id", type="int", required=False, minimum=1,
+            description="Only needed when several files share the filename: the number list_documents prints after 'document_id' on that file's line.",
+        ),
         "heading_path": ToolParameter(
             name="heading_path", type="string", required=False,
-            description="Section path as get_document_outline shows it, e.g. 'Installation > Requirements'; any section whose path contains this text matches. '(no section)' reads the passages that have neither a heading nor a page. Leave out together with page_label to read the whole document.",
+            description="Section path as get_document_outline shows it, e.g. 'Installation > Requirements'; any section whose path contains this text, taken literally, matches. '(no section)' reads the passages that have neither a heading nor a page. Leave out together with page_label to read the whole document.",
         ),
         "page_label": ToolParameter(
             name="page_label", type="string", required=False,
@@ -272,16 +414,22 @@ class ReadDocumentSectionTool(BaseTool):
     }
 
     def execute(self, source_filename: str, heading_path: str = None, page_label: str = None,
-                offset: int = None) -> ToolResult:
+                offset: int = None, document_id: Any = None) -> ToolResult:
         table, err = _table()
         if err:
             return ToolResult(success=False, error=err)
+        key, shown, early = _choose_document(table, source_filename, document_id)
+        if early:
+            return early
         heading_path = (heading_path or "").strip()
         page_label = str(page_label).strip() if page_label is not None else ""
         no_section = heading_path.lower() == NO_SECTION
 
         clauses = ["metadata_->>'source_filename' = %s"]
         params: List[Any] = [source_filename]
+        if key is not None:
+            clauses.append(f"{_DOC_KEY} = %s")
+            params.append(key)
         if no_section:
             # The outline's '(no section)' group: ILIKE never matches a NULL
             # heading, so these rows are selected by their missing metadata.
@@ -289,8 +437,8 @@ class ReadDocumentSectionTool(BaseTool):
             if not page_label:
                 clauses.append("coalesce(metadata_->>'page_label', '') = ''")
         elif heading_path:
-            clauses.append("metadata_->>'heading_path' ILIKE %s")
-            params.append(f"%{heading_path}%")
+            clauses.append("metadata_->>'heading_path' ILIKE %s ESCAPE '\\'")
+            params.append(_contains(heading_path))
         if page_label:
             clauses.append("metadata_->>'page_label' = %s")
             params.append(page_label)
@@ -316,6 +464,8 @@ class ReadDocumentSectionTool(BaseTool):
             return ToolResult(success=True, output="No passages match that section or page.")
 
         head = f"{source_filename}"
+        if key is not None:
+            head += f" · document_id {key}" + (f" · {shown}" if shown else "")
         if no_section:
             head += f" · {NO_SECTION}"
         elif heading_path:
