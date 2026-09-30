@@ -40,6 +40,7 @@ import WaveformPlayer from "../components/audio/WaveformPlayer";
 import axios from "axios";
 import { ActionButton, DashboardStrip, DashboardTile } from "../components/settings/ui";
 import AlertSnackbar from "../components/common/AlertSnackbar";
+import VoiceConsentDialog from "../components/audio/VoiceConsentDialog";
 import SettingsIcon from "@mui/icons-material/Settings";
 
 const AudioFoundryModelsModal = React.lazy(() => import("../components/modals/AudioFoundryModelsModal"));
@@ -111,13 +112,27 @@ const MUSIC_INSTRUMENTS = [
   "Acoustic guitar", "Drums", "Strings", "Brass", "Choir",
 ];
 
+// "Default" in the voice picker: send no voice_id and let Audio Foundry pick
+// (Chatterbox's stock voice in auto, Kokoro's default voice in kokoro).
+const DEFAULT_VOICE = "default";
+
+// The engine a voice request will use (plugins/audio_foundry/backends/voice_gen.py):
+// in auto a reference clip means Chatterbox, a picked built-in voice means Kokoro.
+const voiceEngine = (voiceBackend, voiceId, referenceClip) => {
+  if (voiceBackend !== "auto") return voiceBackend;
+  if (referenceClip) return "chatterbox";
+  if (voiceId && voiceId !== DEFAULT_VOICE) return "kokoro";
+  return "auto";
+};
+
 // Compose chip selections + free text into the LLM rewriter's input. The
 // rewriter expects natural-ish input (it was trained on prose-to-tags), so
 // we just join with commas and let it sort the vocabulary out.
-const idsForTab = (tab, voiceBackend, musicModel) => {
+const idsForTab = (tab, voiceBackend, musicModel, voiceId, referenceClip) => {
   if (tab === 0) {
-    if (voiceBackend === "kokoro") return { ids: ["kokoro"], any: false };
-    if (voiceBackend === "chatterbox") return { ids: ["chatterbox"], any: false };
+    const engine = voiceEngine(voiceBackend, voiceId, referenceClip);
+    if (engine === "kokoro") return { ids: ["kokoro"], any: false };
+    if (engine === "chatterbox") return { ids: ["chatterbox"], any: false };
     return { ids: ["chatterbox", "kokoro"], any: true };
   }
   if (tab === 1) {
@@ -203,44 +218,81 @@ const AudioFoundryPage = () => {
   const [musicPreview, setMusicPreview] = useState(null);
   const [musicPolishing, setMusicPolishing] = useState(false);
   const [voiceBackend, setVoiceBackend] = useState("auto");
-  const [voiceId, setVoiceId] = useState("af_heart");
+  const [voiceId, setVoiceId] = useState(DEFAULT_VOICE);
   const [voiceGroups, setVoiceGroups] = useState(FALLBACK_VOICES);
 
   // Chatterbox reference clips for zero-shot voice cloning. `referenceClip`
-  // holds the currently-selected clip object {id, filename, path}; null means
-  // "use Chatterbox's default voice". `voiceClipLibrary` is the list of
-  // previously-uploaded clips fetched from /voice-clips.
+  // holds the currently-selected clip object {id, filename, path, consented};
+  // null means "use Chatterbox's default voice". `voiceClipLibrary` is the
+  // list of previously-uploaded clips fetched from /voice-clips.
   const [referenceClip, setReferenceClip] = useState(null);
   const [voiceClipLibrary, setVoiceClipLibrary] = useState([]);
   const [uploadingClip, setUploadingClip] = useState(false);
+  // A clip is cloned only after the person confirms the consent statement:
+  // before a new clip is imported, or before an older clip without a record
+  // is used. {file} or {clip} while the dialog is open.
+  const [consentStatement, setConsentStatement] = useState("");
+  const [consentRequest, setConsentRequest] = useState(null);
 
   // Pull library of existing reference clips. Refreshes after every successful
   // upload/delete so the picker stays current.
   const refreshVoiceClips = useCallback(() => {
     axios.get(`${API_BASE}/audio-foundry/voice-clips`)
-      .then((res) => setVoiceClipLibrary(res.data?.clips || []))
+      .then((res) => {
+        setVoiceClipLibrary(res.data?.clips || []);
+        if (res.data?.consent_statement) setConsentStatement(res.data.consent_statement);
+      })
       .catch(() => { /* plugin offline; leave library empty */ });
   }, []);
   useEffect(() => { refreshVoiceClips(); }, [refreshVoiceClips]);
 
-  const handleClipUpload = async (file) => {
+  const handleClipUpload = (file) => {
     if (!file) return;
+    setConsentRequest({ file });
+  };
+
+  const handlePickClip = (clip) => {
+    if (!clip) return;
+    if (clip.consented) {
+      setReferenceClip(clip);
+    } else {
+      setConsentRequest({ clip });
+    }
+  };
+
+  const handleConsentConfirmed = async () => {
+    const request = consentRequest;
+    if (!request) return;
     setUploadingClip(true);
     setError(null);
     try {
-      const fd = new FormData();
-      fd.append("file", file);
-      fd.append("name", file.name);
-      const res = await axios.post(
-        `${API_BASE}/audio-foundry/voice-clips/upload`,
-        fd,
-        { headers: { "Content-Type": "multipart/form-data" } },
-      );
-      setReferenceClip(res.data);
+      if (request.file) {
+        const fd = new FormData();
+        fd.append("file", request.file);
+        fd.append("name", request.file.name);
+        fd.append("consent_confirmed", "true");
+        const res = await axios.post(
+          `${API_BASE}/audio-foundry/voice-clips/upload`,
+          fd,
+          { headers: { "Content-Type": "multipart/form-data" } },
+        );
+        if (!res.data?.consented) {
+          throw new Error("The clip was imported but consent could not be saved, so it cannot be cloned.");
+        }
+        setReferenceClip(res.data);
+      } else {
+        await axios.post(
+          `${API_BASE}/audio-foundry/voice-clips/${encodeURIComponent(request.clip.id)}/consent`,
+          { confirmed: true },
+        );
+        setReferenceClip({ ...request.clip, consented: true });
+      }
+      setConsentRequest(null);
       refreshVoiceClips();
     } catch (err) {
-      console.error("Voice clip upload failed:", err);
-      setError(formatUiError(err.response?.data?.error) || "Import failed.");
+      console.error("Voice clip consent failed:", err);
+      setError(formatUiError(err.response?.data?.error) || err.message || "Import failed.");
+      setConsentRequest(null);
     } finally {
       setUploadingClip(false);
     }
@@ -363,7 +415,7 @@ const AudioFoundryPage = () => {
     // The poll loop will observe status === "cancelled" and reset.
   };
 
-  const tabNeed = idsForTab(activeTab, voiceBackend, musicModel);
+  const tabNeed = idsForTab(activeTab, voiceBackend, musicModel, voiceId, referenceClip);
   const missingRows = missingCatalogRows(catalog, tabNeed.ids, tabNeed.any);
   const pluginRunning = !!pluginInfo.running;
   const openModels = (modelId) => {
@@ -391,18 +443,15 @@ const AudioFoundryPage = () => {
       if (type === "voice") {
         endpoint = "/generate/voice";
         payload = { text: voiceText, backend: voiceBackend };
-        // Kokoro uses voice_id; Chatterbox ignores it (zero-shot voice cloning
-        // takes a reference clip instead). Send for auto + kokoro so the
-        // dispatcher's Kokoro-fallback path also picks up the selected voice.
-        if (voiceBackend !== "chatterbox") {
-          payload.voice_id = voiceId;
-        }
-        // Chatterbox: pass the absolute reference clip path if the user
-        // selected one. Without it Chatterbox falls back to its default voice.
-        // For "auto" we also forward the clip — if Chatterbox runs, it uses
-        // the clip; if it falls back to Kokoro, the clip is silently ignored.
+        // A reference clip (Chatterbox) and a built-in voice (Kokoro) each
+        // decide the voice, so at most one is sent. In auto either one picks
+        // its engine and Audio Foundry reports an error rather than speak
+        // with a different voice; with neither, auto uses Chatterbox's stock
+        // voice (Kokoro's default when Chatterbox cannot run), as before.
         if (referenceClip && voiceBackend !== "kokoro") {
           payload.reference_clip_path = referenceClip.path;
+        } else if (voiceBackend !== "chatterbox" && voiceId !== DEFAULT_VOICE) {
+          payload.voice_id = voiceId;
         }
       } else if (type === "fx") {
         endpoint = "/generate/fx";
@@ -421,7 +470,10 @@ const AudioFoundryPage = () => {
       finishWithResult(res.data);  // inline (short text) — unchanged behavior
     } catch (err) {
       console.error("Audio generation failed:", err);
-      setError(err.response?.data?.detail || "Generation failed. Please check backend logs.");
+      setError(
+        formatUiError(err.response?.data?.detail || err.response?.data?.error) ||
+        "Generation failed. Please check backend logs.",
+      );
       setLoading(false);
     } finally {
       // Inline + error paths set loading=false above / in catch; the async path
@@ -683,15 +735,20 @@ const AudioFoundryPage = () => {
                         />
                       ))}
                     </Stack>
-                    {voiceBackend !== "chatterbox" && (
+                    {voiceBackend !== "chatterbox" && !(voiceBackend === "auto" && referenceClip) && (
                       <FormControl variant="filled" fullWidth size="small">
-                        <InputLabel>Voice {voiceBackend === "auto" ? "(used by Kokoro path)" : ""}</InputLabel>
+                        <InputLabel>Voice</InputLabel>
                         <Select
                           value={voiceId}
                           onChange={(e) => setVoiceId(e.target.value)}
                           MenuProps={{ PaperProps: { sx: { maxHeight: 360 } } }}
                           sx={{ borderRadius: 2 }}
                         >
+                          <MenuItem value={DEFAULT_VOICE}>
+                            {voiceBackend === "auto"
+                              ? "Automatic: Chatterbox's stock voice (Kokoro Heart if Chatterbox cannot run)"
+                              : "Default (Heart)"}
+                          </MenuItem>
                           {voiceGroups.flatMap((group) => [
                             <ListSubheader key={group.label}>{group.label}</ListSubheader>,
                             ...group.voices.map((v) => (
@@ -708,7 +765,7 @@ const AudioFoundryPage = () => {
                         <Typography variant="body2" sx={{ opacity: 0.85 }}>
                           {voiceBackend === "chatterbox"
                             ? "Reference clip (5–10s of clean speech in the voice you want to clone). Optional — leave empty to use Chatterbox's default voice."
-                            : "Optional Chatterbox reference clip. Used only if Chatterbox runs (auto mode)."}
+                            : "Optional reference clip to clone (Chatterbox). A clip decides the voice; without one, the voice above is used."}
                         </Typography>
 
                         {referenceClip ? (
@@ -747,7 +804,11 @@ const AudioFoundryPage = () => {
                               hidden
                               type="file"
                               accept="audio/*,.wav,.mp3,.ogg,.flac,.m4a"
-                              onChange={(e) => handleClipUpload(e.target.files?.[0])}
+                              onChange={(e) => {
+                                handleClipUpload(e.target.files?.[0]);
+                                // Picking the same file again after Cancel must reopen the dialog.
+                                e.target.value = "";
+                              }}
                             />
                           </Button>
                         )}
@@ -758,8 +819,7 @@ const AudioFoundryPage = () => {
                             <Select
                               value=""
                               onChange={(e) => {
-                                const c = voiceClipLibrary.find((x) => x.id === e.target.value);
-                                if (c) setReferenceClip(c);
+                                handlePickClip(voiceClipLibrary.find((x) => x.id === e.target.value));
                               }}
                               MenuProps={{ PaperProps: { sx: { maxHeight: 300 } } }}
                               sx={{ borderRadius: 2 }}
@@ -769,7 +829,7 @@ const AudioFoundryPage = () => {
                                   <Box sx={{ display: "flex", justifyContent: "space-between", width: "100%" }}>
                                     <span>{c.filename}</span>
                                     <Typography component="span" variant="caption" sx={{ opacity: 0.5, ml: 2 }}>
-                                      {(c.size_bytes / 1024).toFixed(0)} KB
+                                      {c.consented ? "" : "needs consent · "}{(c.size_bytes / 1024).toFixed(0)} KB
                                     </Typography>
                                   </Box>
                                 </MenuItem>
@@ -1140,6 +1200,14 @@ const AudioFoundryPage = () => {
           onChanged={refreshCatalog}
         />
       </Suspense>
+      <VoiceConsentDialog
+        open={!!consentRequest}
+        clipName={consentRequest?.file?.name || consentRequest?.clip?.filename}
+        statement={consentStatement}
+        busy={uploadingClip}
+        onConfirm={handleConsentConfirmed}
+        onCancel={() => setConsentRequest(null)}
+      />
       <AlertSnackbar
         open={toast.open}
         onClose={() => setToast((t) => ({ ...t, open: false }))}

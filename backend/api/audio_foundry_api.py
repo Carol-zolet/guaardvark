@@ -31,9 +31,17 @@ logger = logging.getLogger(__name__)
 # Where uploaded reference clips live. Lives under data/uploads/ so it gets
 # the standard backup/portability treatment, but in its own subdirectory so
 # voice references don't get mixed into the user's general document tree.
-_VOICE_REF_SUBDIR = "voice_references"
 _ALLOWED_AUDIO_EXTS = {".wav", ".mp3", ".ogg", ".flac", ".m4a", ".aac", ".opus"}
 _MAX_REF_BYTES = 25 * 1024 * 1024  # 25 MB — plenty for a 10s clip even uncompressed
+
+# Where a consent record written here came from (stored in the record).
+_CONSENT_SOURCE = "audio_studio"
+
+
+def _consent():
+    """Voice-cloning consent rules, shared with the plugin (backends/voice_consent.py)."""
+    from backend.services.audio_foundry_models import voice_consent
+    return voice_consent()
 
 
 def _voice_ref_dir() -> Path:
@@ -41,9 +49,22 @@ def _voice_ref_dir() -> Path:
     upload_root = Path(current_app.config.get("UPLOAD_FOLDER", "data/uploads"))
     if not upload_root.is_absolute():
         upload_root = Path.cwd() / upload_root
-    target = upload_root / _VOICE_REF_SUBDIR
+    target = _consent().references_dir(upload_root)
     target.mkdir(parents=True, exist_ok=True)
     return target
+
+
+def _truthy(value) -> bool:
+    return str(value or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _clip_file(clip_id: str):
+    """The audio file for a clip id (its file name without the extension), or None."""
+    d = _voice_ref_dir()
+    for f in sorted(d.glob(f"{clip_id}.*")):
+        if f.suffix.lower() in _ALLOWED_AUDIO_EXTS and f.is_file() and _is_safe_ref_path(f):
+            return f
+    return None
 
 
 def _safe_ref_path(p) -> Path:
@@ -66,12 +87,20 @@ QUICK_TIMEOUT = 10        # /health, /status, /config — return fast or fail fa
 GENERATION_TIMEOUT = 600  # /generate/* — songs up to 4 minutes plus model load
 
 
+def _not_running(why: str = ""):
+    """The service itself is down. ``plugin_running: false`` tells callers
+    this apart from a 503 the running service sends (a model that cannot run
+    on this machine), which comes back verbatim with FastAPI's ``detail``."""
+    message = "Audio Foundry service not running" + (f" ({why})" if why else "")
+    return jsonify({"error": message, "plugin_running": False}), 503
+
+
 def _proxy_get(path: str, timeout: int = QUICK_TIMEOUT):
     try:
         resp = requests.get(f"{AUDIO_FOUNDRY_URL}{path}", timeout=timeout)
         return jsonify(resp.json()), resp.status_code
     except requests.ConnectionError:
-        return jsonify({"error": "Audio Foundry service not running"}), 503
+        return _not_running()
     except Exception as e:
         logger.exception("Audio Foundry GET %s failed", path)
         return jsonify({"error": str(e)}), 500
@@ -82,7 +111,7 @@ def _proxy_post(path: str, json_data: dict, timeout: int):
         resp = requests.post(f"{AUDIO_FOUNDRY_URL}{path}", json=json_data, timeout=timeout)
         return jsonify(resp.json()), resp.status_code
     except requests.ConnectionError:
-        return jsonify({"error": "Audio Foundry service not running"}), 503
+        return _not_running()
     except requests.Timeout:
         return jsonify({"error": f"Audio Foundry request timed out after {timeout}s"}), 504
     except Exception as e:
@@ -107,7 +136,7 @@ def _proxy_generate(path: str, json_data: dict):
     if job_service_start_enabled():
         ok, why = start_for_job("audio", "generating", is_up=_audio_foundry_up)
         if not ok:
-            return jsonify({"error": f"Audio Foundry service not running ({why})"}), 503
+            return _not_running(why)
     return _proxy_post(path, json_data, GENERATION_TIMEOUT)
 
 
@@ -116,7 +145,7 @@ def _proxy_delete(path: str, timeout: int = QUICK_TIMEOUT):
         resp = requests.delete(f"{AUDIO_FOUNDRY_URL}{path}", timeout=timeout)
         return jsonify(resp.json()), resp.status_code
     except requests.ConnectionError:
-        return jsonify({"error": "Audio Foundry service not running"}), 503
+        return _not_running()
     except Exception as e:
         logger.exception("Audio Foundry DELETE %s failed", path)
         return jsonify({"error": str(e)}), 500
@@ -181,19 +210,16 @@ def generate_voice():
     data = flask_request.get_json(silent=True) or {}
     ref = data.get("reference_clip_path")
     if ref:
-        # Consent enforcement (voice specialist audit): reference must have been
-        # uploaded via /voice-clips/upload (which creates .consent sidecar) and
-        # be safe. This blocks arbitrary FS paths for cloning without consent.
+        # A clone needs a clip in voice_references with an explicit consent
+        # record. The plugin checks again where it clones.
+        consent = _consent()
         try:
-            p = _safe_ref_path(ref)
-        except PathEscapesRoot:
-            return {"error": "Invalid or unconsented reference_clip_path (upload via UI for consent)"}, 403
-        consent = p.with_name(p.name + ".consent")
-        if not p.exists() or not consent.exists():
-            return {"error": "Invalid or unconsented reference_clip_path (upload via UI for consent)"}, 403
-        # Forward the path that was checked. A relative value would otherwise
-        # be read against the sidecar's working directory, not voice_references.
-        data = {**data, "reference_clip_path": str(p)}
+            clip = consent.require_consent(ref, _voice_ref_dir())
+        except consent.ConsentRequired as e:
+            return jsonify({"error": str(e), "needs_consent": True}), 403
+        # Forward the real path that was checked. A relative value would
+        # otherwise be read against the sidecar's working directory.
+        data = {**data, "reference_clip_path": str(clip)}
     body, status_code = _proxy_generate("/generate/voice", data)
     return body, status_code
 
@@ -360,6 +386,11 @@ def jobs_clear():
 # ones, preview them, and delete. The audio_foundry FastAPI service expects
 # `reference_clip_path` to be an absolute filesystem path it can read, so we
 # return the resolved absolute path on upload.
+#
+# A clip is cloned only with a consent record (<clip>.consent), written when
+# the person confirms the consent statement: at upload (consent_confirmed) or
+# later through /voice-clips/<id>/consent. The rules live in the plugin's
+# backends/voice_consent.py and are enforced here and in the plugin.
 
 
 @audio_foundry_bp.route("/voice-clips", methods=["GET"])
@@ -368,6 +399,7 @@ def list_voice_clips():
     so users can re-use clips across sessions without re-uploading."""
     try:
         d = _voice_ref_dir()
+        consent = _consent()
         clips = []
         for f in sorted(d.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True):
             if f.is_file() and f.suffix.lower() in _ALLOWED_AUDIO_EXTS:
@@ -377,8 +409,10 @@ def list_voice_clips():
                     "path": str(f.resolve()),
                     "size_bytes": f.stat().st_size,
                     "modified_ts": f.stat().st_mtime,
+                    # Only a clip with a consent record can be cloned.
+                    "consented": consent.has_consent(f),
                 })
-        return {"clips": clips}, 200
+        return {"clips": clips, "consent_statement": consent.STATEMENT}, 200
     except Exception as e:
         logger.exception("voice clip list failed")
         return jsonify({"error": str(e)}), 500
@@ -388,7 +422,14 @@ def list_voice_clips():
 def upload_voice_clip():
     """Receive a multipart audio upload, save under data/uploads/voice_references/,
     and return the resolved absolute path that callers can pass as
-    `reference_clip_path` to /generate/voice."""
+    `reference_clip_path` to /generate/voice.
+
+    The clip can be cloned only when the form also carries
+    ``consent_confirmed=true``: the person confirmed the consent statement
+    (``GET /voice-clips`` returns it as ``consent_statement``), and a consent
+    record is written for it. Without that the clip is stored but cannot be
+    cloned, which suits other uses such as the Video page's audio guide.
+    """
     if "file" not in flask_request.files:
         return {"error": "No file part in request (expected multipart field 'file')"}, 400
 
@@ -441,10 +482,13 @@ def upload_voice_clip():
         logger.exception("voice clip upload failed")
         return jsonify({"error": str(e)}), 500
 
-    # Consent sidecar for enforcement (per voice team audit): generate/voice with
-    # reference_clip_path will require the sibling .consent to exist (created only
-    # via this upload path). Prevents arbitrary FS paths for cloning.
-    (target.with_name(target.name + ".consent")).touch()
+    consented = False
+    if _truthy(flask_request.form.get("consent_confirmed")):
+        try:
+            _consent().write_record(target, source=_CONSENT_SOURCE)
+            consented = True
+        except OSError as e:
+            logger.warning("voice clip consent record not written for %s: %s", target.name, e)
 
     return {
         "id": asset_id,
@@ -452,7 +496,31 @@ def upload_voice_clip():
         "display_name": display_name,
         "path": str(target.resolve()),
         "size_bytes": written,
+        "consented": consented,
     }, 201
+
+
+@audio_foundry_bp.route("/voice-clips/<clip_id>/consent", methods=["POST"])
+def confirm_voice_clip_consent(clip_id):
+    """Record consent for a clip already imported, e.g. one imported before
+    consent was asked for. Body: ``{"confirmed": true}``, sent after the
+    person confirmed ``consent_statement``."""
+    safe_id = secure_filename(clip_id)
+    if not safe_id or safe_id != clip_id:
+        return {"error": "Invalid clip id"}, 400
+    body = flask_request.get_json(silent=True) or {}
+    if body.get("confirmed") is not True:
+        return {"error": "Consent is recorded only when the person confirms it (confirmed: true)."}, 400
+    clip = _clip_file(safe_id)
+    if clip is None:
+        return {"error": "Clip not found"}, 404
+    try:
+        record = _consent().write_record(clip, source=_CONSENT_SOURCE)
+    except OSError as e:
+        logger.exception("voice clip consent record failed")
+        return jsonify({"error": f"Consent could not be recorded: {e}"}), 500
+    return {"id": safe_id, "consented": True, "recorded_at": record["recorded_at"],
+            "statement": record["statement"]}, 200
 
 
 @audio_foundry_bp.route("/voice-clips/<clip_id>/download", methods=["GET"])
@@ -462,13 +530,10 @@ def download_voice_clip(clip_id):
     safe_id = secure_filename(clip_id)
     if not safe_id or safe_id != clip_id:
         return {"error": "Invalid clip id"}, 400
-    d = _voice_ref_dir()
-    matches = list(d.glob(f"{safe_id}.*"))
-    if not matches:
+    # Audio files only: the clip's consent record shares its name.
+    f = _clip_file(safe_id)
+    if f is None:
         return {"error": "Clip not found"}, 404
-    f = matches[0]
-    if not _is_safe_ref_path(f):
-        return {"error": "Path traversal blocked"}, 403
     # Explicit mimetype so <audio> elements don't get application/octet-stream
     # (which produces "No decoders for requested formats" in browser).
     ext = f.suffix.lower()

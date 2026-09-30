@@ -71,7 +71,8 @@ def test_speech_returns_the_file_and_a_download_link(monkeypatch):
         "meta": {"backend": "kokoro", "voice": "af_heart"}}})
     res = GenerateSpeechTool().execute(text="Dinner is served.", voice="af_heart", engine="kokoro")
     assert res.success
-    assert sent[0][2] == {"text": "Dinner is served.", "backend": "kokoro", "voice_id": "af_heart"}
+    assert sent[0][2] == {"text": "Dinner is served.", "backend": "kokoro", "voice_id": "af_heart",
+                          "async": True, "queue": True}
     out = res.output
     assert out["file"] == "voice_1.wav" and out["document_id"] == 77
     assert out["url"] == "/api/files/document/77/download"
