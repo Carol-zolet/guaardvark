@@ -165,12 +165,16 @@ SELF_HEALING_WINDOW_MINUTES = int(os.environ.get("GUAARDVARK_SELF_HEALING_WINDOW
 
 # KV Cache optimization
 COMPACTION_THRESHOLD = float(os.environ.get("GUAARDVARK_COMPACTION_THRESHOLD", "0.7"))
-CHUNK_SIMILARITY_THRESHOLD = float(os.environ.get("GUAARDVARK_CHUNK_SIMILARITY_THRESHOLD", "0.85"))
+# Dedup threshold for embedding models with no measured entry below: 0.92, the lowest
+# value measured for any model (see CHUNK_SIMILARITY_THRESHOLDS_BY_MODEL). The previous
+# 0.85 counted 3-16% of clearly distinct passage pairs as copies on all three measured
+# models. Not measured for other models; add an entry when one is.
+CHUNK_SIMILARITY_THRESHOLD = float(os.environ.get("GUAARDVARK_CHUNK_SIMILARITY_THRESHOLD", "0.92"))
 
 # Per-model dedup cosine thresholds. Cosine-similarity distributions differ by embedding
 # model, so a single global threshold mis-dedups (drops everything or nothing) when the
 # active model changes. Match on a substring of the active model name; unknown models fall
-# back to CHUNK_SIMILARITY_THRESHOLD. Calibrate new entries by measurement — do NOT guess.
+# back to CHUNK_SIMILARITY_THRESHOLD (0.92). Calibrate new entries by measurement — do NOT guess.
 #
 # Measured 2026-09-30 on the cosine deduplicate_chunks computes (text[:500], model document
 # prefix) over the fused pools of graded queries (56 on nomic, 33 on embeddinggemma, 23 on

@@ -131,6 +131,8 @@ def test_dedup_threshold_uses_the_measured_entry(monkeypatch):
     # An unmeasured size or family gets the fallback, not a neighbour's value.
     assert get_dedup_threshold("qwen3-embedding:8b") == CHUNK_SIMILARITY_THRESHOLD
     assert get_dedup_threshold("bge-m3") == CHUNK_SIMILARITY_THRESHOLD
+    # The fallback is the lowest measured value, not the old 0.85.
+    assert CHUNK_SIMILARITY_THRESHOLD == 0.92
 
 
 def test_dedup_threshold_set_in_the_environment_wins(monkeypatch):
