@@ -23,6 +23,11 @@ PROTECTED_PREFIXES = (
     # Social outreach has kill switches, draft approval, and fetch-meta — none of
     # which should be reachable from another machine on the LAN without an API key.
     '/api/social-outreach/',
+    # Raw file download for everything under data/outputs, chat exports and
+    # screenshots included (backend/routes/download_route.py). Only MCP resource
+    # links point here, and those are local; the web UI loads outputs through
+    # /api/outputs, which stays open to LAN browsers.
+    '/outputs/',
 )
 
 # Browser/desktop/MCP automation and direct tool execution can read files, run

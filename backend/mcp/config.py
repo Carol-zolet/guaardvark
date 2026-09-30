@@ -31,6 +31,28 @@ DEFAULT_DENY_CATEGORIES: List[str] = [
                        # must be explicitly allowed; prevents silent bypass of default-deny
 ]
 
+# Folders under the outputs root that MCP clients may list and read: the ones
+# Guaardvark's generators write media and documents into (writer in the
+# comment). An entry with a slash serves only that subtree. Nothing else under
+# the root is a resource: chat-exports/ (conversation transcripts),
+# screenshots/ (agent desktop captures), consent/ (likeness consent records),
+# training/ (training-video work built on reference voices), edit_inputs/ and
+# upscaling/input/ (files people supplied), tracking/ and other job state, and
+# anything a script or an operator put there by hand.
+DEFAULT_OUTPUT_FOLDERS: List[str] = [
+    "generated_images",      # tools/image_tools.py, services/stills_pipeline.py
+    "generated_animations",  # services/animation_generator.py
+    "videos",                # music videos, text overlays, video_editor renders
+    "audio",                 # Audio Foundry's default output dir (plugin.json)
+    "narrations",            # api/voice_api.py
+    "storyboards",           # Film Crew storyboard frames (tasks/production_swarm_tasks.py)
+    "character_samples",     # Cast Library samples (tasks/character_generation_tasks.py)
+    "csv",                   # generate_csv (tools/generation_tools.py)
+    "files",                 # generate_file (tools/generation_tools.py)
+    "code",                  # codegen (tools/code_tools.py)
+    "upscaling/output",      # upscaled images and video (api/upscaling_api.py)
+]
+
 
 @dataclass
 class ToolPolicy:
@@ -61,6 +83,12 @@ class ResourcePolicy:
     outputs_enabled: bool = True
     # Chroot for the outputs provider. Never serve files outside this.
     outputs_root: str = "data/outputs"
+    # Folders under outputs_root that are served, whole subtree each. Listing
+    # and reading both apply it; see DEFAULT_OUTPUT_FOLDERS.
+    outputs_folders: List[str] = field(default_factory=lambda: list(DEFAULT_OUTPUT_FOLDERS))
+    # Files directly in outputs_root. Bulk CSV generation, CSV task handlers,
+    # the task executor and document generation write their results there.
+    outputs_root_files: bool = True
     # Largest file resources/read embeds; a bigger one gets a download link instead.
     max_inline_bytes: int = 8 * 1024 * 1024
 
@@ -144,6 +172,10 @@ def load_config() -> MCPConfig:
                 cfg.resources.outputs_enabled = bool(resources["outputs_enabled"])
             if "outputs_root" in resources:
                 cfg.resources.outputs_root = str(resources["outputs_root"])
+            if isinstance(resources.get("outputs_folders"), list):
+                cfg.resources.outputs_folders = [str(f) for f in resources["outputs_folders"]]
+            if "outputs_root_files" in resources:
+                cfg.resources.outputs_root_files = bool(resources["outputs_root_files"])
             if "max_inline_bytes" in resources:
                 cfg.resources.max_inline_bytes = int(resources["max_inline_bytes"])
 
