@@ -205,9 +205,11 @@ class SearchCodeTool(BaseTool):
         "node_modules, dist, build, logs and __pycache__ folders, binary files, symlinks, and .env or "
         "credential files. Returns the total, then up to 100 numbered 'path:line' hits with the line text "
         "(long lines cut at 300 characters). Matching is one line at a time. 'No matches found' is a "
-        "normal result; an invalid pattern, or an absolute, ~ or '..' glob, is an error. Use it for exact "
-        "names and patterns; search_codebase asks by meaning when the zvec_grep plugin is connected; "
-        "read_code opens a hit that is UTF-8 text."
+        "normal result; an invalid pattern, or an absolute, ~ or '..' glob, is an error. A pattern that "
+        "backtracks badly (nested repeats such as '(\\w+\\s*)+') is stopped with an error once one line "
+        "takes over 1 s or the whole search over 20 s. Use it for exact names and patterns; "
+        "search_codebase asks by meaning when the zvec_grep plugin is connected; read_code opens a hit "
+        "that is UTF-8 text."
     )
     parameters = {
         "pattern": ToolParameter(
@@ -221,7 +223,7 @@ class SearchCodeTool(BaseTool):
             type="string",
             required=False,
             default="**/*.{py,jsx,js,tsx,ts}",
-            description="Which files to search, as a glob relative to the checkout root, e.g. 'backend/**/*.py' or 'frontend/**/*.{js,jsx}'. '**/' spans zero or more folders, '*' and '?' stay within one folder name, and {a,b} groups expand anywhere; [abc] classes are not supported. Default '**/*.{py,jsx,js,tsx,ts}'."
+            description="Which files to search, relative to the checkout root, e.g. 'backend/**/*.py', 'frontend/**/*.{js,jsx}', '*.py' or 'backend/utils'. A glob without '/' matches file names in any folder ('*.py' is every Python file, as with ripgrep -g); a folder name with no wildcard searches every file under it. '**/' spans zero or more folders, '*' and '?' stay within one folder name, and {a,b} groups expand anywhere; [abc] classes are not supported. Default '**/*.{py,jsx,js,tsx,ts}'."
         )
     }
 

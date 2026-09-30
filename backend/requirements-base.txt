@@ -23,6 +23,11 @@ numpy<2.0,>=1.26.4  # Pin to <2.0 for PyTorch compatibility
 pandas==2.2.2
 pydantic==2.13.5
 psutil==7.2.2
+# regex runs search_code's caller-supplied patterns under a per-call timeout
+# (backend/tools/llama_code_tools.py). transformers, nltk and tiktoken install it
+# too; it is named here because backend code imports it directly. The floor is
+# the one transformers 5.16 already requires.
+regex>=2025.10.22
 
 # Web Scraping & File Processing
 beautifulsoup4==4.15.0
