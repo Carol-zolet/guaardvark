@@ -1868,7 +1868,8 @@ class EditImageTool(BaseTool):
         ),
         "steps": ToolParameter(
             name="steps", type="int",
-            description="Diffusion steps (more = higher fidelity, slower). Default 28.",
+            description=("Diffusion steps (more = higher fidelity, slower). Default 28. A value below "
+                         "the editing model's floor is raised to it, and the result says so."),
             required=False, default=28,
         ),
         "model": ToolParameter(
@@ -2066,15 +2067,17 @@ class EditImageTool(BaseTool):
             gen = ComfyUIImageGenerator()
             gpu_wait = _chat_gpu_wait()
 
+            # No step count (None or 0) renders the model's own default, and the
+            # generator raises a lower one to the model's registry floor.
             if backend == "qwen":
                 gen.edit_image_qwen(
                     image_paths=[src, *extra], instruction=instruction,
-                    output_path=output_path, steps=int(steps) or 20, gpu_wait=gpu_wait,
+                    output_path=output_path, steps=steps, gpu_wait=gpu_wait,
                 )
             elif backend == "kontext":
                 gen.edit_image(
                     image_path=src, instruction=instruction,
-                    output_path=output_path, steps=int(steps), gpu_wait=gpu_wait,
+                    output_path=output_path, steps=steps, gpu_wait=gpu_wait,
                 )
             else:
                 img2img_result = self._edit_via_img2img(
@@ -2092,16 +2095,19 @@ class EditImageTool(BaseTool):
             image_url = f"/api/outputs/generated_images/{filename}"
             return ToolResult(
                 success=True,
-                output=(
-                    f"Image edited successfully ({backend}).\n"
-                    f"Image URL: {image_url}\nEdit: {instruction}"
-                ),
+                output="\n".join([
+                    f"Image edited successfully ({backend}).",
+                    f"Image URL: {image_url}",
+                    f"Edit: {instruction}",
+                    *_steps_lines(gen),
+                ]),
                 metadata={
                     "image_url": image_url,
                     "filename": filename,
                     "instruction": instruction,
                     "model": effective_model,
                     "backend": backend,
+                    **_steps_metadata(gen),
                 },
             )
         except Exception as e:
@@ -2182,6 +2188,30 @@ def _gpu_refusal(e: Exception, gpu_wait: dict | None) -> str | None:
             return text.format(mins=max(1, round(gpu_wait["wait_s"] / 60)))
         return "GPU is busy with another render right now — try again in a moment."
     return None
+
+
+# `steps` on inpaint_image and outpaint_image. The counts live on the editing
+# models' registry entries (min_steps, default_steps), so none is repeated here.
+_EDIT_STEPS_PARAM = (
+    "Diffusion steps. Omit to render at the editing model's own count; a value below that "
+    "model's floor is raised to it, and the result says so."
+)
+
+
+def _steps_metadata(gen) -> dict:
+    """The step count an edit generator rendered, and its notice when the ask was changed."""
+    steps = getattr(gen, "last_steps", None)
+    if steps is None:
+        return {}
+    return {"steps": steps, "steps_notice": getattr(gen, "last_steps_notice", None)}
+
+
+def _steps_lines(gen) -> list:
+    """``_steps_metadata`` as result lines."""
+    meta = _steps_metadata(gen)
+    if not meta:
+        return []
+    return [f"Steps: {meta['steps']}", *([meta["steps_notice"]] if meta["steps_notice"] else [])]
 
 
 def _edit_tool_for(caller: BaseTool) -> "EditImageTool":
@@ -2280,20 +2310,19 @@ class InpaintImageTool(BaseTool):
         ),
         "steps": ToolParameter(
             name="steps", type="int",
-            description="Diffusion steps. Default 20.",
-            required=False, default=20,
+            description=_EDIT_STEPS_PARAM,
+            required=False, default=None,
         ),
         "wait_for_result": _wait_for_result_param(),
     }
 
-    def execute(self, instruction: str, image: str = "", steps: int = 20,
+    def execute(self, instruction: str, image: str = "", steps=None,
                 wait_for_result: bool = False, **kwargs) -> ToolResult:
         if is_mcp_transport(self):
             return _forward_tool_job(self, {
                 "instruction": instruction, "image": image, "steps": steps, "model": kwargs.get("model"),
             }, wait_for_result)
         model = kwargs.get("model") or "auto"
-        steps = int(steps) or 20
         edit = _edit_tool_for(self)
         inputs = edit._edit_inputs(image)
         if isinstance(inputs, ToolResult):
@@ -2330,12 +2359,12 @@ class OutpaintImageTool(BaseTool):
         "right": ToolParameter(name="right", type="int", description="Pixels to add on the right.", required=False, default=0),
         "top": ToolParameter(name="top", type="int", description="Pixels to add on the top.", required=False, default=0),
         "bottom": ToolParameter(name="bottom", type="int", description="Pixels to add on the bottom.", required=False, default=0),
-        "steps": ToolParameter(name="steps", type="int", description="Diffusion steps. Default 20.", required=False, default=20),
+        "steps": ToolParameter(name="steps", type="int", description=_EDIT_STEPS_PARAM, required=False, default=None),
         "wait_for_result": _wait_for_result_param(),
     }
 
     def execute(self, image: str = "", instruction: str = "", left: int = 0, right: int = 0,
-                top: int = 0, bottom: int = 0, steps: int = 20, wait_for_result: bool = False,
+                top: int = 0, bottom: int = 0, steps=None, wait_for_result: bool = False,
                 **kwargs) -> ToolResult:
         if is_mcp_transport(self):
             return _forward_tool_job(self, {
@@ -2375,7 +2404,7 @@ class OutpaintImageTool(BaseTool):
             if gen.qwen_edit_installed():
                 gen.edit_image_qwen(
                     image_paths=[src], instruction=fill, output_path=output_path,
-                    steps=int(steps) or 20, pad=pad, gpu_wait=gpu_wait,
+                    steps=steps, pad=pad, gpu_wait=gpu_wait,
                 )
                 backend = "qwen"
             elif gen._kontext_installed():
@@ -2383,7 +2412,7 @@ class OutpaintImageTool(BaseTool):
                 gen.edit_image(
                     image_path=src,
                     instruction=f"Outpaint: {fill}",
-                    output_path=output_path, steps=max(int(steps) or 20, 20),
+                    output_path=output_path, steps=steps,
                     gpu_wait=gpu_wait,
                 )
                 backend = "kontext"
@@ -2393,8 +2422,9 @@ class OutpaintImageTool(BaseTool):
             image_url = f"/api/outputs/generated_images/{filename}"
             return ToolResult(
                 success=True,
-                output=f"Canvas extended ({backend}).\nImage URL: {image_url}",
-                metadata={"image_url": image_url, "filename": filename, "backend": backend, "pad": pad},
+                output="\n".join([f"Canvas extended ({backend}).", f"Image URL: {image_url}", *_steps_lines(gen)]),
+                metadata={"image_url": image_url, "filename": filename, "backend": backend, "pad": pad,
+                          **_steps_metadata(gen)},
             )
         except Exception as e:
             refusal = _gpu_refusal(e, gpu_wait)
