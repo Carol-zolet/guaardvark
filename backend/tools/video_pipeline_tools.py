@@ -152,6 +152,24 @@ def _script_body(script_text: str, *, mcp: bool = False):
     return text, None
 
 
+def _dispatch_first_stage(svc, row_id: int, agent: str):
+    """Start a new project's first agent. Returns (started, error text or None).
+
+    The row is created first; when Celery does not take the task (its broker
+    is down, say) the row stays at that stage, and a backend restart resumes
+    unfinished stages (PipelineService.resume_all).
+    """
+    if not svc.advance_if_predecessor(row_id, expected_predecessor="draft"):
+        # Another worker moved the new row first, so the stage is its to run.
+        return False, "another worker already moved the project past its first stage"
+    try:
+        svc.dispatch_agent(row_id, agent)
+    except Exception as e:  # noqa: BLE001 - reported to the caller, not raised
+        logger.warning("%s dispatch failed for %s: %s", agent, row_id, e)
+        return False, f"the task queue did not take it ({str(e) or type(e).__name__})"
+    return True, None
+
+
 def _document_from_song_ref(song: str, *, mcp: bool = False):
     """Return (Document, None) or (None, error). Creates a row for a local file.
 
@@ -288,19 +306,23 @@ class MusicVideoTool(BaseTool):
                 project_id=None,
                 settings=settings,
             )
-            if svc.advance_if_predecessor(mv.id, expected_predecessor="draft"):
-                try:
-                    svc.dispatch_agent(mv.id, "analyzer")
-                except Exception as e:  # noqa: BLE001
-                    logger.warning("music-video analyzer dispatch failed for %s: %s", mv.id, e)
-                db.session.refresh(mv)
+            started, dispatch_err = _dispatch_first_stage(svc, mv.id, "analyzer")
+            db.session.refresh(mv)
 
             studio = f"/music-video"
+            if started:
+                next_line = "Analysis is running. Approve the cut plan in Studio before any clip renders."
+            else:
+                next_line = (
+                    f"Analysis was not started: {dispatch_err}. The project is saved at stage "
+                    f"'{mv.current_stage}'; its analysis starts when the backend restarts, or on "
+                    f"POST /api/music-video/{mv.id}/analyze. Do not create it again."
+                )
             return ToolResult(
                 success=True,
                 output="\n".join([
                     f"Music video '{mv.name}' created (id {mv.id}, stage: {mv.current_stage}).",
-                    "Analysis is running. Approve the cut plan in Studio before any clip renders.",
+                    next_line,
                     f"Open Music Video: {studio}",
                 ]),
                 metadata={
@@ -309,6 +331,8 @@ class MusicVideoTool(BaseTool):
                     "studio_url": studio,
                     "i2v_model": settings.get("i2v_model"),
                     "approved": False,
+                    "analysis_started": started,
+                    "dispatch_error": dispatch_err,
                 },
             )
         except Exception as e:  # noqa: BLE001
@@ -387,19 +411,23 @@ class FilmCrewTool(BaseTool):
             prod = svc.create(
                 name=title, script_text=script_text, project_id=None, settings=settings,
             )
-            if svc.advance_if_predecessor(prod.id, expected_predecessor="draft"):
-                try:
-                    svc.dispatch_agent(prod.id, "screenwriter")
-                except Exception as e:  # noqa: BLE001
-                    logger.warning("film-crew screenwriter dispatch failed for %s: %s", prod.id, e)
-                db.session.refresh(prod)
+            started, dispatch_err = _dispatch_first_stage(svc, prod.id, "screenwriter")
+            db.session.refresh(prod)
 
             studio = "/film-crew"
+            if started:
+                lines = ["The screenwriter is running. Casting, storyboards and renders wait in Studio."]
+            else:
+                lines = [
+                    f"The screenwriter was not started: {dispatch_err}. The production is saved at "
+                    f"stage '{prod.current_stage}'; use Re-dispatch on the Film Crew page, or restart "
+                    "the backend, which resumes it. Do not create it again."
+                ]
             return ToolResult(
                 success=True,
                 output="\n".join([
                     f"Film Crew '{prod.name}' created (id {prod.id}, stage: {prod.current_stage}).",
-                    "The screenwriter is running. Casting, storyboards and renders wait in Studio.",
+                    *lines,
                     f"Open Film Crew: {studio}",
                 ]),
                 metadata={
@@ -408,6 +436,8 @@ class FilmCrewTool(BaseTool):
                     "studio_url": studio,
                     "video_model": picked,
                     "rendered": False,
+                    "screenwriter_started": started,
+                    "dispatch_error": dispatch_err,
                 },
             )
         except Exception as e:  # noqa: BLE001
