@@ -97,9 +97,16 @@ class RebootLogHandler(BaseHTTPRequestHandler):
 
     # ---- helpers ----
 
-    def _origin_allowed(self):
+    def _allowed_origin(self):
+        """The allow-list entry matching the request's Origin, or None.
+
+        The entry is what gets echoed back, never the request's own value.
+        """
         origin = (self.headers.get("Origin") or "").strip().rstrip("/").lower()
-        return origin in self.allowed_origins
+        return next((o for o in self.allowed_origins if o == origin), None)
+
+    def _origin_allowed(self):
+        return self._allowed_origin() is not None
 
     def _json(self, data, code=200):
         body = json.dumps(data).encode("utf-8")
@@ -112,8 +119,9 @@ class RebootLogHandler(BaseHTTPRequestHandler):
 
     def _cors(self):
         self.send_header("Vary", "Origin")
-        if self._origin_allowed():
-            self.send_header("Access-Control-Allow-Origin", self.headers["Origin"])
+        allowed = self._allowed_origin()
+        if allowed is not None:
+            self.send_header("Access-Control-Allow-Origin", allowed)
             self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
 
     def log_message(self, fmt, *args):
