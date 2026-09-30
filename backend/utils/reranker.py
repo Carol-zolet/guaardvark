@@ -2,8 +2,8 @@
 
 The fused retriever scores a query and a passage independently (bi-encoder plus
 BM25); a cross-encoder reads the pair together and is markedly better at deciding
-relevance. It is applied to the candidate pool AFTER filtering and dedup, and
-BEFORE MMR -- rerank decides what is relevant, MMR decides what is diverse.
+relevance. It is applied to the candidate pool AFTER filtering and dedup, and its
+order is final: MMR runs only when the cross-encoder did not score the pool.
 
 The model competes for VRAM with image and video generation, so loading is
 admitted against free VRAM and falls back to CPU rather than failing a query.

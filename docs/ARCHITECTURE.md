@@ -113,9 +113,10 @@ All three failures are quiet. None of them raise.
 `search_with_llamaindex()` is the retrieval path; `query_index()` is a thin legacy wrapper and
 should not be used for new work. The pipeline is: vector + keyword retrieval fused by
 `relative_score` with a per-query adaptive alpha (keyword-ish queries lean sparse, prose leans
-dense) → metadata filters enforced **after** fusion → dedup → cross-encoder rerank
-(`backend/utils/reranker.py`, admitted against free VRAM with a CPU fallback) → MMR for diversity
-→ trim to the caller's count.
+dense) → metadata filters enforced **after** fusion → dedup of near-copies (embedding cosine,
+per-model threshold in `CHUNK_SIMILARITY_THRESHOLDS_BY_MODEL`) → cross-encoder rerank
+(`backend/utils/reranker.py`, admitted against free VRAM with a CPU fallback), whose order is
+final; MMR for diversity runs only when the cross-encoder did not → trim to the caller's count.
 
 The keyword leg is `PostgresSparseRetriever`, querying the `text_search_tsv`/GIN index directly.
 It tries `websearch_to_tsquery` first — AND-by-default, so it stays precise and its candidate set

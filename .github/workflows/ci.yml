@@ -328,6 +328,15 @@ jobs:
             backend/tests/test_search_code_budget_and_globs.py \
             backend/tests/test_search_codebase_scope.py \
             backend/tests/api/test_chat_export_api.py \
+            backend/tests/test_voice_clip_withdraw_delete.py \
+            backend/tests/test_chatterbox_stock_voice.py \
+            backend/tests/test_music_video_song_library.py \
+            backend/tests/test_video_pipeline_tools_start.py \
+            backend/tests/test_acestep_install_complete.py \
+            backend/tests/test_audio_status_plugin_stopped.py \
+            backend/tests/test_mcp_generate_speech_jobs.py \
+            backend/tests/test_voice_routing_consistency.py \
+            backend/tests/test_voice_clone_consent.py \
             backend/tests/services/test_audio_foundry_offline.py \
             backend/tests/test_mcp_generate_speech_voices.py \
             backend/tests/test_audit_batch2_security.py \
@@ -338,6 +347,7 @@ jobs:
             backend/tests/services/test_resource_hardening.py \
             backend/tests/services/test_gpu_resource_policy.py \
             backend/tests/services/test_gpu_pipeline_pin.py \
+            backend/tests/services/test_media_player_service.py \
             backend/tests/test_social_outreach/test_reject_stops_post.py \
             backend/tests/test_social_outreach/test_posters_ask_before_submit.py \
             backend/tests/test_social_outreach/test_share_draft_posts.py \

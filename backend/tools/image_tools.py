@@ -1013,23 +1013,55 @@ class GenerationStatusTool(BaseTool):
         if prog.get("total"):
             pct = int(100 * (prog.get("current") or 0) / prog["total"])
         files = []
+        notes = []
         if status == "complete" and job.get("result"):
-            entry = _file_entry(job["result"])
+            result = job["result"]
+            entry = _file_entry(result)
             entry.setdefault("url", entry["file"])
             files.append(entry)
+            # The output line is a URL; the file's own name and library id
+            # are what a person looks for in the library.
+            saved = f"Saved as {entry['file']}"
+            if entry.get("document_id"):
+                saved += f" (library document {entry['document_id']})"
+            notes.append(saved)
+            if entry.get("note"):
+                notes.append(entry["note"])
+            meta = result.get("meta") or {}
+            if job.get("intent") == "voice" and meta.get("backend"):
+                notes.append(f"Engine: {meta['backend']}" + (f", voice {meta['voice']}" if meta.get("voice") else ""))
         return {
             "kind": {"music": "song", "voice": "speech", "fx": "sound effect"}.get(job.get("intent"), "audio"),
             "batch_id": job_id, "status": status, "progress": pct, "message": prog.get("stage") or "",
             "error": job.get("error"), "errors": [], "files": files, "studio_url": STUDIO_URL,
+            "note": ". ".join(notes) or None,
+        }
+
+    @staticmethod
+    def _audio_foundry_stopped(job_id: str):
+        """The answer for an audio job id while Audio Foundry is stopped: the
+        backend answered, the plugin that holds the job did not, and retrying
+        will not change that until someone starts it."""
+        from backend.tools.audio_tools import STUDIO_URL
+        return {
+            "kind": "audio", "batch_id": job_id, "status": "unknown", "progress": None,
+            "error": ("Audio Foundry is not running (start it in Plugins, or POST "
+                      "/api/plugins/audio_foundry/start), so this job cannot be read. A job that was "
+                      "running when it stopped is marked interrupted when it starts again; a finished "
+                      "file is already in the library."),
+            "errors": [], "files": [], "studio_url": STUDIO_URL,
         }
 
     @classmethod
     def _audio_status_http(cls, job_id: str):
         if not cls._AUDIO_JOB_ID.match(job_id):
             return None
+        from backend.tools.audio_tools import plugin_stopped
         try:
             job = _http_json("GET", f"/api/audio-foundry/jobs/{job_id}")
         except RuntimeError as e:
+            if plugin_stopped(e):
+                return cls._audio_foundry_stopped(job_id)
             if "not found" in str(e).lower() or "unknown job" in str(e).lower() or "404" in str(e):
                 return None
             raise
@@ -1049,7 +1081,10 @@ class GenerationStatusTool(BaseTool):
                    "result": {"path": m3_job.get("path"), "document_id": m3_job.get("document_id"),
                               "duration_s": m3_job.get("seconds")} if m3_job.get("path") else None}
             return cls._audio_info(job_id, job)
-        resp = requests.get(f"{AUDIO_FOUNDRY_URL}/jobs/{job_id}", timeout=5)
+        try:
+            resp = requests.get(f"{AUDIO_FOUNDRY_URL}/jobs/{job_id}", timeout=5)
+        except requests.ConnectionError:
+            return cls._audio_foundry_stopped(job_id)
         if resp.status_code == 404:
             return None
         resp.raise_for_status()

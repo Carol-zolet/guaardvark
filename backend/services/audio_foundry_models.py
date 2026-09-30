@@ -93,6 +93,13 @@ AUDIO_FOUNDRY_MODELS: List[Dict[str, Any]] = [
         "group": "music",
         "hf_repo": "ACE-Step/ACE-Step-v1-3.5B",
         "probe_file": "ace_step_transformer/config.json",
+        # What ACEStepPipeline.load_checkpoint reads: its four model folders
+        # (config and weights each, plus the umt5 tokenizer), listed in the
+        # plugin file the ACE-Step daemon checks too. From the snapshot a full
+        # Install left in the cache (revision 82cd0d7b, read 2026-09-30); the
+        # other repo files are the README, .gitattributes and a root config
+        # the loader never opens. Install stays a full snapshot_download.
+        "required_files_catalog": "backends/acestep_files.json",
         "size_gb": 8.3,
         "gated": False,
     },
@@ -160,9 +167,35 @@ def is_hub_cached(repo_id: str, probe_file: str) -> bool:
 
 
 def load_voice_catalog(relpath: str) -> Dict[str, Any]:
-    """A voice list shipped with the plugin (e.g. backends/kokoro_voices.json)."""
+    """A JSON list shipped with the plugin (e.g. backends/kokoro_voices.json,
+    backends/acestep_files.json)."""
     with (PLUGIN_SOURCE_DIR / relpath).open("r", encoding="utf-8") as fh:
         return json.load(fh)
+
+
+_voice_consent_module = None
+
+
+def voice_consent():
+    """The plugin's voice-consent rules (plugins/audio_foundry/backends/voice_consent.py).
+
+    Loaded from the checkout by path, like the voice catalog, so the backend
+    proxy and the plugin that clones decide consent with the same code. The
+    module is standard-library only.
+    """
+    global _voice_consent_module
+    if _voice_consent_module is None:
+        import importlib.util
+        import sys
+
+        name = "guaardvark_audio_foundry_voice_consent"
+        spec = importlib.util.spec_from_file_location(
+            name, PLUGIN_SOURCE_DIR / "backends" / "voice_consent.py")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module
+        spec.loader.exec_module(module)
+        _voice_consent_module = module
+    return _voice_consent_module
 
 
 def kokoro_catalog() -> Dict[str, Any]:
@@ -175,8 +208,46 @@ def kokoro_voice_ids() -> List[str]:
     return [v["id"] for g in kokoro_catalog()["groups"] for v in g["voices"]]
 
 
+def kokoro_voice_groups() -> List[Dict[str, Any]]:
+    """The catalog's groups with each voice marked ``installed`` when its voice
+    pack is in the local Hugging Face cache: the Kokoro part of the plugin's
+    GET /voices, for when the plugin is not running."""
+    cat = kokoro_catalog()
+    return [
+        {
+            "label": group["label"],
+            "voices": [
+                {**voice,
+                 "installed": is_hub_cached(cat["hf_repo"], cat["voice_file"].format(voice=voice["id"]))}
+                for voice in group["voices"]
+            ],
+        }
+        for group in cat["groups"]
+    ]
+
+
+def kokoro_voice_choices(installed_only: bool = True) -> List[Dict[str, str]]:
+    """The Kokoro voices as ``{id, label, group}``, for a caller choosing one.
+
+    With ``installed_only`` only voices whose pack is on this machine are
+    listed: Audio Foundry refuses a voice that is not installed rather than
+    download it mid-generation.
+    """
+    cat = kokoro_catalog()
+    choices = []
+    for group in cat["groups"]:
+        for voice in group["voices"]:
+            if installed_only and not is_hub_cached(
+                    cat["hf_repo"], cat["voice_file"].format(voice=voice["id"])):
+                continue
+            choices.append({"id": voice["id"], "label": voice["label"], "group": group["label"]})
+    return choices
+
+
 def required_hub_files(entry: Dict[str, Any]) -> List[str]:
     """Every file of ``entry['hf_repo']`` that generation reads."""
+    if entry.get("required_files_catalog"):
+        return list(load_voice_catalog(entry["required_files_catalog"])["files"])
     if entry.get("voice_catalog"):
         cat = load_voice_catalog(entry["voice_catalog"])
         voices = [v["id"] for g in cat["groups"] for v in g["voices"]]
