@@ -32,6 +32,8 @@ PROTECTED_PREFIXES = (
     '/api/backups/restore',
     '/api/backups/create',
     '/api/self-code/',
+    # Restarting Guaardvark (stops every running job) and the restart log.
+    '/api/reboot',
     # Social outreach has kill switches, draft approval, and fetch-meta — none of
     # which should be reachable from another machine on the LAN without an API key.
     '/api/social-outreach/',
@@ -366,6 +368,7 @@ def protected_summary() -> list[str]:
         items.append("Changing the MCP server list")
     items += [
         "Code execution",
+        "Restarting Guaardvark",
         "Creating, restoring and deleting backups",
         "Editing files and browsing the server's folders",
         "Reading Guaardvark's own source (self-code)",

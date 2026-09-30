@@ -217,12 +217,17 @@ class HttpProxyForwarder:
         import os
         # X-API-Key and the browser's sign-in cookie belong to this install;
         # another node has its own key and gets target.api_key below.
+        # Origin and Sec-Fetch-* say how the browser reached this install,
+        # which already checked them (backend/utils/cross_site_guard.py); the
+        # next node gets a call between machines, which carries neither.
         from backend.utils.api_session import strip_session_cookies
 
         out = {}
         for k, v in incoming.items():
             name = k.lower()
             if name in HOP_BY_HOP_HEADERS or name == "x-api-key":
+                continue
+            if name == "origin" or name.startswith("sec-fetch-"):
                 continue
             if name == "cookie":
                 v = strip_session_cookies(v)

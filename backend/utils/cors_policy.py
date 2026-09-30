@@ -36,6 +36,10 @@ that node's UI has. Those three routes, and only those, also accept any
 private-network or loopback origin. Register and heartbeat check the master's
 Interconnector key; status says only the node's name, mode and sync settings.
 
+The same answer decides which pages may send a state-changing request at all
+(backend/utils/cross_site_guard.py), since CORS alone only stops a page from
+reading the reply.
+
 Interface addresses and the hostname are read once per process, so a machine
 that moves to a new address needs a backend restart before a browser on the
 new address can use Socket.IO.
@@ -70,6 +74,7 @@ _LOOPBACK = r"(?:localhost|127(?:\.\d{1,3}){3}|\[::1\])"
 NODE_ORIGIN = re.compile(
     rf"https?://(?:{_PRIVATE_IPV4}|{_LOOPBACK})(?::\d{{1,5}})?\Z", re.IGNORECASE
 )
+_NODE_ROUTE = re.compile(rf"^{NODE_ROUTES}\Z")
 
 CORS_METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
 CORS_HEADERS = ["Content-Type", "Authorization", "X-API-Key"]
@@ -218,6 +223,18 @@ def allowed_origins() -> list[str]:
 def origin_allowed(origin: Optional[str]) -> bool:
     normalized = normalize_origin(origin)
     return normalized is not None and normalized in allowed_origins()
+
+
+def origin_allowed_on(origin: Optional[str], path: str) -> bool:
+    """What Flask's CORS answers a page at ``origin`` calling ``path``: yes for
+    this install's origins, and on the Interconnector's node routes also for
+    private-network and loopback origins."""
+    normalized = normalize_origin(origin)
+    if normalized is None:
+        return False
+    if normalized in allowed_origins():
+        return True
+    return bool(_NODE_ROUTE.match(path or "")) and bool(NODE_ORIGIN.match(normalized))
 
 
 def socketio_origin_allowed(origin: Optional[str], environ: Optional[dict] = None) -> bool:

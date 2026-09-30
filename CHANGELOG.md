@@ -13,6 +13,17 @@
   progress and voice; its connection was refused before. The Interconnector's status, register
   and heartbeat routes still accept any private-network page, which is how a client node's
   Settings page reaches its master.
+- **Pages on other sites cannot change anything.** A page on any website open in a browser on
+  the Guaardvark machine (or on any device the backend answers) could make that browser send a
+  form-style POST to the backend, and routes that trust the Guaardvark machine would act on it.
+  Every request other than GET, HEAD and OPTIONS is now refused with `cross_site_request` when the
+  browser says it came from a page that is not this install's (its `Origin`, an `Origin: null`, or
+  `Sec-Fetch-Site: cross-site` with no `Origin`). The web UI under any name it is reached by, the
+  CLI, the MCP server, scripts and calls between machines are unaffected, and a client node's
+  Settings page still registers with its master.
+- **Restarting Guaardvark needs this machine or the API key**, like the other protected actions.
+  From another device the restart dialog says to enter the key in Settings → API key instead of
+  restarting.
 - **A browser preflight no longer needs the API key.** Once a key existed, a UI built with an
   absolute `VITE_API_BASE_URL` could not call protected routes: the browser's CORS preflight
   (an OPTIONS request, which never carries a key or cookie) was refused, so the real request was

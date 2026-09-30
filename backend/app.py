@@ -890,6 +890,11 @@ def _initialize_app_components(app):
             f"Incoming {request.method} request to {request.path} from {request.remote_addr}"
         )
 
+    # A page on another site may not change anything here, API key or not
+    # (backend/utils/cross_site_guard.py). Runs before the auth guard and every view.
+    from backend.utils.cross_site_guard import refuse_cross_site_request
+    app.before_request(refuse_cross_site_request)
+
     # Protect sensitive endpoints (code execution, backup restore/delete)
     from backend.utils.auth_guard import check_endpoint_auth
     app.before_request(check_endpoint_auth)
