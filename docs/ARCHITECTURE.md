@@ -112,8 +112,8 @@ All three failures are quiet. None of them raise.
 should not be used for new work. The pipeline is: vector + keyword retrieval fused by
 `relative_score` with a per-query adaptive alpha (keyword-ish queries lean sparse, prose leans
 dense) → metadata filters enforced **after** fusion → dedup → cross-encoder rerank
-(`backend/utils/reranker.py`, admitted against free VRAM with a CPU fallback) → MMR for diversity
-→ trim to the caller's count.
+(`backend/utils/reranker.py`, admitted against free VRAM with a CPU fallback), whose order is
+final; MMR for diversity runs only when the cross-encoder did not → trim to the caller's count.
 
 The keyword leg is `PostgresSparseRetriever`, querying the `text_search_tsv`/GIN index directly.
 It tries `websearch_to_tsquery` first — AND-by-default, so it stays precise and its candidate set

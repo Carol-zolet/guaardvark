@@ -80,19 +80,30 @@ def test_rerank_orders_by_cross_encoder_score(monkeypatch):
 
 
 # --------------------------------------------------------------------------
-# MMR must not undo the reranker
+# The cross-encoder's order is final
 # --------------------------------------------------------------------------
-def test_mmr_ranks_on_rerank_score_when_present():
-    """MMR ranked on the retrieval score, silently discarding the cross-encoder."""
+def test_cross_encoder_order_is_kept_on_skewed_scores():
+    """A weakly answered question: one clear hit, a related passage scored low that
+    shares the most words with it, and unrelated passages at ~0. The related passage
+    stays second."""
     from backend.services.indexing_service import _mmr_rerank
 
     results = [
-        {"text": "alpha unique words here", "score": 0.9, "rerank_score": 0.1},
-        {"text": "beta entirely different terms", "score": 0.1, "rerank_score": 0.9},
-        {"text": "gamma yet more distinct vocabulary", "score": 0.5, "rerank_score": 0.5},
+        {"text": "Document: budget.md. Section: Trip budget. Hotel Aurora, four nights: "
+                 "480 euros. Flights: 320 euros.", "score": 0.75, "rerank_score": 0.3072},
+        {"text": "Document: itinerary.md. Section: Lisbon trip. Day 1: fly in, check in at "
+                 "Hotel Aurora. Day 2: tram 28.", "score": 0.24, "rerank_score": 0.0081},
+        {"text": "Document: service-agreement.md. Section: Terms. Renewal: auto-renews "
+                 "unless cancelled.", "score": 0.015, "rerank_score": 1.8e-5},
+        {"text": "Document: garden_notes.txt. Tomatoes: water deeply twice a week in the "
+                 "morning.", "score": 0.0, "rerank_score": 1.6e-5},
+        {"text": "Document: bike_maintenance.txt. Chain: clean and lube every 200 miles.",
+         "score": 0.03, "rerank_score": 1.5e-5},
+        {"text": "Document: clothes.md. Section: Packing. Walking shoes, a light jacket, "
+                 "two shirts.", "score": 0.076, "rerank_score": 1.4e-5},
     ]
     out = _mmr_rerank(list(results))
-    assert out[0]["rerank_score"] == 0.9, "MMR ignored the cross-encoder score"
+    assert [r["rerank_score"] for r in out] == [r["rerank_score"] for r in results]
 
 
 def test_mmr_falls_back_to_retrieval_score_without_rerank():
