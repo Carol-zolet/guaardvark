@@ -1466,7 +1466,9 @@ class VideoGeneratorTool(BaseTool):
         "num_inference_steps": ToolParameter(
             name="num_inference_steps",
             type="int",
-            description="Inference steps. Omit to use the model's default; a value below the model's floor is raised to it.",
+            description=("Inference steps. Omit to use the model's default, or the speed profile's count when "
+                         "speed_profile is given. A value below the floor (the speed profile's when one is "
+                         "given, else the model's) is raised to it."),
             required=False,
         ),
         "audio": ToolParameter(
@@ -1550,7 +1552,7 @@ class VideoGeneratorTool(BaseTool):
         model's capability record. Returns (params, None) or (None, message).
         Pure: no service is touched, so the rules are testable."""
         from backend.services.video_model_registry import (
-            DEFAULT_T2V_MODEL, VIDEO_MODEL_REGISTRY, model_capabilities, i2v_model_for,
+            DEFAULT_T2V_MODEL, GENERATION_TYPES, VIDEO_MODEL_REGISTRY, model_capabilities, i2v_model_for,
             resolve_active_video_model,
         )
         model_id = (model or "").strip()
@@ -1560,11 +1562,15 @@ class VideoGeneratorTool(BaseTool):
             model_id = picked or DEFAULT_T2V_MODEL
         entry = VIDEO_MODEL_REGISTRY.get(model_id)
         if not entry:
-            known = ", ".join(k for k in VIDEO_MODEL_REGISTRY if model_capabilities(k))
+            known = ", ".join(k for k, e in VIDEO_MODEL_REGISTRY.items() if e.get("type") in GENERATION_TYPES)
             return None, f"Unknown video model '{model_id}'. Known: {known}."
         caps = model_capabilities(model_id)
         if not caps:
             return None, f"'{model_id}' is a companion file, not a video model."
+        if entry.get("type") not in GENERATION_TYPES:
+            # The song model carries a capability record too; a render would
+            # route its id to a video family that shares the prefix.
+            return None, f"{entry['name']} generates audio, not video. Use generate_music for a song."
         if audio and not caps.get("audio_out"):
             return None, (
                 f"{entry['name']} renders silent clips. For a clip with its own soundtrack use "
@@ -1600,18 +1606,22 @@ class VideoGeneratorTool(BaseTool):
         min_clip = caps.get("min_clip_s")
         frames = max(int(round((min_clip or 0) * fps)) or 9, min(frames, max_frames))
 
+        profiles = caps.get("speed_profiles") or {}
+        if speed_profile and speed_profile not in profiles:
+            declared = ", ".join(profiles) or "none"
+            return None, f"{entry['name']} declares no speed profile '{speed_profile}' (declared: {declared})."
         steps = None
         if num_inference_steps not in (None, ""):
             try:
                 steps = max(1, min(int(num_inference_steps), 100))
             except (TypeError, ValueError):
                 return None, f"num_inference_steps must be a number, got {num_inference_steps!r}"
-            floor = int(caps.get("min_steps") or 0)
+            # A speed profile's LoRA is distilled for its own step count, so the
+            # profile's floor applies in place of the model's.
+            profile_floor = (profiles.get(speed_profile) or {}).get("min_steps") if speed_profile else None
+            floor = int(profile_floor or caps.get("min_steps") or 0)
             if floor and steps < floor:
                 steps = floor
-        if speed_profile and speed_profile not in (caps.get("speed_profiles") or {}):
-            declared = ", ".join(caps.get("speed_profiles") or {}) or "none"
-            return None, f"{entry['name']} declares no speed profile '{speed_profile}' (declared: {declared})."
 
         ratios = caps.get("aspect_ratios") or []
         ratio = (aspect_ratio or "").strip()
