@@ -1,6 +1,9 @@
 """codegen and analyze_code with the model stubbed: what codegen saves for each
 shape of model reply. No Ollama, GPU, network or database: the LLM service
-module is replaced and output goes to tmp_path."""
+module is replaced and output goes to tmp_path.
+
+The case tables are module-level so a standalone check can import them and run
+the same cases without pytest."""
 import os
 import sys
 import types
@@ -21,6 +24,16 @@ class StubLLM:
         return SimpleNamespace(message=SimpleNamespace(content=self.reply))
 
 
+def fake_llm_service(state):
+    """A stand-in for backend.utils.llm_service whose get_default_llm returns
+    state["llm"]."""
+    fake = types.ModuleType("backend.utils.llm_service")
+    fake.ChatMessage = lambda role, content: SimpleNamespace(role=role, content=content)
+    fake.MessageRole = SimpleNamespace(USER="user")
+    fake.get_default_llm = lambda: state["llm"]
+    return fake
+
+
 @pytest.fixture
 def llm(tmp_path, monkeypatch):
     """Installs a stub LLM service and returns a function that sets the client
@@ -29,11 +42,7 @@ def llm(tmp_path, monkeypatch):
     monkeypatch.setattr("backend.config.UPLOAD_DIR", str(tmp_path / "uploads"))
     (tmp_path / "uploads").mkdir()
     state = {"llm": StubLLM()}
-    fake = types.ModuleType("backend.utils.llm_service")
-    fake.ChatMessage = lambda role, content: SimpleNamespace(role=role, content=content)
-    fake.MessageRole = SimpleNamespace(USER="user")
-    fake.get_default_llm = lambda: state["llm"]
-    monkeypatch.setitem(sys.modules, "backend.utils.llm_service", fake)
+    monkeypatch.setitem(sys.modules, "backend.utils.llm_service", fake_llm_service(state))
 
     def use(stub):
         state["llm"] = stub
@@ -49,28 +58,74 @@ def _generate(tmp_path, filename="out.py", **kwargs):
 
 
 FILE = "print('hi')"
+JS_FILE = "console.log(1)"
+
+# (output file, model reply, what must be saved). The code sits in a fence with
+# chat around it; only the code is the file.
+CHAT_REPLIES = [
+    ("out.py", FILE, FILE),
+    ("out.py", f"```python\n{FILE}\n```", FILE),
+    ("out.py", f"Here is the complete file:\n\n```python\n{FILE}\n```", FILE),
+    ("out.py", f"```python\n{FILE}\n```\n\nThis version adds a greeting.", FILE),
+    ("out.py", f"Sure! Here's the file:\n```py\n{FILE}\n```\nIt prints a greeting.", FILE),
+    ("out.py", f"``` Python3 \n{FILE}\n```", FILE),
+    ("out.py", f"~~~python\n{FILE}\n~~~", FILE),
+    ("out.py", f"```python\n{FILE}", FILE),
+    ("cfg.json", 'Here is the JSON:\n```json\n{"a": 1}\n```', '{"a": 1}'),
+]
+
+# Replies with more than one fenced block. The file is the first block tagged
+# with the output file's language; failing that the first untagged block; a
+# block tagged as another language (how to install or run it) only when there
+# is nothing else. Block length plays no part: the usage lines here are longer
+# than the file.
+TWO_BLOCK_REPLIES = [
+    # file first, usage second
+    ("out.py", f"Here is the file:\n```python\n{FILE}\n```\nRun it:\n```bash\npython out.py\n```", FILE),
+    ("out.py", f"```python\n{FILE}\n```\n```bash\npython out.py --verbose\n```", FILE),
+    ("out.js", f"Here is the file:\n```js\n{JS_FILE}\n```\nRun it:\n```bash\nnode out.js --trace-warnings\n```", JS_FILE),
+    # usage first, file second
+    ("out.py", f"Install it first:\n```bash\npip install rich\n```\nThen the file:\n```python\n{FILE}\n```", FILE),
+    ("out.js", f"First:\n```bash\nnpm install left-pad\n```\nThen:\n```javascript\n{JS_FILE}\n```", JS_FILE),
+    # an untagged block is the file before a block tagged as another language, in either order
+    ("out.py", f"Run this first:\n```bash\npip install rich\n```\nThe file:\n```\n{FILE}\n```", FILE),
+    ("out.js", f"```\n{JS_FILE}\n```\nRun it:\n```sh\nnode out.js --trace-warnings\n```", JS_FILE),
+    # two blocks in the file's language: the first is the file
+    ("out.py", f"```python\n{FILE}\n```\nA longer variant:\n```python\nprint('hi')\nprint('again')\n```", FILE),
+    ("out.js", f"```js\n{JS_FILE}\n```\nOr:\n```js\nconsole.log(2); console.log(3)\n```", JS_FILE),
+    ("run.sh", "```bash\necho hi\n```\nRun it:\n```bash\nchmod +x run.sh && ./run.sh\n```", "echo hi"),
+    # ...unless, for Python and JSON, the first does not parse and a later one does
+    ("out.py", f"```\npip install rich\n```\n```\n{FILE}\n```", FILE),
+]
+
+PYTHON_WITH_EXAMPLE = 'def f():\n    return 1\n\n\nDOC = """\n```python\nf()\n```\n"""'
+NESTED_EXAMPLE = 'DOC = """\n```bash\nrun me\n```\n"""\nprint(DOC)'
+HEREDOC_SCRIPT = "#!/bin/bash\ncat > README.md <<'EOF'\n# Title\n```bash\nnpm i\n```\nEOF\necho done"
+README = "# App\n\nInstall:\n```bash\npip install app\n```"
+
+# (output file, model reply, what must be saved). The fences here belong to
+# the file and stay in it.
+FILE_REPLIES = [
+    ("out.py", PYTHON_WITH_EXAMPLE, PYTHON_WITH_EXAMPLE),
+    ("out.py", f"```python\n{NESTED_EXAMPLE}\n```", NESTED_EXAMPLE),
+    ("mk.sh", HEREDOC_SCRIPT, HEREDOC_SCRIPT),
+    ("README.md", README, README),
+    ("README.md", f"```markdown\n{README}\n```", README),
+]
+
+NO_CODE_REPLIES = ["```python\n```", "Here you go:\n```\n```", "No code, sorry\n```\n\n```", "  \n"]
 
 
-@pytest.mark.parametrize("reply", [
-    FILE,
-    f"```python\n{FILE}\n```",
-    f"Here is the complete file:\n\n```python\n{FILE}\n```",
-    f"```python\n{FILE}\n```\n\nThis version adds a greeting.",
-    f"Sure! Here's the file:\n```py\n{FILE}\n```\nIt prints a greeting.",
-    f"``` Python3 \n{FILE}\n```",
-    f"~~~python\n{FILE}\n~~~",
-    f"```python\n{FILE}",
-    f"Here is the file:\n```python\n{FILE}\n```\nRun it:\n```bash\npython out.py\n```",
-])
-def test_only_the_code_is_saved(llm, tmp_path, reply):
+@pytest.mark.parametrize("filename,reply,expected", CHAT_REPLIES + TWO_BLOCK_REPLIES + FILE_REPLIES)
+def test_the_file_is_saved_without_the_chat_around_it(llm, tmp_path, filename, reply, expected):
     llm(StubLLM(reply))
-    result, written = _generate(tmp_path)
+    result, written = _generate(tmp_path, filename=filename)
     assert result.success, result.error
-    assert written.read_text() == FILE
-    assert result.output["syntax_ok"] is True
+    assert written.read_text() == expected
+    assert result.output["syntax_ok"] is (True if filename.endswith((".py", ".json")) else None)
 
 
-@pytest.mark.parametrize("reply", ["```python\n```", "Here you go:\n```\n```", "No code, sorry\n```\n\n```", "  \n"])
+@pytest.mark.parametrize("reply", NO_CODE_REPLIES)
 def test_a_reply_with_no_code_is_an_error_and_writes_nothing(llm, tmp_path, reply):
     llm(StubLLM(reply))
     result, written = _generate(tmp_path)
@@ -79,45 +134,11 @@ def test_a_reply_with_no_code_is_an_error_and_writes_nothing(llm, tmp_path, repl
     assert not written.exists()
 
 
-def test_fences_that_belong_to_the_file_are_kept(llm, tmp_path):
-    python_with_example = 'def f():\n    return 1\n\n\nDOC = """\n```python\nf()\n```\n"""'
-    llm(StubLLM(python_with_example))
-    result, written = _generate(tmp_path)
-    assert result.success and written.read_text() == python_with_example
-
-    nested = 'DOC = """\n```bash\nrun me\n```\n"""\nprint(DOC)'
-    llm(StubLLM(f"```python\n{nested}\n```"))
-    result, written = _generate(tmp_path)
-    assert result.success and written.read_text() == nested
-
-    script = "#!/bin/bash\ncat > README.md <<'EOF'\n# Title\n```bash\nnpm i\n```\nEOF\necho done"
-    llm(StubLLM(script))
-    result, written = _generate(tmp_path, filename="mk.sh")
-    assert result.success and written.read_text() == script
-    assert result.output["syntax_ok"] is None
-
-
-def test_markdown_output_keeps_its_code_samples(llm, tmp_path):
-    readme = "# App\n\nInstall:\n```bash\npip install app\n```"
-    llm(StubLLM(readme))
-    result, written = _generate(tmp_path, filename="README.md")
-    assert result.success and written.read_text() == readme
-
-    llm(StubLLM(f"```markdown\n{readme}\n```"))
-    result, written = _generate(tmp_path, filename="README.md")
-    assert result.success and written.read_text() == readme
-
-
 def test_output_that_does_not_parse_is_flagged(llm, tmp_path):
     llm(StubLLM("def broken(:\n    pass"))
     result, written = _generate(tmp_path)
     assert result.success and written.exists()
     assert result.output["syntax_ok"] is False
-
-    llm(StubLLM('Here is the JSON:\n```json\n{"a": 1}\n```'))
-    result, written = _generate(tmp_path, filename="cfg.json")
-    assert written.read_text() == '{"a": 1}'
-    assert result.output["syntax_ok"] is True
 
 
 def test_mcp_clients_get_the_output_path_relative_to_the_checkout(llm, tmp_path, monkeypatch):
@@ -181,24 +202,30 @@ def guard(monkeypatch):
     return ct.CodeGeneratorTool()
 
 
-@pytest.mark.parametrize("output,instructions", [
+# (output_filename, instructions): new files, although a name in them exists.
+NEW_FILE_REQUESTS = [
     ("README.md", "Generate a README.md for a to-do list web app"),
     ("start.sh", "a bash script that starts my node server"),
     ("app/config.yml", "config similar in spirit to docker-compose.yml but for my app"),
     ("helper.py", "Write a brand new helper.py with a greet function"),
     ("backend/app.py", "a small Flask app with one health route"),
-])
-def test_a_new_file_that_shares_an_existing_name_is_allowed(guard, output, instructions):
-    assert guard._referenced_existing_file(instructions, output) is None
-
-
-@pytest.mark.parametrize("output,instructions,expected", [
+]
+# (output_filename, instructions, the file the request is aimed at).
+MODIFY_REQUESTS = [
     ("README.md", "Improve the README", "README.md"),
     ("app_v2.py", "Refactor backend/app.py for readability", "backend/app.py"),
     ("backend/app.py", "refactor it", "backend/app.py"),
     ("gate_v2.py", "Improve the uploaded quality_gate.py with better structure", "quality_gate.py"),
     ("out.py", "Improve this file so it runs faster", "out.py"),
-])
+]
+
+
+@pytest.mark.parametrize("output,instructions", NEW_FILE_REQUESTS)
+def test_a_new_file_that_shares_an_existing_name_is_allowed(guard, output, instructions):
+    assert guard._referenced_existing_file(instructions, output) is None
+
+
+@pytest.mark.parametrize("output,instructions,expected", MODIFY_REQUESTS)
 def test_a_request_to_change_an_existing_file_needs_input_file(guard, output, instructions, expected):
     assert guard._referenced_existing_file(instructions, output) == expected
 

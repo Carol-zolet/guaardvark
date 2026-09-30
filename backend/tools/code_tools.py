@@ -33,8 +33,24 @@ PROMPT_CHARS_PER_TOKEN = 3.5
 _FENCE_LINE = re.compile(r"^ {0,3}(`{3,}|~{3,})[ \t]*([^`\n]*?)[ \t]*$")
 # Output that is itself Markdown: fences inside it are part of the file.
 _MARKDOWN_EXTENSIONS = {".md", ".markdown", ".mdx"}
+_MARKDOWN_TAGS = {"", "markdown", "md", "mdx"}
 # A lead-in such as "Here is the complete file:" is at most this many lines.
 _LEAD_IN_MAX_LINES = 2
+# Fence tags that name an output type, besides its extension and the name
+# LANGUAGE_MAP gives it (".py" already accepts "py" and "python").
+_FENCE_TAG_ALIASES = {
+    ".js": ("node", "nodejs"),
+    ".jsx": ("javascript", "js", "react"),
+    ".tsx": ("typescript", "ts", "react"),
+    ".sh": ("sh", "shell", "zsh"),
+    ".bash": ("sh", "shell"),
+    ".yaml": ("yml",),
+    ".h": ("c", "cpp", "c++"),
+    ".cpp": ("c++", "cxx", "cc"),
+    ".go": ("golang",),
+    ".cs": ("c#",),
+    ".html": ("htm",),
+}
 
 
 def _syntax_ok(filename: str, text: str) -> Optional[bool]:
@@ -59,15 +75,33 @@ def _syntax_ok(filename: str, text: str) -> Optional[bool]:
     return None
 
 
-def _fenced_blocks(lines: list[str]) -> list[tuple[int, int]]:
-    """(opening line, closing line) indexes of the top-level fenced blocks.
+def _fence_tag(info: str) -> str:
+    """The language a fence's info string names, lower-cased: "python" for
+    "Python title=app.py", "" for a bare fence."""
+    m = re.match(r"[\s{.]*([\w+#-]*)", info or "")
+    return m.group(1).lower() if m else ""
+
+
+def _names_output_type(tag: str, filename: str) -> bool:
+    """True when a fence tag names the language of the output file: its
+    extension, its LANGUAGE_MAP name or an alias, with or without a version
+    ("python3")."""
+    ext = os.path.splitext(filename)[1].lower()
+    if not tag or not ext:
+        return False
+    accepted = {ext[1:], CodeGeneratorTool.LANGUAGE_MAP.get(ext, ext[1:]), *_FENCE_TAG_ALIASES.get(ext, ())}
+    return tag in accepted or tag.rstrip("0123456789") in accepted
+
+
+def _fenced_blocks(lines: list[str]) -> list[tuple[int, int, str]]:
+    """(opening line, closing line, tag) of the top-level fenced blocks.
 
     Inside a block, a fence with an info string opens a nested block and the
     next bare fence closes that one, so a fenced example in a docstring does not
     end the block around it. A block the reply never closes runs to the end: its
     closing index is len(lines)."""
-    blocks: list[tuple[int, int]] = []
-    opened: Optional[tuple[int, str, int]] = None  # line, fence character, fence length
+    blocks: list[tuple[int, int, str]] = []
+    opened: Optional[tuple[int, str, int, str]] = None  # line, fence character, fence length, tag
     depth = 0
     for i, line in enumerate(lines):
         m = _FENCE_LINE.match(line)
@@ -75,7 +109,7 @@ def _fenced_blocks(lines: list[str]) -> list[tuple[int, int]]:
             continue
         marker, info = m.group(1), m.group(2)
         if opened is None:
-            opened, depth = (i, marker[0], len(marker)), 0
+            opened, depth = (i, marker[0], len(marker), _fence_tag(info)), 0
         elif marker[0] != opened[1]:
             continue
         elif info:
@@ -83,11 +117,32 @@ def _fenced_blocks(lines: list[str]) -> list[tuple[int, int]]:
         elif depth:
             depth -= 1
         elif len(marker) >= opened[2]:
-            blocks.append((opened[0], i))
+            blocks.append((opened[0], i, opened[3]))
             opened = None
     if opened is not None:
-        blocks.append((opened[0], len(lines)))
+        blocks.append((opened[0], len(lines), opened[3]))
     return blocks
+
+
+def _file_block(tagged_bodies: list[tuple[str, str]], filename: str) -> str:
+    """Which of a reply's fenced blocks is the file, given (tag, body) pairs in
+    reply order.
+
+    A block tagged with the output file's language comes first; then a block
+    with no tag; a block tagged as another language (the "bash" block that shows
+    how to run the file) only when there is nothing else. Among equals the
+    first one wins, so of two blocks in the file's language the earlier is the
+    file; for Python and JSON the first that parses is preferred."""
+    bodies = [(tag, body) for tag, body in tagged_bodies if body.strip()]
+    tiers = (
+        [body for tag, body in bodies if _names_output_type(tag, filename)],
+        [body for tag, body in bodies if not tag],
+        [body for tag, body in bodies if tag and not _names_output_type(tag, filename)],
+    )
+    for tier in tiers:
+        if tier:
+            return next((body for body in tier if _syntax_ok(filename, body)), tier[0])
+    return ""
 
 
 def _extract_code(reply: str, filename: str) -> str:
@@ -95,14 +150,13 @@ def _extract_code(reply: str, filename: str) -> str:
 
     A reply with no fence is the file. So is one that already parses as the
     target language (Python, JSON): its fences are content, such as a docstring
-    example. Otherwise the reply is read as chat, code in a fence with
-    commentary around it, when one of these holds: it starts with a fence; the
+    example. Otherwise the reply is read as chat, code in fences with
+    commentary around them, when one of these holds: it starts with a fence; the
     text before the first fence is a short lead-in ending in a colon; or the
     longest fenced block is at least as long as everything outside the blocks.
-    The file is then the longest block, or for a reply fenced from its first
-    line to its last, everything between those two lines. For Python and JSON a
-    candidate that parses is preferred. Anything else is returned unchanged: a
-    script whose heredoc holds a fenced example is a file, not chat.
+    The file is then the block _file_block picks, never the usage example that
+    follows or precedes it. Anything else is returned unchanged: a script whose
+    heredoc holds a fenced example is a file, not chat.
 
     Markdown output keeps its fences; only a fence wrapped around the whole
     reply is removed. Fences with nothing in them give "", which the caller
@@ -117,26 +171,33 @@ def _extract_code(reply: str, filename: str) -> str:
     wrapped = first_open == 0 and last_close == len(lines) - 1
     span = "\n".join(lines[first_open + 1:last_close])
     if os.path.splitext(filename)[1].lower() in _MARKDOWN_EXTENSIONS:
-        return span.strip("\n") if wrapped else text
+        return span.strip("\n") if wrapped and blocks[0][2] in _MARKDOWN_TAGS else text
 
-    longest = max(("\n".join(lines[a + 1:b]) for a, b in blocks), key=len)
-    if not longest.strip():
+    tagged_bodies = [(tag, "\n".join(lines[a + 1:b])) for a, b, tag in blocks]
+    chosen = _file_block(tagged_bodies, filename)
+    if not chosen:
         return ""
-    if not wrapped:
-        inside = {i for a, b in blocks for i in range(a, b + 1)}
-        outside = "\n".join(line for i, line in enumerate(lines) if i not in inside).strip()
-        lead_in = [line.strip() for line in lines[:first_open] if line.strip()]
-        is_chat = (
-            first_open == 0
-            or (len(lead_in) <= _LEAD_IN_MAX_LINES and lead_in[-1].endswith(":"))
-            or len(longest) >= len(outside)
-        )
-        if not is_chat:
-            return text
+    if len(blocks) == 1 and wrapped:
+        return chosen.strip("\n")
 
-    candidates = [span, longest] if wrapped else [longest, span]
-    parsed = [c for c in candidates if _syntax_ok(filename, c)]
-    return (parsed[0] if parsed else candidates[0]).strip("\n")
+    inside = {i for a, b, _tag in blocks for i in range(a, b + 1)}
+    outside = "\n".join(line for i, line in enumerate(lines) if i not in inside).strip()
+    lead_in = [line.strip() for line in lines[:first_open] if line.strip()]
+    longest = max(len(body) for _tag, body in tagged_bodies)
+    is_chat = (
+        first_open == 0
+        or (len(lead_in) <= _LEAD_IN_MAX_LINES and lead_in[-1].endswith(":"))
+        or longest >= len(outside)
+    )
+    if not is_chat:
+        return text
+
+    # One block that holds bare fences of its own (a Markdown string in the
+    # file) is read as several. When the pick does not parse and everything from
+    # the first fence to the last does, that whole stretch is the file.
+    if not _syntax_ok(filename, chosen) and _syntax_ok(filename, span):
+        return span.strip("\n")
+    return chosen.strip("\n")
 
 
 def _active_llm():
