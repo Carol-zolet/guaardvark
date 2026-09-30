@@ -5,14 +5,126 @@ Executable tools for code analysis, generation, and file processing.
 Wraps existing code intelligence services for agent system integration.
 """
 
+import json
 import logging
 import os
 import re
+import warnings
 from typing import Any, Optional
 
 from backend.services.agent_tools import BaseTool, ToolParameter, ToolResult
 
 logger = logging.getLogger(__name__)
+
+# A Markdown fence line: up to three spaces, three or more backticks or tildes,
+# then an optional info string such as "python". Only a bare one closes a block.
+_FENCE_LINE = re.compile(r"^ {0,3}(`{3,}|~{3,})[ \t]*([^`\n]*?)[ \t]*$")
+# Output that is itself Markdown: fences inside it are part of the file.
+_MARKDOWN_EXTENSIONS = {".md", ".markdown", ".mdx"}
+# A lead-in such as "Here is the complete file:" is at most this many lines.
+_LEAD_IN_MAX_LINES = 2
+
+
+def _syntax_ok(filename: str, text: str) -> Optional[bool]:
+    """Whether text parses as the language filename's extension names: True or
+    False for Python and JSON, None for languages with no parser here. The text
+    is compiled, never run."""
+    ext = os.path.splitext(filename)[1].lower()
+    if ext == ".py":
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                compile(text, filename, "exec", dont_inherit=True)
+            return True
+        except (SyntaxError, ValueError, RecursionError, MemoryError):
+            return False
+    if ext == ".json":
+        try:
+            json.loads(text)
+            return True
+        except (ValueError, RecursionError):
+            return False
+    return None
+
+
+def _fenced_blocks(lines: list[str]) -> list[tuple[int, int]]:
+    """(opening line, closing line) indexes of the top-level fenced blocks.
+
+    Inside a block, a fence with an info string opens a nested block and the
+    next bare fence closes that one, so a fenced example in a docstring does not
+    end the block around it. A block the reply never closes runs to the end: its
+    closing index is len(lines)."""
+    blocks: list[tuple[int, int]] = []
+    opened: Optional[tuple[int, str, int]] = None  # line, fence character, fence length
+    depth = 0
+    for i, line in enumerate(lines):
+        m = _FENCE_LINE.match(line)
+        if not m:
+            continue
+        marker, info = m.group(1), m.group(2)
+        if opened is None:
+            opened, depth = (i, marker[0], len(marker)), 0
+        elif marker[0] != opened[1]:
+            continue
+        elif info:
+            depth += 1
+        elif depth:
+            depth -= 1
+        elif len(marker) >= opened[2]:
+            blocks.append((opened[0], i))
+            opened = None
+    if opened is not None:
+        blocks.append((opened[0], len(lines)))
+    return blocks
+
+
+def _extract_code(reply: str, filename: str) -> str:
+    """The file a model reply carries, without the chat formatting around it.
+
+    A reply with no fence is the file. So is one that already parses as the
+    target language (Python, JSON): its fences are content, such as a docstring
+    example. Otherwise the reply is read as chat, code in a fence with
+    commentary around it, when one of these holds: it starts with a fence; the
+    text before the first fence is a short lead-in ending in a colon; or the
+    longest fenced block is at least as long as everything outside the blocks.
+    The file is then the longest block, or for a reply fenced from its first
+    line to its last, everything between those two lines. For Python and JSON a
+    candidate that parses is preferred. Anything else is returned unchanged: a
+    script whose heredoc holds a fenced example is a file, not chat.
+
+    Markdown output keeps its fences; only a fence wrapped around the whole
+    reply is removed. Fences with nothing in them give "", which the caller
+    reports as a reply with no code."""
+    text = (reply or "").strip()
+    lines = text.split("\n")
+    blocks = _fenced_blocks(lines)
+    if not blocks or _syntax_ok(filename, text):
+        return text
+
+    first_open, last_close = blocks[0][0], blocks[-1][1]
+    wrapped = first_open == 0 and last_close == len(lines) - 1
+    span = "\n".join(lines[first_open + 1:last_close])
+    if os.path.splitext(filename)[1].lower() in _MARKDOWN_EXTENSIONS:
+        return span.strip("\n") if wrapped else text
+
+    longest = max(("\n".join(lines[a + 1:b]) for a, b in blocks), key=len)
+    if not longest.strip():
+        return ""
+    if not wrapped:
+        inside = {i for a, b in blocks for i in range(a, b + 1)}
+        outside = "\n".join(line for i, line in enumerate(lines) if i not in inside).strip()
+        lead_in = [line.strip() for line in lines[:first_open] if line.strip()]
+        is_chat = (
+            first_open == 0
+            or (len(lead_in) <= _LEAD_IN_MAX_LINES and lead_in[-1].endswith(":"))
+            or len(longest) >= len(outside)
+        )
+        if not is_chat:
+            return text
+
+    candidates = [span, longest] if wrapped else [longest, span]
+    parsed = [c for c in candidates if _syntax_ok(filename, c)]
+    return (parsed[0] if parsed else candidates[0]).strip("\n")
 
 
 def _confine_candidates(paths):
@@ -135,8 +247,10 @@ class CodeGeneratorTool(BaseTool):
         "only read and can never be the output. With input_file the prompt holds that file's full text "
         "(a file longer than the model's context window is cut by Ollama) plus your instructions; "
         "without it the model writes a new file from the instructions alone, and the call is refused "
-        "if the instructions name a file that exists in the checkout or the uploads. An empty reply is an error "
-        "and writes nothing. Returns output_path, filename, language, line and character counts and "
+        "if the instructions name a file that exists in the checkout or the uploads. Only the code is saved: "
+        "a Markdown fence and any sentences the model puts around it are dropped, and a reply with no code is an error "
+        "and writes nothing. Returns output_path, filename, language, line and character counts, syntax_ok "
+        "(true or false for Python and JSON output, which is parsed but never run; null for other languages) and "
         "the first 500 characters. The model call stops after 180 s; over MCP the call returns an "
         "error after its timeout (120 s by default); the run is not cancelled and saves if the model "
         "answers within 180 s of the start, and "
@@ -372,16 +486,9 @@ OUTPUT THE COMPLETE FILE NOW (no explanations, no markdown fences, just code):""
             else:
                 code_content = ""
 
-            # Clean up markdown artifacts
-            if code_content.startswith("```"):
-                lines = code_content.split('\n')
-                if lines[0].startswith("```"):
-                    lines = lines[1:]
-                if lines and lines[-1].strip() == "```":
-                    lines = lines[:-1]
-                code_content = '\n'.join(lines)
+            code_content = _extract_code(code_content, clean_name)
 
-            # Checked after the fence is removed: a reply of only a fence is empty too.
+            # Checked after the fences are removed: a reply of only a fence is empty too.
             if not code_content.strip():
                 return ToolResult(
                     success=False,
@@ -405,6 +512,7 @@ OUTPUT THE COMPLETE FILE NOW (no explanations, no markdown fences, just code):""
                     "language": language,
                     "line_count": line_count,
                     "char_count": char_count,
+                    "syntax_ok": _syntax_ok(clean_name, code_content),
                     "content_preview": code_content[:500] + "..." if len(code_content) > 500 else code_content
                 },
                 metadata={
