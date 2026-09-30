@@ -38,7 +38,9 @@ Interconnector key; status says only the node's name, mode and sync settings.
 
 The same answer decides which pages may send a state-changing request at all
 (backend/utils/cross_site_guard.py), since CORS alone only stops a page from
-reading the reply.
+reading the reply. The same names decide which Host a request may be
+addressed to (own_host_names, used by backend/utils/host_check.py), which is
+what stops a page whose DNS name was re-pointed at this machine.
 
 Interface addresses and the hostname are read once per process, so a machine
 that moves to a new address needs a backend restart before a browser on the
@@ -157,14 +159,55 @@ def _machine_hosts() -> frozenset[str]:
     return frozenset(hosts)
 
 
+def _vite_allowed_hosts() -> list[str]:
+    entries = (os.environ.get("VITE_ALLOWED_HOSTS") or "").split(",")
+    return [name for name in (entry.strip().lower() for entry in entries) if name]
+
+
 def _allowed_host_names() -> set[str]:
     """Exact names from VITE_ALLOWED_HOSTS. "all" and ".suffix" entries widen
-    the dev server's Host check but name no machine, so they add nothing."""
-    names = set()
-    for entry in (os.environ.get("VITE_ALLOWED_HOSTS") or "").split(","):
-        name = entry.strip().lower()
-        if name and name != "all" and not name.startswith("."):
-            names.add(name)
+    the dev server's Host check but name no machine, so they add no origin."""
+    return {name for name in _vite_allowed_hosts() if name != "all" and not name.startswith(".")}
+
+
+def allowed_host_suffixes() -> tuple[str, ...]:
+    """The ".example.lan" entries of VITE_ALLOWED_HOSTS, each of which Vite
+    reads as that name and every name under it."""
+    return tuple(name for name in _vite_allowed_hosts() if name.startswith(".") and len(name) > 1)
+
+
+def any_host_allowed() -> bool:
+    """True when VITE_ALLOWED_HOSTS includes "all", which turns off Vite's
+    Host check and the backend's (backend/utils/host_check.py)."""
+    return "all" in _vite_allowed_hosts()
+
+
+def url_host(value: Optional[str]) -> Optional[str]:
+    """The host of an absolute http(s) URL, lower case, an IPv6 address
+    without brackets; None for a relative path or anything else."""
+    origin = normalize_origin(value)
+    if origin is None:
+        return None
+    host = urlsplit(origin).hostname
+    return host or None
+
+
+def own_host_names() -> set[str]:
+    """The names this install answers to by name (the backend's Host check,
+    backend/utils/host_check.py, also accepts any IP address and the
+    VITE_ALLOWED_HOSTS suffixes): this machine's names, the exact names in
+    VITE_ALLOWED_HOSTS, and the hosts of VITE_FRONTEND_URL, of an absolute
+    VITE_API_BASE_URL or VITE_SOCKET_URL (a build that calls the backend
+    directly), and of each origin in GUAARDVARK_CORS_ORIGINS."""
+    names = set(_machine_hosts()) | _allowed_host_names()
+    for name in ("VITE_FRONTEND_URL", "VITE_API_BASE_URL", "VITE_SOCKET_URL"):
+        host = url_host(os.environ.get(name))
+        if host:
+            names.add(host)
+    for origin in extra_origins():
+        host = url_host(origin)
+        if host:
+            names.add(host)
     return names
 
 
