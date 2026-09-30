@@ -32,6 +32,8 @@ PROTECTED_PREFIXES = (
     '/api/backups/restore',
     '/api/backups/create',
     '/api/self-code/',
+    # Restarting Guaardvark (stops every running job) and the restart log.
+    '/api/reboot',
     # Social outreach has kill switches, draft approval, and fetch-meta — none of
     # which should be reachable from another machine on the LAN without an API key.
     '/api/social-outreach/',
@@ -261,6 +263,22 @@ def _effective_client_ip():
     return peer
 
 
+def _is_preflight_flask_answers() -> bool:
+    """An OPTIONS request that Flask answers itself, without running a view.
+
+    That is a browser's CORS preflight: it never carries a key or a cookie,
+    so refusing it only makes the browser drop the real request that would
+    carry them. Flask-CORS adds the CORS headers to Flask's answer for this
+    install's own origins only. An OPTIONS to a route whose view handles
+    OPTIONS itself is guarded like any other request.
+    """
+    if request.method != "OPTIONS":
+        return False
+    rule = request.url_rule
+    # No rule: Flask answers 404 or 405 and no view runs.
+    return rule is None or bool(getattr(rule, "provide_automatic_options", False))
+
+
 def _is_protected():
     """Check if the current request targets a protected endpoint."""
     path = request.path
@@ -362,6 +380,7 @@ def protected_summary() -> list[str]:
         items.append("Changing the MCP server list")
     items += [
         "Code execution",
+        "Restarting Guaardvark",
         "Creating, restoring and deleting backups",
         "Editing files and browsing the server's folders",
         "Reading Guaardvark's own source (self-code)",
@@ -381,11 +400,15 @@ def check_endpoint_auth():
     """Flask before_request hook: enforce auth on dangerous endpoints.
 
     Logic:
+    - An OPTIONS request Flask answers itself (a CORS preflight) → allow
     - Agent screen captures: a link signed for that path passes, then the rule below
     - If endpoint is not protected → allow
     - If GUAARDVARK_API_KEY is set → require X-API-Key header (any host)
     - If GUAARDVARK_API_KEY is NOT set → allow localhost, block remote
     """
+    if _is_preflight_flask_answers():
+        return None
+
     if request.path.startswith(SCREENSHOT_PREFIX):
         if _screenshot_link_is_signed() or caller_is_authorized():
             return None

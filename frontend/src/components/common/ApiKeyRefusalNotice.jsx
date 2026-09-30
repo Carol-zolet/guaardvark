@@ -31,7 +31,7 @@ const LINK_LABEL = "Settings → API key";
 let inlineAlerts = 0;
 const INLINE_GRACE_MS = 400;
 
-export function ApiKeyRefusalAlert({ message, severity = "info", sx }) {
+export function ApiKeyRefusalAlert({ message, severity = "info", sx, onFollow }) {
   const navigate = useNavigate();
   useEffect(() => {
     inlineAlerts += 1;
@@ -44,7 +44,15 @@ export function ApiKeyRefusalAlert({ message, severity = "info", sx }) {
       severity={severity}
       sx={sx}
       action={
-        <Button color="inherit" size="small" onClick={() => navigate(API_KEY_SETTINGS_PATH)} sx={{ whiteSpace: "nowrap" }}>
+        <Button
+          color="inherit"
+          size="small"
+          onClick={() => {
+            onFollow?.();
+            navigate(API_KEY_SETTINGS_PATH);
+          }}
+          sx={{ whiteSpace: "nowrap" }}
+        >
           {LINK_LABEL}
         </Button>
       }
@@ -58,6 +66,8 @@ ApiKeyRefusalAlert.propTypes = {
   message: PropTypes.node.isRequired,
   severity: PropTypes.string,
   sx: PropTypes.object,
+  // Called before the link opens Settings → API key (a dialog closes itself).
+  onFollow: PropTypes.func,
 };
 
 export default function ApiKeyRefusalNotice() {

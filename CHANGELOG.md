@@ -22,6 +22,38 @@
   Film Crew character without a voice) spoke in that clone's voice, even after its consent was
   withdrawn, until the model unloaded. The stock voice now comes back after every generation, and
   a clone reads its clip once rather than once per chunk.
+- **Only Guaardvark's own pages can read its replies.** A web page served from any device on the
+  local network (any 192.168.x, 10.x or 172.16–31.x address, on any port) could call the backend
+  and read what it answered. Browsers are now answered only for this install's own pages: its
+  frontend and backend ports on this machine's names and addresses (`localhost`, its IP addresses,
+  its hostname and `<hostname>.local`), `VITE_FRONTEND_URL`, and origins listed in the new
+  `GUAARDVARK_CORS_ORIGINS` for a reverse proxy or another name. Other local ports (3000, 5175)
+  count only when one is this install's `VITE_PORT`. Socket.IO uses the same list, so the UI
+  opened at the machine's LAN address from a phone or another computer now gets live chat,
+  progress and voice; its connection was refused before. The Interconnector's status, register
+  and heartbeat routes still accept any private-network page, which is how a client node's
+  Settings page reaches its master.
+- **Pages on other sites cannot change anything.** A page on any website open in a browser on
+  the Guaardvark machine (or on any device the backend answers) could make that browser send a
+  form-style POST to the backend, and routes that trust the Guaardvark machine would act on it.
+  Every request other than GET, HEAD and OPTIONS is now refused with `cross_site_request` when the
+  browser says it came from a page that is not this install's (its `Origin`, an `Origin: null`, or
+  `Sec-Fetch-Site: cross-site` with no `Origin`). The web UI under any name it is reached by, the
+  CLI, the MCP server, scripts and calls between machines are unaffected, and a client node's
+  Settings page still registers with its master.
+- **Restarting Guaardvark needs this machine or the API key**, like the other protected actions.
+  From another device the restart dialog says to enter the key in Settings → API key instead of
+  restarting.
+- **A browser preflight no longer needs the API key.** Once a key existed, a UI built with an
+  absolute `VITE_API_BASE_URL` could not call protected routes: the browser's CORS preflight
+  (an OPTIONS request, which never carries a key or cookie) was refused, so the real request was
+  never sent. OPTIONS requests that Flask answers itself now pass; the request that follows still
+  needs the key or a signed-in browser.
+- **The restart log server answers only this install's pages.** During a restart from Settings
+  the log shown on the page came from a small server that listened on every network address,
+  let any web page read the restart log, and had a `/shutdown` link that did not stop it but kept
+  the process from ever exiting. It now listens on this machine only, only Guaardvark's own
+  pages can read the log, and `POST /shutdown` stops it.
 - **`start.sh` stops when run as root.** With `sudo`, the install landed under `/root` and left
   files the normal user could not write. It now says to run it as your normal user; it asks
   for your password itself when it installs system packages. Machines where root is the only

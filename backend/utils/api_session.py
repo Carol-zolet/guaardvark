@@ -12,9 +12,10 @@ the old key is signed out at once.
 SameSite treats the same host on another port as the same site, so the cookie
 is also refused when the browser says the request came from a page on another
 origin (the Sec-Fetch-Site header), unless that page is this install's own
-frontend served from a separate origin (VITE_FRONTEND_URL, or localhost and
-127.0.0.1 at VITE_PORT). Browsers that send no Sec-Fetch-Site (Safari before
-16.4) are held by SameSite alone.
+frontend served from a separate origin: cors_policy.frontend_origins(), the
+frontend's port on this machine's names and addresses plus VITE_FRONTEND_URL
+and GUAARDVARK_CORS_ORIGINS. Browsers that send no Sec-Fetch-Site (Safari
+before 16.4) are held by SameSite alone.
 
 Command-line clients, the MCP server and scripts keep sending the key in the
 X-API-Key header; the cookie is for browsers only.
@@ -25,11 +26,12 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
-import os
 from pathlib import Path
 from typing import Optional
 
 from flask import request
+
+from backend.utils.cors_policy import frontend_origins, normalize_origin
 
 COOKIE_PREFIX = "guaardvark_session"
 _TOKEN_CONTEXT = b"guaardvark-session-v1"
@@ -65,23 +67,14 @@ def session_token(key: str) -> str:
     return base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
 
 
-def _own_frontend_origins() -> set[str]:
-    port = (os.environ.get("VITE_PORT") or "5173").strip()
-    origins = {f"http://localhost:{port}", f"http://127.0.0.1:{port}"}
-    configured = (os.environ.get("VITE_FRONTEND_URL") or "").strip().rstrip("/")
-    if configured:
-        origins.add(configured.lower())
-    return origins
-
-
 def request_origin_allowed() -> bool:
     """False when the browser reports the request came from another origin's
     page that is not this install's own frontend."""
     site = (request.headers.get("Sec-Fetch-Site") or "").strip().lower()
     if not site or site in ("same-origin", "none"):
         return True
-    origin = (request.headers.get("Origin") or "").strip().rstrip("/").lower()
-    return bool(origin) and origin in _own_frontend_origins()
+    origin = normalize_origin(request.headers.get("Origin"))
+    return origin is not None and origin in frontend_origins()
 
 
 def session_state() -> str:

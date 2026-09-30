@@ -624,6 +624,9 @@ export const triggerReboot = async () => {
       throw new Error(data.error);
     return data;
   } catch (err) {
+    // Refused (this device needs the API key): nothing restarted, and the
+    // caller shows the advice handleResponse put in the message.
+    if (err.authRefused) throw err;
     console.warn(
       "settingsService: Error triggering reboot (might be expected if server restarted):",
       err.message,
