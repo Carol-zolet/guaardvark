@@ -14,6 +14,8 @@ from typing import Any, Optional
 
 from backend.services.agent_tools import BaseTool, ToolParameter, ToolResult
 from backend.tools.generation_tools import FileGeneratorTool
+from backend.utils.backend_http import is_mcp_transport
+from backend.utils.display_paths import display_path, display_text
 
 logger = logging.getLogger(__name__)
 
@@ -293,7 +295,8 @@ class CodeGeneratorTool(BaseTool):
         "if the instructions ask to improve, refactor, rewrite or update a file that exists in the checkout "
         "or the uploads (a new file that only shares an existing name, such as README.md, is fine). Only the code is saved: "
         "a Markdown fence and any sentences the model puts around it are dropped, and a reply with no code is an error "
-        "and writes nothing. Returns output_path, filename, language, line and character counts, syntax_ok "
+        "and writes nothing. Returns output_path (over MCP relative to the checkout, e.g. "
+        "'data/outputs/code/app_v2.py', which read_code opens), filename, language, line and character counts, syntax_ok "
         "(true or false for Python and JSON output, which is parsed but never run; null for other languages) and "
         "the first 500 characters. The model call stops after 180 s; over MCP the call returns an "
         "error after its timeout (120 s by default); the run is not cancelled and saves if the model "
@@ -595,10 +598,15 @@ OUTPUT THE COMPLETE FILE NOW (no explanations, no markdown fences, just code):""
             line_count = len(code_content.split('\n'))
             char_count = len(code_content)
 
+            # An MCP client gets the path relative to the checkout, which read_code
+            # accepts; where the checkout sits on disk is not its business. The
+            # chat keeps the real path: it builds the reply's file card from it.
+            shown_path = display_path(output_path) if is_mcp_transport(self) else output_path
+
             return ToolResult(
                 success=True,
                 output={
-                    "output_path": output_path,
+                    "output_path": shown_path,
                     "filename": clean_name,
                     "language": language,
                     "line_count": line_count,
@@ -618,7 +626,7 @@ OUTPUT THE COMPLETE FILE NOW (no explanations, no markdown fences, just code):""
             logger.error(f"Code generation failed: {e}", exc_info=True)
             return ToolResult(
                 success=False,
-                error=f"Code generation failed: {str(e)}"
+                error=display_text(f"Code generation failed: {str(e)}")
             )
 
 
@@ -827,5 +835,5 @@ Provide a structured analysis grounded in the visible code, with line citations 
             logger.error(f"Code analysis failed: {e}", exc_info=True)
             return ToolResult(
                 success=False,
-                error=f"Code analysis failed: {str(e)}"
+                error=display_text(f"Code analysis failed: {str(e)}")
             )

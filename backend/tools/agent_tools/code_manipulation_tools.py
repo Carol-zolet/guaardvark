@@ -25,8 +25,10 @@ from backend.tools.llama_code_tools import (
 )
 from backend.models import db, Folder
 from backend.utils.backend_http import is_mcp_transport
+from backend.utils.display_paths import display_text
 import json
 import ast
+from datetime import datetime
 from backend.services.guarded_code_service import (
     GuardedCodeError,
     apply_exact_replacement,
@@ -322,7 +324,7 @@ class ReadCodeTool(BaseTool):
             logger.error(f"ReadCodeTool failed: {e}", exc_info=True)
             return ToolResult(
                 success=False,
-                error=f"Failed to read file: {str(e)}",
+                error=display_text(f"Failed to read file: {str(e)}"),
                 metadata={"filepath": filepath}
             )
 
@@ -681,7 +683,7 @@ class ListCodeFilesTool(BaseTool):
             logger.error(f"ListCodeFilesTool failed: {e}", exc_info=True)
             return ToolResult(
                 success=False,
-                error=f"List files failed: {str(e)}",
+                error=display_text(f"List files failed: {str(e)}"),
                 metadata={"directory": directory}
             )
 
@@ -798,6 +800,22 @@ def _repository_folder(tool: BaseTool, folder_id, with_physical_path: bool = Fal
     return info, None
 
 
+def _analysis_stamp(metadata: dict) -> str:
+    """When the stored analysis ran and how many files it covered, as one
+    sentence for a result that reflects that analysis rather than the folder
+    as it is now."""
+    raw = str(metadata.get("analyzed_at") or "").strip()
+    try:
+        when = datetime.fromisoformat(raw).strftime("%Y-%m-%d %H:%M") + " (server local time)"
+    except ValueError:
+        when = raw
+    count = metadata.get("file_count")
+    files = f", {count} files" if isinstance(count, int) else ""
+    if not when:
+        return f"Analysis time not recorded{files}. Files added or changed since the analysis are not reflected."
+    return f"Analysed {when}{files}. Files added or changed since then are not reflected."
+
+
 class GetRepositoryMapTool(BaseTool):
     """Tool to get the PageRank-based repository map of a Code Repository folder."""
 
@@ -808,7 +826,8 @@ class GetRepositoryMapTool(BaseTool):
         "its files by PageRank, each with up to 10 top-ranked classes, functions and methods, cut off at "
         "about 4,096 tokens. Take folder_id from list_code_repositories, using an entry with "
         "has_metadata=true. Read-only; needs the Guaardvark backend running, and shows the folder as of "
-        "its last analysis, not later edits. Fails with a message if the folder is not a Code Repository "
+        "its last analysis, not later edits: the first line says when that analysis ran (server local "
+        "time) and how many files it covered. Fails with a message if the folder is not a Code Repository "
         "or not analysed yet, and says so when the analysis found no code symbols. For import edges use "
         "get_dependency_graph; for one Python symbol's source, read_ast_node; for Guaardvark's own "
         "checkout, map_codebase."
@@ -844,19 +863,22 @@ class GetRepositoryMapTool(BaseTool):
                 if "repository_map" in folder["metadata"]:
                     return ToolResult(
                         success=True,
-                        output="The analysis found no classes or functions to map in this folder.",
+                        output=(
+                            "The analysis found no classes or functions to map in this folder. "
+                            + _analysis_stamp(folder["metadata"])
+                        ),
                         metadata={"folder_id": folder_id},
                     )
                 return ToolResult(success=False, error="No repository map found in the metadata. It may still be generating.")
 
             return ToolResult(
                 success=True,
-                output=repo_map,
-                metadata={"folder_id": folder_id}
+                output=f"{_analysis_stamp(folder['metadata'])}\n\n{repo_map}",
+                metadata={"folder_id": folder_id, "analyzed_at": folder["metadata"].get("analyzed_at")}
             )
         except Exception as e:
             logger.error(f"GetRepositoryMapTool failed: {e}", exc_info=True)
-            return ToolResult(success=False, error=f"Failed to get repository map: {str(e)}")
+            return ToolResult(success=False, error=display_text(f"Failed to get repository map: {str(e)}"))
 
 
 class GetDependencyGraphTool(BaseTool):
@@ -866,11 +888,13 @@ class GetDependencyGraphTool(BaseTool):
     read_only = True
     description = (
         "Return the file-level import graph of an uploaded Code Repository folder as JSON "
-        "{file: [in-repository files it imports]}, paths starting with the folder's own path. Only "
+        "{analyzed_at, file_count, graph}, where graph is {file: [in-repository files it imports]} with "
+        "paths starting with the folder's own path. Only "
         "Python and JavaScript/TypeScript imports are parsed; third-party imports and files that import "
-        "nothing in the repository are left out, and a repository with no internal imports returns {}. "
+        "nothing in the repository are left out, and a repository with no internal imports has an empty graph. "
         "Take folder_id from list_code_repositories. Read-only; needs the Guaardvark backend running, "
-        "reflects the last analysis, and fails with a message if the folder is not analysed. For a "
+        "reflects the last analysis (analyzed_at is when it ran, in server local time; later edits are "
+        "not in the graph), and fails with a message if the folder is not analysed. For a "
         "ranked symbol overview use get_repository_map; for import cycles in Guaardvark's own checkout, "
         "map_codebase."
     )
@@ -907,12 +931,16 @@ class GetDependencyGraphTool(BaseTool):
 
             return ToolResult(
                 success=True,
-                output=json.dumps(dep_graph, indent=2),
+                output=json.dumps({
+                    "analyzed_at": folder["metadata"].get("analyzed_at"),
+                    "file_count": folder["metadata"].get("file_count"),
+                    "graph": dep_graph,
+                }, indent=2),
                 metadata={"folder_id": folder_id, "node_count": len(dep_graph)}
             )
         except Exception as e:
             logger.error(f"GetDependencyGraphTool failed: {e}", exc_info=True)
-            return ToolResult(success=False, error=f"Failed to get dependency graph: {str(e)}")
+            return ToolResult(success=False, error=display_text(f"Failed to get dependency graph: {str(e)}"))
 
 
 class ReadASTNodeTool(BaseTool):
@@ -1036,7 +1064,26 @@ class ReadASTNodeTool(BaseTool):
             
         except Exception as e:
             logger.error(f"ReadASTNodeTool failed: {e}", exc_info=True)
-            return ToolResult(success=False, error=f"Failed to read AST node: {str(e)}")
+            return ToolResult(success=False, error=display_text(f"Failed to read AST node: {str(e)}"))
+
+
+# Guaardvark's own source is always listed, although it is not a Library folder:
+# it has no folder id and cannot be marked as a Code Repository, so the folder
+# tools do not apply to it. Its path is "." because read_code, search_code and
+# list_code_files take paths relative to the checkout root; where the checkout
+# sits on disk is not something a client needs.
+LIVE_CHECKOUT_ENTRY = {
+    "id": "live",
+    "name": "Guaardvark's own source (live checkout)",
+    "path": ".",
+    "has_metadata": False,
+    "description": (
+        "The source of this Guaardvark install, not a Library folder: 'live' is not a folder_id, and "
+        "get_repository_map, get_dependency_graph and read_ast_node do not work on it. Explore it "
+        "with search_code, search_codebase, list_code_files and read_code, using paths relative to "
+        "the checkout root, or map_codebase for an overview."
+    ),
+}
 
 
 class ListCodeRepositoriesTool(BaseTool):
@@ -1049,7 +1096,8 @@ class ListCodeRepositoriesTool(BaseTool):
         "has_metadata, description}. Call it first to get the integer folder_id that get_repository_map, "
         "get_dependency_graph and read_ast_node take. Marking a folder on the Documents page also marks "
         "each subfolder, listed separately; only entries with has_metadata=true have been analysed (the "
-        "map and graph are built at the end of that analysis), so use the top folder's id for those. The last entry, id 'live', is Guaardvark's own source root, "
+        "map and graph are built at the end of that analysis), so use the top folder's id for those. The last entry, id 'live', is Guaardvark's own source root "
+        "(path '.', the root that read_code and search_code paths are relative to), "
         "not a folder id: explore it with search_code, read_code or map_codebase. Read-only; needs the "
         "Guaardvark backend running. Folders are marked on the Documents page or by bulk indexing."
     )
@@ -1073,20 +1121,7 @@ class ListCodeRepositoriesTool(BaseTool):
                         "description": (f.description or "")[:200] if f.description else ""
                     })
 
-            # Always surface the live main source root (GUAARDVARK_ROOT) even if not a DB-indexed Code Repo.
-            # Agent can use read_code / search_code / list_code_files with absolute or relative paths from here.
-            # For full map/graph, the folder should be marked is_repository and analyzed.
-            try:
-                root = os.environ.get("GUAARDVARK_ROOT") or os.getcwd()
-                result.append({
-                    "id": "live",
-                    "name": "Live main codebase (GUAARDVARK_ROOT)",
-                    "path": root,
-                    "has_metadata": False,
-                    "description": "The running Guaardvark source root. Use file tools (read_code etc.) directly with this path for exploration. Mark as Code Repo in Documents for map tools."
-                })
-            except Exception:
-                pass
+            result.append(dict(LIVE_CHECKOUT_ENTRY))
 
             return ToolResult(
                 success=True,
@@ -1095,7 +1130,7 @@ class ListCodeRepositoriesTool(BaseTool):
             )
         except Exception as e:
             logger.error(f"ListCodeRepositoriesTool failed: {e}", exc_info=True)
-            return ToolResult(success=False, error=f"Failed to list code repos: {str(e)}")
+            return ToolResult(success=False, error=display_text(f"Failed to list code repos: {str(e)}"))
 
 
 # Tool instances for registration

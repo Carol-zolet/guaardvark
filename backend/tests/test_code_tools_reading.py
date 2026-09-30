@@ -1,8 +1,15 @@
 """The read-only code tools as an MCP client sees them: read_code returns a
-large file in pages and a line range on request.
+large file in pages and a line range on request, list_code_files refuses
+private folders without showing which exist, and the repository tools give
+checkout-relative labels and say when their analysis ran.
 
 Each test works on a small tree under tmp_path, which is not a git checkout.
 No backend, database, GPU or network."""
+import json
+import os
+from pathlib import Path
+from types import SimpleNamespace
+
 import pytest
 
 import backend.tools.agent_tools.code_manipulation_tools as cmt
@@ -112,3 +119,69 @@ def test_a_private_folder_gets_the_same_answer_whether_or_not_it_exists(checkout
 
     assert "does not exist" in lct.list_files("zz-no-such-folder")
     assert "a.py" in lct.list_files("src")
+
+
+# --- repositories, map and graph (the backend's answers are stubbed) -------
+
+ANALYSED = {
+    "id": 7, "path": "Repo", "is_repository": True,
+    "metadata": {
+        "analyzed_at": "2026-09-12T14:03:11.123456",
+        "file_count": 42,
+        "repository_map": "## Repo/app/main.py\n- class Worker",
+        "dependency_graph": {"Repo/app/main.py": ["Repo/app/util.py"]},
+    },
+}
+# Metadata written without an analysis time, and nothing to map.
+UNDATED = {"id": 8, "path": "Old", "is_repository": True,
+           "metadata": {"repository_map": "", "dependency_graph": {}}}
+
+
+@pytest.fixture
+def backend(monkeypatch):
+    def request_json(method, path, **_kwargs):
+        if path == "/api/files/repositories":
+            data = {"repositories": [{"id": 7, "name": "Repo", "path": "Repo", "has_metadata": True, "description": ""}]}
+        else:
+            data = {7: ANALYSED, 8: UNDATED}[int(path.split("/")[4])]
+        return SimpleNamespace(data=data)
+
+    monkeypatch.setattr("backend.utils.backend_http.request_json", request_json)
+
+
+def test_the_live_entry_is_a_relative_label_with_advice_that_can_be_followed(backend):
+    result = _mcp(cmt.ListCodeRepositoriesTool).execute()
+    assert result.success
+    live = result.output[-1]
+    assert (live["id"], live["path"]) == ("live", ".")
+    assert "Mark as Code Repo" not in live["description"]
+    assert "not a folder_id" in live["description"]
+    # Nothing in the listing names where the checkout or the home folder is.
+    assert not [entry for entry in result.output if os.path.isabs(str(entry["path"]))]
+    assert str(Path.home()) not in json.dumps(result.output)
+
+
+def test_the_repository_map_says_when_the_analysis_ran(backend):
+    result = _mcp(cmt.GetRepositoryMapTool).execute(folder_id=7)
+    assert result.success
+    first_line, _blank, rest = result.output.partition("\n\n")
+    assert first_line.startswith("Analysed 2026-09-12 14:03 (server local time), 42 files.")
+    assert rest == ANALYSED["metadata"]["repository_map"]
+
+    undated = _mcp(cmt.GetRepositoryMapTool).execute(folder_id=8)
+    assert undated.success
+    assert "no classes or functions" in undated.output
+    assert "Analysis time not recorded" in undated.output
+
+
+def test_the_dependency_graph_carries_the_analysis_time(backend):
+    result = _mcp(cmt.GetDependencyGraphTool).execute(folder_id=7)
+    assert result.success
+    assert json.loads(result.output) == {
+        "analyzed_at": "2026-09-12T14:03:11.123456",
+        "file_count": 42,
+        "graph": {"Repo/app/main.py": ["Repo/app/util.py"]},
+    }
+
+    undated = json.loads(_mcp(cmt.GetDependencyGraphTool).execute(folder_id=8).output)
+    assert undated == {"analyzed_at": None, "file_count": None, "graph": {}}

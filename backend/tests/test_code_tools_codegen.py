@@ -1,6 +1,7 @@
 """codegen and analyze_code with the model stubbed: what codegen saves for each
 shape of model reply. No Ollama, GPU, network or database: the LLM service
 module is replaced and output goes to tmp_path."""
+import os
 import sys
 import types
 from types import SimpleNamespace
@@ -117,6 +118,20 @@ def test_output_that_does_not_parse_is_flagged(llm, tmp_path):
     result, written = _generate(tmp_path, filename="cfg.json")
     assert written.read_text() == '{"a": 1}'
     assert result.output["syntax_ok"] is True
+
+
+def test_mcp_clients_get_the_output_path_relative_to_the_checkout(llm, tmp_path, monkeypatch):
+    """The chat keeps the real path: it builds the reply's file card from it."""
+    monkeypatch.setenv("GUAARDVARK_ROOT", str(tmp_path))
+    llm(StubLLM(FILE))
+    over_mcp = ct.CodeGeneratorTool()
+    over_mcp.set_context({"transport": "mcp"})
+    result = over_mcp.execute(output_filename="p.py", instructions="write a greeting script")
+    assert result.output["output_path"] == "outputs/code/p.py"
+
+    in_chat = ct.CodeGeneratorTool().execute(output_filename="p.py", instructions="write a greeting script")
+    assert os.path.isabs(in_chat.output["output_path"])
+    assert os.path.samefile(in_chat.output["output_path"], tmp_path / "outputs" / "code" / "p.py")
 
 
 # --- input size ---------------------------------------------------------
