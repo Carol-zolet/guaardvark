@@ -526,13 +526,18 @@ class ImageGeneratorTool(BaseTool):
             params["guidance"] = guidance
         if subject_ids:
             params["subject_ids"] = list(subject_ids)
+        notes: list = []
         try:
             if via_http:
                 data = _http_json("POST", "/api/batch-image/generate/prompts",
                                   {"prompts": [prompt], **params})
                 batch_id = data["batch_id"]
-                sampling.update({k: v for k, v in (data.get("parameters") or {}).items()
+                # The route is the authority on what was queued: its model, steps and warnings.
+                served = data.get("parameters") or {}
+                sampling.update({k: v for k, v in served.items()
                                  if k in ("steps", "steps_requested", "steps_notice")})
+                model = served.get("model") or model
+                notes = [str(w) for w in (data.get("validation") or {}).get("warnings") or []]
             else:
                 from backend.services.batch_image_generator import start_batch_from_prompts
                 batch_id = start_batch_from_prompts([prompt], **params)
@@ -555,6 +560,7 @@ class ImageGeneratorTool(BaseTool):
                 f"Size: {width}x{height} | Model: {model or 'auto'} | Style: {style}",
                 f"Steps: {sampling['steps']} (planned)",
                 *([sampling["steps_notice"]] if sampling.get("steps_notice") else []),
+                *[f"Note: {note}" for note in notes],
                 cast_line,
                 f"Poll: get_generation_status(batch_id=\"{batch_id}\")",
                 f"Open Images: {self.STUDIO_URL}",
@@ -563,6 +569,7 @@ class ImageGeneratorTool(BaseTool):
                 "prompt": prompt,
                 "batch_id": batch_id,
                 "queued": True,
+                "warnings": notes,
                 "steps": sampling["steps"],
                 "steps_requested": sampling.get("steps_requested"),
                 "steps_notice": sampling.get("steps_notice"),
