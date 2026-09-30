@@ -1,6 +1,8 @@
 // frontend/src/api/apiClient.js
 // Version 1.0: Centralized API client logic.
 
+import { authRefusalCode, describeAuthRefusal, isBackendUrl } from "./apiKey";
+
 // Default to '/api' so requests use the Vite proxy during development
 // Strip any trailing slash to avoid double slashes or Flask 405 errors
 export const BASE_URL = (import.meta.env.VITE_API_BASE_URL || "/api").replace(
@@ -53,7 +55,15 @@ export const handleResponse = async (response, options = {}) => {
     // "[object Object]", which is what the client box showed when its master
     // was unreachable. Older endpoints still send a bare string under "error".
     const nested = errorData?.error;
+    // A protected route refused this browser: say what to do here (Settings →
+    // API key) rather than the server's wording, which also addresses the CLI.
+    const refusal =
+      (response.status === 401 || response.status === 403) &&
+      (!response.url || isBackendUrl(response.url))
+        ? authRefusalCode(errorData)
+        : null;
     const errorMessage =
+      (refusal && describeAuthRefusal(refusal)) ||
       (typeof nested === "string" && nested) ||
       (typeof nested?.message === "string" && nested.message) ||
       (typeof errorData?.message === "string" && errorData.message) ||
@@ -61,6 +71,7 @@ export const handleResponse = async (response, options = {}) => {
     const error = new Error(errorMessage);
     error.status = response.status;
     error.data = errorData;
+    if (refusal) error.authRefused = refusal;
     // The Vite proxy returns 502 (and {"error":"backend_offline"}) when the Flask
     // backend is unreachable; 504 is a proxy timeout. Surface a single flag so
     // callers (StatusContext, VoiceContext, HealthContext) can distinguish

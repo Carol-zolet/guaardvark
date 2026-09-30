@@ -35,6 +35,8 @@ import {
   reloadMcpConfig,
   saveMcpServer,
 } from "../../api/mcpService";
+import { API_KEY_CHANGED_EVENT } from "../../api/apiKey";
+import { ApiKeyRefusalAlert } from "../common/ApiKeyRefusalNotice";
 import { ActionButton, ConfirmActionDialog, SettingChip, StatusPill } from "./ui";
 
 const STATUS_TONE = {
@@ -283,8 +285,9 @@ const MCPServersSection = () => {
   const [dialog, setDialog] = useState({ open: false, initial: null, isEdit: false });
   const [removing, setRemoving] = useState(null);
   const [message, setMessage] = useState(null);
-  // The backend's own words when it answers these routes only on its machine
-  // (401/403): this page has no API-key field, so nothing here can work.
+  // Set when the backend refuses this browser (these routes answer the
+  // Guaardvark machine, or this install's API key): the advice to show in
+  // place of the page. Polling stops until the key in this browser changes.
   const [refused, setRefused] = useState(null);
 
   const refresh = useCallback(async () => {
@@ -293,13 +296,20 @@ const MCPServersSection = () => {
       setStatus(st);
       setServers(list.servers || []);
       setConfigErrors(list.config_errors || []);
+      setRefused(null);
     } catch (e) {
-      if (e.status === 401 || e.status === 403) {
+      if (e.authRefused) {
         setRefused(e.message);
       } else {
         setMessage({ severity: "error", text: `Could not load MCP status: ${e.message}` });
       }
     }
+  }, []);
+
+  useEffect(() => {
+    const retry = () => setRefused(null);
+    window.addEventListener(API_KEY_CHANGED_EVENT, retry);
+    return () => window.removeEventListener(API_KEY_CHANGED_EVENT, retry);
   }, []);
 
   const refreshAudit = useCallback(async () => {
@@ -352,7 +362,7 @@ const MCPServersSection = () => {
   };
 
   if (refused) {
-    return <Alert severity="info">{refused}</Alert>;
+    return <ApiKeyRefusalAlert message={refused} />;
   }
   if (status && !status.mcp_enabled) {
     return <Alert severity="info">MCP is disabled. Set GUAARDVARK_MCP_ENABLED=true and restart.</Alert>;

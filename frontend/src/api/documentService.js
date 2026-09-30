@@ -1,6 +1,7 @@
 // frontend/src/api/documentService.js
 // Version 1.1: Added document usage and context analytics endpoints.
 import { BASE_URL, handleResponse } from "./apiClient";
+import { apiKeyHeaders } from "./apiKey";
 import { API_TIMEOUT_GENERATION } from "../config/constants";
 
 export const getDocuments = async (queryParams = {}) => {
@@ -294,7 +295,12 @@ export const uploadFile = async (
     };
 
     // Configure request
-    xhr.open("POST", `${BASE_URL}/docs/upload`);
+    const uploadUrl = `${BASE_URL}/docs/upload`;
+    xhr.open("POST", uploadUrl);
+    // XMLHttpRequest does not go through fetch, so it adds the key itself.
+    for (const [name, value] of Object.entries(apiKeyHeaders(uploadUrl))) {
+      xhr.setRequestHeader(name, value);
+    }
     xhr.timeout = API_TIMEOUT_GENERATION;
 
     // Handle request cancellation via AbortSignal
