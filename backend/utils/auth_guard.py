@@ -103,6 +103,30 @@ MUTATION_PROTECTED_SUFFIXES = (
     ('/api/cast-library/subjects/', '/import-lora'),
 )
 
+# Folders under OUTPUT_DIR that hold personal records rather than generated
+# media: chat transcripts, agent desktop captures, likeness consent records and
+# training-video work built on reference voices. The /outputs/<path> download
+# route (backend/routes/download_route.py) applies require_local_or_key() to any
+# file below them. The route matches the path after it is resolved under
+# OUTPUT_DIR, not the raw URL, so percent-encoding and '..' do not step around
+# it. Generated media under /outputs stays reachable from other hosts.
+PROTECTED_OUTPUT_FOLDERS = ('chat-exports', 'screenshots', 'consent', 'training')
+# Consent sidecars (<image>.consent) sit next to whichever image they cover, so
+# they are matched by name anywhere under OUTPUT_DIR.
+PROTECTED_OUTPUT_SUFFIXES = ('.consent',)
+
+
+def is_protected_output(rel_path: str) -> bool:
+    """True when ``rel_path`` (relative to OUTPUT_DIR, already normalised) is
+    one of the personal-record files above. Compared case-insensitively so a
+    case-insensitive filesystem cannot serve CHAT-EXPORTS/ as chat-exports/."""
+    parts = [p for p in rel_path.replace('\\', '/').split('/') if p and p != '.']
+    if not parts:
+        return False
+    if parts[0].casefold() in {f.casefold() for f in PROTECTED_OUTPUT_FOLDERS}:
+        return True
+    return parts[-1].casefold().endswith(tuple(s.casefold() for s in PROTECTED_OUTPUT_SUFFIXES))
+
 
 def _normalize_ip(addr: str) -> str:
     """Normalize IP for localhost checks (handles IPv4-mapped IPv6 like ::ffff:127.0.0.1 and zone IDs)."""
@@ -223,12 +247,20 @@ def check_endpoint_auth():
 
     Logic:
     - If endpoint is not protected → allow
-    - If GUAARDVARK_API_KEY is set → require X-API-Key header (any host)
-    - If GUAARDVARK_API_KEY is NOT set → allow localhost, block remote
+    - Otherwise apply require_local_or_key()
     """
     if not _is_protected():
         return None
+    return require_local_or_key()
 
+
+def require_local_or_key():
+    """The protection rule for the current request: None to allow it, or the
+    Flask error response to return.
+
+    - If GUAARDVARK_API_KEY is set → require X-API-Key header (any host)
+    - If GUAARDVARK_API_KEY is NOT set → allow localhost, block remote
+    """
     api_key = os.environ.get('GUAARDVARK_API_KEY')
 
     if not api_key:
