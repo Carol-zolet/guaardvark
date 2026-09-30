@@ -2,9 +2,11 @@
 search engine and nowhere else, says so when the engine finds nothing or cannot
 be asked, asks the engine for the number of results the caller wanted, and
 sends no ~/.netrc login to the fixed hosts it calls. The search client's HTTP
-call and requests' transport are both replaced; nothing is sent."""
+call and requests' transport are both replaced, and where a fetch is
+public-only its name lookup is answered too; nothing is sent."""
 
 import json
+import socket
 import sys
 from urllib.parse import urlsplit
 
@@ -201,7 +203,25 @@ def test_a_missing_client_is_reported_not_hidden(monkeypatch, transport):
     assert transport == []
 
 
-def test_a_url_that_serves_a_file_ends_the_call_without_a_search(engine, monkeypatch):
+@pytest.fixture
+def lookups(monkeypatch):
+    """Answer every name lookup with a public address and record the names.
+
+    A URL in a web search is fetched only from a public address, and the guard
+    looks the host up before the first request, so a test that fakes the
+    transport must answer the lookup too, or it is sent to the real resolver.
+    """
+    asked = []
+
+    def fake(host, port, *args, **kwargs):
+        asked.append(host)
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", port or 0))]
+
+    monkeypatch.setattr(socket, "getaddrinfo", fake)
+    return asked
+
+
+def test_a_url_that_serves_a_file_ends_the_call_without_a_search(engine, lookups, monkeypatch):
     """The query is not sent on to the search engine when its URL is a PDF."""
     asked, _ = engine
     sent = []
@@ -222,6 +242,7 @@ def test_a_url_that_serves_a_file_ends_the_call_without_a_search(engine, monkeyp
     assert not result["success"] and result["error"].startswith("Not a web page")
     assert sent == ["https://site.example/report.pdf"]
     assert asked == []
+    assert lookups == ["site.example"]
 
 
 def test_the_weather_lookup_carries_no_login_and_names_its_service(engine, transport):
