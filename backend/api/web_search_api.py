@@ -12,8 +12,12 @@ from flask import Blueprint, current_app, jsonify, request
 from backend.utils.response_utils import success_response, error_response
 from backend.utils.settings_utils import get_web_access
 from backend.utils.safe_math import evaluate_arithmetic
+from backend.utils.hosts import no_netrc_session
 from backend.utils.text_focus import focus_window
 from backend.utils.web_fetch import FetchFailed, FetchRefused, decode_page, fetch_page
+from backend.utils.web_search_sources import (
+    DEFAULT_SEARCH_RESULTS, FALLBACK_SEARCH_SOURCE, MAX_SEARCH_RESULTS, SEARCH_ENGINE, WEATHER_SOURCE,
+)
 
 web_search_bp = Blueprint("web_search_api", __name__, url_prefix="/api/web-search")
 logger = logging.getLogger(__name__)
@@ -123,8 +127,9 @@ def get_weather_info(location: str) -> Dict[str, Any]:
         for api_url in weather_apis:
             try:
                 headers = {'User-Agent': 'Guaardvark-Weather/1.0'}
-                response = requests.get(api_url, headers=headers, timeout=10)
-                
+                with no_netrc_session() as session:
+                    response = session.get(api_url, headers=headers, timeout=10)
+
                 if response.ok:
                     data = response.json()
                     
@@ -142,7 +147,7 @@ def get_weather_info(location: str) -> Dict[str, Any]:
                             "temperature_fahrenheit": temp_f,
                             "description": weather_desc,
                             "humidity": humidity,
-                            "source": "wttr.in"
+                            "source": WEATHER_SOURCE
                         }
                         
             except Exception as e:
@@ -163,10 +168,13 @@ def get_weather_info(location: str) -> Dict[str, Any]:
             "error": f"Weather service error: {str(e)}"
         }
 
-def enhanced_web_search(query: str, public_only: bool = False) -> Dict[str, Any]:
+def enhanced_web_search(query: str, public_only: bool = False,
+                        max_results: int = DEFAULT_SEARCH_RESULTS) -> Dict[str, Any]:
     """Answer ``query`` from the web. A URL in the query is fetched directly;
     ``public_only`` refuses that fetch for addresses that are not globally
-    routable, as fetch_url does."""
+    routable, as fetch_url does. ``max_results`` is how many search results to
+    ask for (1 to ``MAX_SEARCH_RESULTS``). ``data["source"]`` names the service
+    that answered."""
 
     results = {
         "query": query,
@@ -214,9 +222,9 @@ def enhanced_web_search(query: str, public_only: bool = False) -> Dict[str, Any]
         else:
             results["data"]["website_error"] = website_data["error"]
     
-    logger.info(f"Performing DuckDuckGo search for: {query}")
-    ddg_results = perform_duckduckgo_search(query)
-    
+    logger.info(f"Performing web search for: {query}")
+    ddg_results = perform_duckduckgo_search(query, max_results=max_results)
+
     if ddg_results["success"]:
         results.update({
             "strategy_used": "duckduckgo_search",
@@ -226,7 +234,7 @@ def enhanced_web_search(query: str, public_only: bool = False) -> Dict[str, Any]
                 "results": ddg_results["results"],
                 "snippet": ddg_results["snippet"],
                 "total_results": ddg_results["total_results"],
-                "source": "DuckDuckGo"
+                "source": ddg_results.get("source") or SEARCH_ENGINE
             }
         })
         return results
@@ -430,7 +438,7 @@ def handle_special_queries(query: str) -> Dict[str, Any]:
                         "description": description,
                         "humidity": humidity,
                         "snippet": snippet,
-                        "source": "Weather API"
+                        "source": weather_result.get("source") or WEATHER_SOURCE
                     }
                 }
             logger.warning(f"Weather lookup failed for {location}: {weather_result.get('error', 'Unknown error')}")
@@ -463,17 +471,31 @@ def handle_special_queries(query: str) -> Dict[str, Any]:
     }
 
 
-def perform_duckduckgo_search(query: str) -> Dict[str, Any]:
+def search_result_count(value: Any) -> int:
+    """``value`` as a number of results to ask for, within 1..MAX_SEARCH_RESULTS."""
+    try:
+        count = int(value)
+    except (TypeError, ValueError):
+        return DEFAULT_SEARCH_RESULTS
+    return max(1, min(count, MAX_SEARCH_RESULTS))
+
+
+def perform_duckduckgo_search(query: str, max_results: int = DEFAULT_SEARCH_RESULTS) -> Dict[str, Any]:
+    """Search the web for ``query`` with the duckduckgo-search client, then, if
+    that gave nothing, through FALLBACK_SEARCH_SOURCE. ``source`` in the result
+    names the one the results came from."""
+    max_results = search_result_count(max_results)
     try:
         from duckduckgo_search import DDGS
 
         results = []
         search_snippets = []
         last_error = None
+        source = SEARCH_ENGINE
         for backend in ("lite", "html"):
             try:
                 with DDGS() as ddgs:
-                    search_rows = ddgs.text(query, backend=backend, max_results=5)
+                    search_rows = ddgs.text(query, backend=backend, max_results=max_results)
 
                 for row in search_rows:
                     title = (row.get("title") or "").strip()
@@ -493,14 +515,16 @@ def perform_duckduckgo_search(query: str) -> Dict[str, Any]:
                     break
             except Exception as backend_error:
                 last_error = str(backend_error)
-                logger.warning(f"DuckDuckGo {backend} backend failed: {backend_error}")
+                logger.warning(f"Web search ({SEARCH_ENGINE}, asked as {backend}) failed: {backend_error}")
                 continue
 
         if not results:
             try:
+                source = FALLBACK_SEARCH_SOURCE
                 proxy_url = f"https://r.jina.ai/http://lite.duckduckgo.com/lite/?q={quote_plus(query)}"
                 headers = {"User-Agent": "guaardvark-web-search/1.0"}
-                resp = requests.get(proxy_url, headers=headers, timeout=10)
+                with no_netrc_session() as session:
+                    resp = session.get(proxy_url, headers=headers, timeout=10)
                 resp.raise_for_status()
 
                 lines = resp.text.splitlines()
@@ -535,7 +559,7 @@ def perform_duckduckgo_search(query: str) -> Dict[str, Any]:
                         break
             except Exception as proxy_error:
                 last_error = last_error or str(proxy_error)
-                logger.warning(f"DuckDuckGo proxy fallback failed: {proxy_error}")
+                logger.warning(f"Web search fallback ({FALLBACK_SEARCH_SOURCE}) failed: {proxy_error}")
 
         if results:
             combined_snippet = "\n\n".join(search_snippets[:3]) if search_snippets else ""
@@ -543,7 +567,8 @@ def perform_duckduckgo_search(query: str) -> Dict[str, Any]:
                 "success": True,
                 "results": results,
                 "snippet": f"Search results for '{query}':\n\n{combined_snippet}",
-                "total_results": len(results)
+                "total_results": len(results),
+                "source": source,
             }
 
         return {
@@ -554,10 +579,10 @@ def perform_duckduckgo_search(query: str) -> Dict[str, Any]:
         }
 
     except Exception as e:
-        logger.error(f"DuckDuckGo search failed: {e}")
+        logger.error(f"Web search failed: {e}")
         return {
             "success": False,
-            "error": f"DuckDuckGo search error: {str(e)}",
+            "error": f"Web search error: {str(e)}",
             "results": [],
             "snippet": ""
         }
@@ -689,7 +714,10 @@ def search_status():
             ],
             "reliability_notes": {
                 "direct_website": "Reliable for specific URLs",
-                "duckduckgo_search": "Primary general search provider"
+                "duckduckgo_search": (
+                    f"General search: {SEARCH_ENGINE} through the duckduckgo-search client, "
+                    f"then {FALLBACK_SEARCH_SOURCE} when that returns nothing"
+                )
             }
         })
         
