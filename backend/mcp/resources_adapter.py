@@ -257,8 +257,9 @@ def _read_contents(uri: str, root: Path, scope: OutputScope, max_inline_bytes: i
                 mime_type="text/plain",
                 text=(
                     f"{path.name} is {size} bytes, above this server's {max_inline_bytes}-byte "
-                    f"inline limit, so it is not embedded. Download it from {link}, or read "
-                    f"{path} on this machine."
+                    f"inline limit, so it is not embedded. Download it from {link} on this "
+                    f"machine (send the X-API-Key header if this install sets "
+                    f"GUAARDVARK_API_KEY), or read {path} directly."
                 ),
             ), size
         # Text MIME types go as UTF-8 text; everything else as base64 blob.
