@@ -2272,8 +2272,11 @@ def _gpu_refusal(e: Exception, gpu_wait: dict | None) -> str | None:
     return None
 
 
-# `steps` on inpaint_image and outpaint_image. The counts live on the editing
-# models' registry entries (min_steps, default_steps), so none is repeated here.
+# The least outpaint_image renders on FLUX.1 Kontext when a step count is given.
+_KONTEXT_OUTPAINT_MIN_STEPS = 20
+
+# `steps` on inpaint_image. The counts live on the editing models' registry
+# entries (min_steps, default_steps), so none is repeated here.
 _EDIT_STEPS_PARAM = (
     "Diffusion steps. Omit to render at the editing model's own count. A value is used as given, "
     "except below a floor the editing model declares (Qwen-Image-Edit does), where it is raised "
@@ -2452,7 +2455,11 @@ class OutpaintImageTool(BaseTool):
         "right": ToolParameter(name="right", type="int", description="Pixels to add on the right.", required=False, default=0),
         "top": ToolParameter(name="top", type="int", description="Pixels to add on the top.", required=False, default=0),
         "bottom": ToolParameter(name="bottom", type="int", description="Pixels to add on the bottom.", required=False, default=0),
-        "steps": ToolParameter(name="steps", type="int", description=_EDIT_STEPS_PARAM, required=False, default=None),
+        "steps": ToolParameter(
+            name="steps", type="int", required=False, default=None,
+            description=("Diffusion steps. Omit to render at the editing model's own count. Outpainting "
+                         f"raises a lower value to at least {_KONTEXT_OUTPAINT_MIN_STEPS}."),
+        ),
         "wait_for_result": _wait_for_result_param(),
     }
 
@@ -2501,11 +2508,13 @@ class OutpaintImageTool(BaseTool):
                 )
                 backend = "qwen"
             elif gen._kontext_installed():
-                # Kontext has no pad node in its graph; instruct it instead.
+                # Kontext has no pad node in its graph; instruct it instead. A count
+                # that is given is raised to at least 20; none renders the model's default.
                 gen.edit_image(
                     image_path=src,
                     instruction=f"Outpaint: {fill}",
-                    output_path=output_path, steps=steps,
+                    output_path=output_path,
+                    steps=max(int(steps), _KONTEXT_OUTPAINT_MIN_STEPS) if steps else None,
                     gpu_wait=gpu_wait,
                 )
                 backend = "kontext"

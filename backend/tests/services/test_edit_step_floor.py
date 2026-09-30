@@ -99,8 +99,20 @@ def test_a_count_given_to_a_kontext_tool_call_is_used_as_given(comfy, photo):
 
     res = it.InpaintImageTool().execute(instruction="remove the cup", image=photo, steps=20)
     assert _sampler_steps(comfy[-1]) == 20 and "raised" not in res.output
+    res = it.InpaintImageTool().execute(instruction="remove the cup", image=photo, steps=12)
+    assert _sampler_steps(comfy[-1]) == 12 and res.metadata["steps"] == 12
+
+
+def test_outpaint_on_kontext_raises_a_given_count_to_at_least_twenty(comfy, photo):
     res = it.OutpaintImageTool().execute(image=photo, steps=12)
-    assert _sampler_steps(comfy[-1]) == 12 and res.metadata["steps_notice"] is None
+    assert res.success and _sampler_steps(comfy[-1]) == 20 and res.metadata["steps"] == 20
+    assert "Steps: 20" in res.output
+    res = it.OutpaintImageTool().execute(image=photo, steps=30)
+    assert _sampler_steps(comfy[-1]) == 30
+    # No count is not a low count: the model's default renders.
+    res = it.OutpaintImageTool().execute(image=photo)
+    assert _sampler_steps(comfy[-1]) == cig.KONTEXT_DEFAULT_STEPS
+    assert "at least 20" in it.OutpaintImageTool.parameters["steps"].description
 
 
 def test_qwen_keeps_its_own_floor_and_reports_it(comfy, photo, monkeypatch, tmp_path):
