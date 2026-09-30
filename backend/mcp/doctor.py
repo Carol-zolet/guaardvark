@@ -77,8 +77,16 @@ def _check_build() -> bool:
             _server, stats = build_server()
     except Exception as exc:
         return _report(_FAIL, "build_server()", f"{exc.__class__.__name__}: {exc}")
+    # The server's own figure is capped for its startup banner; the operator
+    # asking what an agent can read gets the full count.
+    try:
+        from backend.mcp.config import load_config
+        from backend.mcp.resources_adapter import count_resources
+        resources = str(count_resources(load_config()))
+    except Exception as exc:
+        resources = f"unknown ({exc.__class__.__name__}: {exc})"
     return _report(_PASS, "build_server()",
-                   f"{stats['tools']} tools, {stats['resources']} resources exposed")
+                   f"{stats['tools']} tools, {resources} resources exposed")
 
 
 async def _stdio_roundtrip(timeout: float = 60.0) -> tuple[bool, str]:

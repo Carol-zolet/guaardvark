@@ -10,9 +10,13 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import subprocess
+import threading
+import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import quote
 
 from backend.services.agent_tools import BaseTool, ToolParameter, ToolResult
 from backend.utils.backend_http import BackendError, is_mcp_transport, request_json
@@ -23,6 +27,11 @@ _SWARM_OFFLINE_ERROR = (
     "Swarm plugin is not running (port 8210). Start it from /plugins or say so — "
     "do not pretend a swarm launched."
 )
+
+# Swarm ids look like "swarm-20260930-120000-a1b2c3" (generate_swarm_id in
+# plugins/swarm/service/models.py). The id becomes a URL path segment, so
+# anything else, such as "../../gpu/status", is refused rather than sent.
+_SWARM_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 _LOG_ALLOWLIST = frozenset({
     "backend.log",
@@ -58,11 +67,23 @@ def _safe_root(root_arg: Optional[str]) -> Path:
     base = _repo_root()
     if not root_arg:
         return base
-    candidate = Path(root_arg).expanduser().resolve()
+    candidate = Path(root_arg).expanduser()
+    if not candidate.is_absolute():
+        candidate = base / candidate
+    candidate = candidate.resolve()
     try:
-        candidate.relative_to(base)
+        rel = candidate.relative_to(base)
     except ValueError as exc:
         raise ValueError(f"root must be inside the Guaardvark tree ({base})") from exc
+    # The mapper skips these folders at any depth below the checkout, so a root
+    # inside one (data/uploads, logs, a venv) is refused rather than mapped.
+    from backend.services.system_mapper.core import DEFAULT_EXCLUDE_DIRS
+    skipped = next((part for part in rel.parts if part in DEFAULT_EXCLUDE_DIRS), None)
+    if skipped:
+        raise ValueError(
+            f"root is inside '{skipped}', a folder the System Mapper always skips. "
+            "For an uploaded Code Repository use get_repository_map or get_dependency_graph."
+        )
     if not candidate.is_dir():
         raise ValueError(f"Not a directory: {candidate}")
     return candidate
@@ -76,6 +97,133 @@ def _load_snapshot(root: Path, refresh: bool) -> dict:
         # err is (jsonify_response, status) — unwrap for the tool
         raise RuntimeError(f"system map failed for {root}")
     return payload
+
+
+# How long map_codebase waits for a map being computed before answering with
+# what it has. Measured 2026-09-30 on one workstation: a clean checkout
+# (1,454 source files) maps in about 15 s, 7 s of it the tool-registry
+# subprocess; a checkout also holding ~26,000 files of ignored worktree
+# copies took 126 s before that subprocess. MCP clients are cut off at 120 s
+# by default. 60 s is four times the clean-checkout time and half that cutoff.
+_MAP_WAIT_SECONDS = 60.0
+
+
+def _map_wait_seconds(over_mcp: bool) -> float:
+    """_MAP_WAIT_SECONDS, or half the MCP call timeout when that is shorter,
+    so the answer always reaches an MCP client before it gives up."""
+    if not over_mcp:
+        return _MAP_WAIT_SECONDS
+    try:
+        from backend.mcp.config import load_config
+        return min(_MAP_WAIT_SECONDS, max(1.0, load_config().timeout_seconds / 2))
+    except Exception:
+        return _MAP_WAIT_SECONDS
+
+
+class _MapJob:
+    """One background map computation for one root."""
+
+    def __init__(self) -> None:
+        self.started = time.time()
+        self.done = threading.Event()
+        self.payload: Optional[dict] = None
+        self.error: Optional[str] = None
+
+
+_map_jobs: Dict[str, _MapJob] = {}
+_map_jobs_lock = threading.Lock()
+
+
+def _run_map_job(root: Path, job: _MapJob) -> None:
+    try:
+        from backend.api.system_map_api import compute_and_cache
+        job.payload = compute_and_cache(root)
+    except Exception as exc:
+        logger.exception("map_codebase: background map of %s failed", root)
+        job.error = str(exc) or type(exc).__name__
+    finally:
+        job.done.set()
+
+
+def _map_job(root: Path) -> _MapJob:
+    """The computation running for root, or a new one started in the
+    background. A root never has two at once, so a retry joins the first."""
+    key = str(root)
+    with _map_jobs_lock:
+        job = _map_jobs.get(key)
+        if job is not None and not job.done.is_set():
+            return job
+        job = _MapJob()
+        _map_jobs[key] = job
+    threading.Thread(target=_run_map_job, args=(root, job), name="map_codebase", daemon=True).start()
+    return job
+
+
+def _age_text(seconds: float) -> str:
+    seconds = int(seconds)
+    if seconds < 120:
+        return f"{seconds} s"
+    if seconds < 7200:
+        return f"{seconds // 60} min"
+    if seconds < 172800:
+        return f"{seconds // 3600} h"
+    return f"{seconds // 86400} days"
+
+
+def _map_snapshot(root: Path, refresh: bool, wait_seconds: float) -> Tuple[Optional[dict], Optional[str]]:
+    """(snapshot, note), never blocking longer than wait_seconds.
+
+    A map under the cache TTL is returned as is. Otherwise a background
+    computation is started, or the running one joined: an older map is
+    returned at once with its age, and when there is none, or refresh was
+    asked, the call first waits up to wait_seconds for the new one.
+    (None, note) means there is nothing to show yet.
+    """
+    from backend.api.system_map_api import CACHE_TTL_SECONDS, read_cached
+
+    cached, age = read_cached(root)
+    if cached is not None and age < CACHE_TTL_SECONDS and not refresh:
+        cached["_cache"] = {"hit": True, "age_seconds": int(age), "ttl_seconds": CACHE_TTL_SECONDS}
+        return cached, None
+
+    job = _map_job(root)
+    if cached is None or refresh:
+        job.done.wait(wait_seconds)
+
+    if job.done.is_set() and job.error is None and job.payload is not None:
+        return job.payload, None
+
+    if job.done.is_set():
+        if cached is None:
+            raise RuntimeError(f"system map failed for {root}: {job.error}")
+        cached["_cache"] = {
+            "hit": True, "stale": age >= CACHE_TTL_SECONDS, "age_seconds": int(age),
+            "ttl_seconds": CACHE_TTL_SECONDS, "refresh_error": job.error,
+        }
+        return cached, (
+            f"Computing a new map failed ({job.error}). This is the last map, "
+            f"{_age_text(age)} old."
+        )
+
+    running = int(time.time() - job.started)
+    if cached is not None:
+        cached["_cache"] = {
+            "hit": True, "stale": age >= CACHE_TTL_SECONDS, "age_seconds": int(age),
+            "ttl_seconds": CACHE_TTL_SECONDS, "refreshing": True,
+            "refresh_running_seconds": running,
+        }
+        return cached, (
+            f"This map is {_age_text(age)} old. A new one has been computing in the "
+            f"background for {running} s; call map_codebase again later to get it, or "
+            "with refresh=true to wait for it. Calling again never starts a second "
+            "computation."
+        )
+    return None, (
+        f"No map of this folder exists yet. It has been computing in the background "
+        f"for {running} s (seconds on a typical checkout, minutes on a very large "
+        "one). Call map_codebase again with the same root in a minute or two to get "
+        "it; calling again does not start a second computation."
+    )
 
 
 def _nvidia_smi() -> Dict[str, Any]:
@@ -116,22 +264,31 @@ class MapCodebaseTool(BaseTool):
     name = "map_codebase"
     read_only = True
     description = (
-        "Run the System Mapper (same snapshot as /system-map) and return stats plus "
-        "ranked findings. Use when the user says 'use the system mapper', 'map the "
-        "codebase', 'what's wrong with this repo', or 'constellation findings'."
+        "Run the System Mapper over Guaardvark's own source checkout, or a folder inside it, and "
+        "return JSON: file_count, languages, per-analyzer stats, finding_count and the top findings, "
+        "most severe first, each with id, kind (e.g. import-cycle, ghost-endpoint, dead-symbol, "
+        "untested-module), severity, summary and up to 6 paths; dismissed findings are left out. "
+        "Mostly static analysis of the files; mapping the whole checkout also loads its tool registry "
+        "in an offline subprocess. Needs no backend, network or GPU. Never blocks for long: a map under "
+        "5 minutes old comes back as is; an older one comes back at once with its age (cache.age_seconds "
+        "and a note) while a new one is computed in the background, one per folder at a time. When no "
+        "map exists yet, or refresh=true, it waits up to 60 s for the new map; if that is not enough it "
+        "answers with status 'computing' (or the last map and a note), and calling again later returns "
+        "the result without starting a second computation. For an uploaded Code Repository folder use "
+        "get_repository_map or get_dependency_graph; to find code by meaning, search_codebase."
     )
     parameters = {
         "refresh": ToolParameter(
             name="refresh", type="bool", required=False, default=False,
-            description="Ignore the 5-minute disk cache and recompute.",
+            description="true: compute a new map now, rescanning every source file under root, and wait up to 60 s for it (otherwise the last map, or status 'computing', comes back and the new map lands in the background). false (default): return the last map, refreshing one older than 5 minutes in the background.",
         ),
         "root": ToolParameter(
             name="root", type="string", required=False, default="",
-            description="Code root. Defaults to GUAARDVARK_ROOT. Must stay inside that tree.",
+            description="Folder inside the Guaardvark checkout to map instead of all of it, absolute or relative to the checkout (e.g. 'backend/api'); paths outside are refused. Folders named data, logs, backups, outputs, build, dist, env, venv, node_modules, migrations, plans, audit, voice or ComfyUI, among others, are always skipped, and a root inside one is refused.",
         ),
         "limit": ToolParameter(
-            name="limit", type="int", required=False, default=15,
-            description="Max findings to return (default 15).",
+            name="limit", type="int", required=False, default=15, minimum=1, maximum=40,
+            description="How many findings to return, most severe first, 1-40 (default 15). finding_count still gives the total.",
         ),
     }
 
@@ -140,7 +297,13 @@ class MapCodebaseTool(BaseTool):
             root = _safe_root(kwargs.get("root") or None)
             refresh = bool(kwargs.get("refresh", False))
             limit = int(kwargs.get("limit") or 15)
-            snapshot = _load_snapshot(root, refresh)
+            snapshot, note = _map_snapshot(root, refresh, _map_wait_seconds(is_mcp_transport(self)))
+            if snapshot is None:
+                return ToolResult(
+                    success=True,
+                    output={"status": "computing", "root": str(root), "note": note},
+                    metadata={"root": str(root), "computing": True},
+                )
             from backend.services.system_mapper.actions import ranked_findings
 
             findings = ranked_findings(snapshot, root)
@@ -162,7 +325,12 @@ class MapCodebaseTool(BaseTool):
                 "finding_count": len(findings),
                 "findings": slim,
                 "cache": snapshot.get("_cache"),
+                "note": note,
+                # dispatch_map_finding needs a person's approval and is not offered over MCP.
                 "hint": (
+                    "To hand a dispatchable finding to self-improvement, open the System Map page "
+                    "(/system-map) in Guaardvark."
+                    if is_mcp_transport(self) else
                     "Call dispatch_map_finding with a finding id to hand a "
                     "dispatchable finding to self-improvement (PendingFix)."
                 ),
@@ -377,12 +545,22 @@ class SwarmStatusTool(BaseTool):
     parameters = {
         "swarm_id": ToolParameter(
             name="swarm_id", type="string", required=False, default="",
-            description="Optional swarm id for a single swarm.",
+            description="Optional id of one swarm, as the launch returned it, e.g. 'swarm-20260930-120000-a1b2c3' (letters, digits, '-' and '_' only).",
         ),
     }
 
     def execute(self, **kwargs) -> ToolResult:
         swarm_id = (kwargs.get("swarm_id") or "").strip()
+        if swarm_id and not _SWARM_ID_RE.match(swarm_id):
+            return ToolResult(
+                success=False,
+                error=(
+                    "swarm_id must be a swarm id such as 'swarm-20260930-120000-a1b2c3': "
+                    "letters, digits, '-' and '_', at most 64 characters. Leave it empty "
+                    "to list every swarm."
+                ),
+            )
+        swarm_id = quote(swarm_id, safe="")
         if is_mcp_transport(self):
             return self._status_via_backend(swarm_id)
 
@@ -471,19 +649,20 @@ class SelfImprovementStatusTool(BaseTool):
     description = (
         "Report whether self-improvement can run (codebase lock, enabled flag, "
         "already running) plus recent runs and PendingFix rows. Use when the user "
-        "asks if SI is on, why a fix didn't apply, or what pending fixes exist."
+        "asks if SI is on, why a fix didn't apply, or what pending fixes exist. "
+        "Over MCP every part comes from the running Guaardvark backend; when it is "
+        "not answering, the call fails and says so."
     )
     parameters: Dict[str, ToolParameter] = {}
 
     def execute(self, **kwargs) -> ToolResult:
+        if is_mcp_transport(self):
+            return self._status_via_backend()
         try:
             from backend.services.self_improvement_service import get_self_improvement_service
             svc = get_self_improvement_service()
             pre = svc.dispatch_precheck()
             payload: Dict[str, Any] = {"precheck": pre, "runs": [], "pending_fixes": []}
-            if is_mcp_transport(self):
-                payload.update(self._history_via_backend())
-                return ToolResult(success=True, output=payload)
             try:
                 from backend.models import PendingFix, SelfImprovementRun, db
                 runs = (
@@ -522,6 +701,28 @@ class SelfImprovementStatusTool(BaseTool):
         except Exception as e:
             logger.exception("self_improvement_status failed")
             return ToolResult(success=False, error=str(e))
+
+    def _status_via_backend(self) -> ToolResult:
+        """The whole answer from the backend.
+
+        The precheck reads the database and the running service's state, and
+        this process has neither: computed here it could only ever say
+        "disabled". A backend that is not answering is reported as that.
+        """
+        try:
+            pre = request_json("GET", "/api/self-improvement/precheck").data
+        except BackendError as e:
+            if e.kind in ("unreachable", "timeout", "auth"):
+                return ToolResult(success=False, error=str(e), metadata={"backend_error": e.kind})
+            pre = {
+                "ok": None,
+                "reason": f"The backend did not report whether self-improvement can run: {e}",
+            }
+        if not isinstance(pre, dict) or "ok" not in pre:
+            pre = {"ok": None, "reason": "The backend's precheck answer had no 'ok' field."}
+        payload: Dict[str, Any] = {"precheck": pre, "runs": [], "pending_fixes": []}
+        payload.update(self._history_via_backend())
+        return ToolResult(success=True, output=payload)
 
     @staticmethod
     def _history_via_backend() -> Dict[str, Any]:

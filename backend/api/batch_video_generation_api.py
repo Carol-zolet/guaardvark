@@ -155,7 +155,8 @@ def _withheld_style_error(params: dict):
 def _resolve_request_model(data, role: str):
     """Explicit body model, else the active-video-model resolver."""
     explicit = (data.get("model") or "").strip() or None
-    model_id, err = resolve_active_video_model(role, explicit)
+    # Both routes run prepare_video_model next, which starts a stopped ComfyUI.
+    model_id, err = resolve_active_video_model(role, explicit, comfyui_down_ok=True)
     if err:
         return None, err
     return model_id, None
@@ -982,8 +983,8 @@ def list_video_models():
     try:
         models = []
         total_vram_mb = _detected_total_vram_mb()
-        active_t2v, _ = resolve_active_video_model("t2v")
-        active_i2v, _ = resolve_active_video_model("i2v")
+        active_t2v, _ = resolve_active_video_model("t2v", comfyui_down_ok=True)
+        active_i2v, _ = resolve_active_video_model("i2v", comfyui_down_ok=True)
         for model_id, info in VIDEO_MODEL_REGISTRY.items():
             plan = _resolve_download_plan(model_id)
             requires = info.get("requires", [])

@@ -2,13 +2,14 @@
 One-command client setup: ``python -m backend.mcp install``.
 
 Writes (or merges) a ``guaardvark`` MCP server entry into the config of each
-detected agent client — Cursor, Claude Code, Grok, Claude Desktop, Zed,
-Gemini — instead of asking the user to paste JSON by hand.
+detected agent client — Cursor, Claude Code, Codex, Grok, Antigravity,
+opencode, Claude Desktop, Zed, Gemini — instead of asking the user to paste
+JSON by hand.
 
 Safety rules:
   * Existing config files are backed up (``<file>.guaardvark-backup``) before
     the first rewrite, and other server entries are never touched.
-  * CLI-based clients (claude, grok) are configured through their own
+  * CLI-based clients (claude, codex, grok, agy) are configured through their own
     ``mcp add`` commands so we never hand-edit files those tools own.
   * All paths are computed at runtime from this checkout's location; nothing
     machine-specific is baked in.
@@ -34,7 +35,8 @@ from backend.mcp.cli import (
 
 SERVER_NAME = "guaardvark"
 
-CLIENTS = ("cursor", "claude-code", "grok", "claude-desktop", "zed", "gemini")
+CLIENTS = ("cursor", "claude-code", "codex", "grok", "antigravity", "opencode",
+           "claude-desktop", "zed", "gemini")
 
 
 def _shell_wrapper() -> tuple[str, list[str]]:
@@ -72,8 +74,14 @@ def _detect(client: str) -> bool:
         return bool(shutil.which("cursor-agent")) or (home / ".cursor").is_dir()
     if client == "claude-code":
         return bool(shutil.which("claude"))
+    if client == "codex":
+        return bool(shutil.which("codex")) or (home / ".codex").is_dir()
     if client == "grok":
         return bool(shutil.which("grok"))
+    if client == "antigravity":
+        return bool(shutil.which("agy"))
+    if client == "opencode":
+        return bool(shutil.which("opencode")) or _opencode_config_path().parent.is_dir()
     if client == "claude-desktop":
         return _claude_desktop_config_path().parent.is_dir()
     if client == "zed":
@@ -165,6 +173,36 @@ def _install_grok(dry_run: bool) -> str:
     )
 
 
+def _install_codex(dry_run: bool) -> str:
+    command, args = _shell_wrapper()
+    return _run_cli(["codex", "mcp", "add", SERVER_NAME, "--", command, *args], dry_run)
+
+
+def _install_antigravity(dry_run: bool) -> str:
+    command, args = _shell_wrapper()
+    return _run_cli(["agy", "mcp", "add", SERVER_NAME, "--", command, *args], dry_run)
+
+
+def _opencode_config_path() -> Path:
+    import os
+
+    base = os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")
+    return Path(base) / "opencode" / "opencode.json"
+
+
+def _install_opencode(dry_run: bool) -> str:
+    # opencode's own `mcp add` is interactive, so its JSON config is merged here.
+    def mutate(data: dict[str, Any]) -> None:
+        servers = data.setdefault("mcp", {})
+        if not isinstance(servers, dict):
+            raise ValueError("existing 'mcp' key is not an object")
+        command, args = _shell_wrapper()
+        servers[SERVER_NAME] = {"type": "local", "command": [command, *args], "enabled": True}
+        data.setdefault("$schema", "https://opencode.ai/config.json")
+
+    return _merge_json_config(_opencode_config_path(), mutate, dry_run)
+
+
 def _install_claude_desktop(dry_run: bool) -> str:
     return _merge_json_config(
         _claude_desktop_config_path(), _set_mcp_servers_entry, dry_run)
@@ -191,7 +229,10 @@ def _install_gemini(dry_run: bool) -> str:
 _INSTALLERS: dict[str, Callable[[bool], str]] = {
     "cursor": _install_cursor,
     "claude-code": _install_claude_code,
+    "codex": _install_codex,
     "grok": _install_grok,
+    "antigravity": _install_antigravity,
+    "opencode": _install_opencode,
     "claude-desktop": _install_claude_desktop,
     "zed": _install_zed,
     "gemini": _install_gemini,

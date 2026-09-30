@@ -65,6 +65,8 @@ def _configure_logging(cmd: str | None, verbose: bool = False) -> None:
 
 
 def _build_parser() -> argparse.ArgumentParser:
+    from backend.mcp.installer import CLIENTS
+
     parser = argparse.ArgumentParser(prog="python -m backend.mcp")
     sub = parser.add_subparsers(dest="cmd")
 
@@ -84,13 +86,13 @@ def _build_parser() -> argparse.ArgumentParser:
 
     install_cmd = sub.add_parser(
         "install",
-        help="Write the guaardvark entry into agent client configs (Cursor, Claude, Grok, ...)",
+        help="Write the guaardvark entry into agent client configs (Cursor, Claude, Codex, Grok, ...)",
     )
     install_cmd.add_argument(
         "--client",
         action="append",
         dest="clients",
-        choices=("cursor", "claude-code", "grok", "claude-desktop", "zed", "gemini"),
+        choices=CLIENTS,
         help="Client to configure (repeatable). Default: every client detected on this machine.",
     )
     install_cmd.add_argument(

@@ -3,14 +3,18 @@
 Media Player Service - MPRIS2 control via gdbus, VLC launch, and music file search.
 """
 
+import fcntl
 import json
 import logging
 import os
 import re
+import signal
 import subprocess
 import threading
+import time
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +28,121 @@ MPRIS2_BUS_PREFIX = "org.mpris.MediaPlayer2."
 MPRIS2_OBJECT_PATH = "/org/mpris/MediaPlayer2"
 MPRIS2_PLAYER_IFACE = "org.mpris.MediaPlayer2.Player"
 MPRIS2_PROPS_IFACE = "org.freedesktop.DBus.Properties"
+
+# A GVariant string as gdbus prints it: single-quoted, or double-quoted when the
+# text itself contains a single quote ("Don't Stop"), with backslash escapes.
+_GV_STRING = r"""(?:'((?:[^'\\]|\\.)*)'|"((?:[^"\\]|\\.)*)")"""
+
+# GLib writes control characters as \n \t \r \a \b \f \v, other unprintable
+# characters as \uXXXX or \UXXXXXXXX, and puts a backslash before \ ' and ".
+_GV_ESCAPES = {"n": "\n", "t": "\t", "r": "\r", "a": "\a", "b": "\b", "f": "\f", "v": "\v"}
+_GV_ESCAPE = re.compile(r"\\(u[0-9a-fA-F]{4}|U[0-9a-fA-F]{8}|.)", re.DOTALL)
+
+
+def _gv_unescape(raw: str) -> str:
+    def one(match: "re.Match") -> str:
+        esc = match.group(1)
+        if len(esc) > 1:
+            code = int(esc[1:], 16)
+            return chr(code) if code <= 0x10FFFF and not 0xD800 <= code <= 0xDFFF else "�"
+        return _GV_ESCAPES.get(esc, esc)
+    return _GV_ESCAPE.sub(one, raw)
+
+
+def _gv_text(match: "re.Match", first_group: int = 1) -> str:
+    raw = match.group(first_group) if match.group(first_group) is not None else match.group(first_group + 1)
+    return _gv_unescape(raw or "")
+
+
+def _vlc_pidfile() -> Path:
+    """Where the VLC that Guaardvark started is recorded as "<pid> <starttime>",
+    shared by the chat and MCP processes so either can replace it without touching
+    other players. It lives in the git-ignored cache folder."""
+    try:
+        from backend.config import CACHE_DIR
+        base = Path(CACHE_DIR)
+    except Exception:
+        base = Path(__file__).resolve().parents[2] / "data" / "cache"
+    return base / "media" / "vlc.pid"
+
+
+@contextmanager
+def _vlc_launch_lock():
+    """Serialise replacing and launching VLC across threads and processes, so two
+    plays at once (chat and MCP) cannot both start a VLC and record only one."""
+    lock_path = _vlc_pidfile().with_name("vlc.lock")
+    handle = None
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        handle = open(lock_path, "a")
+        fcntl.flock(handle, fcntl.LOCK_EX)
+    except OSError as e:
+        logger.debug(f"Could not take the VLC launch lock: {e}")
+    try:
+        yield
+    finally:
+        if handle:
+            handle.close()
+
+
+def _proc_stat(pid: int) -> Optional[Tuple[str, str]]:
+    """(state, starttime) of a process, from fields 3 and 22 of /proc/<pid>/stat,
+    or None when there is no such process. Field 2 (the command name) may contain
+    spaces and ')', so the fields are counted from after the last ')'."""
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+    except OSError:
+        return None
+    fields = stat[stat.rfind(")") + 1:].split()
+    if len(fields) < 20:
+        return None
+    return fields[0], fields[19]
+
+
+def _proc_is_vlc(pid: int) -> bool:
+    """True when the process's executable or argv[0] is named exactly 'vlc'."""
+    names = []
+    try:
+        names.append(os.readlink(f"/proc/{pid}/exe").removesuffix(" (deleted)"))
+    except OSError:
+        pass
+    try:
+        argv0 = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0", 1)[0]
+        names.append(argv0.decode(errors="replace"))
+    except OSError:
+        pass
+    return any(os.path.basename(name) == "vlc" for name in names)
+
+
+def _proc_gone(pid: int, started: str) -> bool:
+    """True when the process recorded with this start time has exited (a zombie
+    counts as exited) or its PID now belongs to another process."""
+    stat = _proc_stat(pid)
+    return stat is None or stat[1] != started or stat[0] in ("Z", "X")
+
+
+# Top-level folders that hold the system rather than music. /run/media (removable
+# drives) is allowed, and so is everything inside the home folder, which some
+# systems keep under /var (/var/home).
+_SYSTEM_TOP_FOLDERS = {"etc", "proc", "sys", "dev", "boot", "root", "run", "var", "usr", "bin", "sbin"}
+
+
+def _folder_refusal(folder: Path) -> Optional[str]:
+    """Why a resolved absolute folder may not be played, or None when it may."""
+    home = Path.home().resolve()
+    if home != Path("/") and (folder == home or home in folder.parents):
+        inside = folder.relative_to(home).parts
+    else:
+        inside = folder.parts[1:]
+        if not inside:
+            return "is the root folder"
+        top = inside[0]
+        if (top in _SYSTEM_TOP_FOLDERS or top.startswith("lib")) and inside[:2] != ("run", "media"):
+            return f"is in a system folder (/{top})"
+    hidden = next((part for part in inside if part.startswith(".")), None)
+    if hidden:
+        return f"is in a hidden folder ({hidden})"
+    return None
 
 
 class MediaPlayerService:
@@ -50,14 +169,26 @@ class MediaPlayerService:
         logger.info("MediaPlayerService initialized")
 
     def _get_music_directory(self) -> str:
-        """Read music directory from DB settings, fall back to ~/Music."""
-        try:
-            from backend.models import db, Setting
-            setting = db.session.get(Setting, "music_directory")
-            if setting and setting.value and setting.value.strip():
-                return setting.value.strip()
-        except Exception as e:
-            logger.debug(f"Could not read music_directory setting: {e}")
+        """Read music directory from DB settings, fall back to ~/Music. The MCP
+        server has no app database, so there it asks the backend."""
+        from backend.utils.backend_http import in_mcp_process
+        if in_mcp_process():
+            try:
+                from backend.utils.backend_http import request_json
+                value = ((request_json("GET", "/api/settings/music_directory").data or {})
+                         .get("music_directory") or "").strip()
+                if value:
+                    return value
+            except Exception as e:
+                logger.debug(f"Could not read music_directory from the backend: {e}")
+        else:
+            try:
+                from backend.models import db, Setting
+                setting = db.session.get(Setting, "music_directory")
+                if setting and setting.value and setting.value.strip():
+                    return setting.value.strip()
+            except Exception as e:
+                logger.debug(f"Could not read music_directory setting: {e}")
         return str(Path.home() / "Music")
 
     # ===== gdbus helpers =====
@@ -106,7 +237,7 @@ class MediaPlayerService:
             if name.startswith(MPRIS2_BUS_PREFIX):
                 return name
 
-        raise RuntimeError("No media player is currently running. Say 'play <something>' to start.")
+        raise RuntimeError("No media player is running.")
 
     def _player_display_name(self, bus_name: str) -> str:
         if bus_name.startswith(MPRIS2_BUS_PREFIX):
@@ -212,21 +343,24 @@ class MediaPlayerService:
         info: Dict[str, Any] = {"title": "Unknown", "artist": "Unknown", "album": "Unknown"}
 
         # Extract title: 'xesam:title': <'Some Title'>
-        title = re.search(r"'xesam:title':\s*<'([^']*)'", raw)
-        if title:
-            info["title"] = title.group(1)
+        title = re.search(r"'xesam:title':\s*<" + _GV_STRING, raw)
+        title_text = _gv_text(title).strip() if title else ""
+        if title_text:
+            info["title"] = title_text
 
-        # Extract artist: 'xesam:artist': <['Artist1', 'Artist2']>
-        artist = re.search(r"'xesam:artist':\s*<\[([^\]]*)\]>", raw)
+        # Extract artist: 'xesam:artist': <['Artist1', "Guns N' Roses"]>
+        artist = re.search(r"'xesam:artist':\s*<\[((?:" + _GV_STRING + r"|[\s,])*)\]>", raw)
         if artist:
-            artists = re.findall(r"'([^']*)'", artist.group(1))
+            artists = [_gv_text(m).strip() for m in re.finditer(_GV_STRING, artist.group(1))]
+            artists = [a for a in artists if a]
             if artists:
                 info["artist"] = ", ".join(artists)
 
         # Extract album
-        album = re.search(r"'xesam:album':\s*<'([^']*)'", raw)
-        if album:
-            info["album"] = album.group(1)
+        album = re.search(r"'xesam:album':\s*<" + _GV_STRING, raw)
+        album_text = _gv_text(album).strip() if album else ""
+        if album_text:
+            info["album"] = album_text
 
         # Extract length (microseconds)
         length = re.search(r"'mpris:length':\s*<(?:int64\s+|uint64\s+)?(\d+)>", raw)
@@ -234,9 +368,19 @@ class MediaPlayerService:
             info["length_seconds"] = int(length.group(1)) // 1_000_000
 
         # Extract art URL
-        art = re.search(r"'mpris:artUrl':\s*<'([^']*)'", raw)
+        art = re.search(r"'mpris:artUrl':\s*<" + _GV_STRING, raw)
         if art:
-            info["art_url"] = art.group(1)
+            info["art_url"] = _gv_text(art)
+
+        # With no title tag, or an empty one, the file name without its
+        # extension is the next best thing.
+        if not title_text:
+            url = re.search(r"'xesam:url':\s*<" + _GV_STRING, raw)
+            if url:
+                from urllib.parse import unquote, urlparse
+                name = Path(unquote(urlparse(_gv_text(url)).path)).stem
+                if name:
+                    info["title"] = name
 
         return info
 
@@ -333,26 +477,92 @@ class MediaPlayerService:
     # ===== VLC Launch =====
 
     def _kill_existing_vlc(self):
-        """Kill any existing VLC instances before launching a new one."""
+        """End the VLC that Guaardvark started last and wait up to 2 s for it to
+        exit. The pidfile outlives VLC and reboots and PIDs are reused, so the
+        process is signalled only while its start time matches the one recorded
+        and its executable or argv[0] is vlc. Players the user started are left
+        alone. Call with _vlc_launch_lock held."""
+        pidfile = _vlc_pidfile()
         try:
-            subprocess.run(["pkill", "-f", "vlc"], capture_output=True, timeout=3)
-        except Exception:
+            recorded = pidfile.read_text().strip()
+        except OSError:
+            return
+        try:
+            pidfile.unlink()
+        except OSError:
             pass
+        # "<pid> <starttime>"; anything else, such as a pid-only file, is stale.
+        match = re.fullmatch(r"([0-9]+) ([0-9]+)", recorded)
+        if not match:
+            return
+        pid, started = int(match.group(1)), match.group(2)
+
+        # A VLC launched a moment ago may still be in its launcher (snap run, a
+        # wrapper script) on the way to exec'ing vlc under the same PID.
+        deadline = time.monotonic() + 2.0
+        while not _proc_is_vlc(pid):
+            if _proc_gone(pid, started) or time.monotonic() >= deadline:
+                return
+            time.sleep(0.05)
+        if _proc_gone(pid, started):
+            return
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            return
+
+        # Wait for it to exit so the new VLC does not start beside it.
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            try:
+                os.waitpid(pid, os.WNOHANG)  # reaps it when this process started it
+            except OSError:
+                pass
+            if _proc_gone(pid, started):
+                return
+            time.sleep(0.05)
+        logger.debug(f"VLC {pid} was still running 2 s after SIGTERM")
+
+    def _record_vlc(self, pid: int) -> None:
+        stat = _proc_stat(pid)
+        if not stat:
+            return
+        try:
+            pidfile = _vlc_pidfile()
+            pidfile.parent.mkdir(parents=True, exist_ok=True)
+            pidfile.write_text(f"{pid} {stat[1]}")
+        except OSError as e:
+            logger.debug(f"Could not record the VLC pid: {e}")
 
     def launch_vlc(self, files: Optional[List[str]] = None, directory: Optional[str] = None,
                    shuffle: bool = False) -> Dict[str, Any]:
-        """Launch VLC with specified files or directory. Kills existing VLC first."""
+        """Start VLC on files or a folder, replacing the VLC Guaardvark started
+        before. A directory must be an existing absolute folder, and not the root,
+        a system or a hidden folder unless it is inside the Settings music folder."""
         if not MEDIA_CONTROL_ENABLED:
             return {"success": False, "error": "Media control disabled"}
 
-        # Kill any existing VLC to avoid multiple instances
-        self._kill_existing_vlc()
+        if directory:
+            folder = Path(directory).expanduser()
+            if not folder.is_absolute() or not folder.is_dir():
+                return {"success": False, "error": f"'{directory}' is not an existing folder (give an absolute path)"}
+            folder = folder.resolve()
+            refusal = _folder_refusal(folder)
+            if refusal:
+                music = Path(self._get_music_directory()).expanduser().resolve()
+                if folder != music and music not in folder.parents:
+                    return {"success": False,
+                            "error": f"'{directory}' {refusal}; name a folder of music instead"}
+            directory = str(folder)
 
         vlc_cmd = VLC_PATH
         if not os.path.exists(vlc_cmd):
             vlc_cmd = "vlc"
 
-        cmd = [vlc_cmd]
+        # --no-one-instance: with VLC's "Allow only one instance" preference on, a
+        # new vlc hands its playlist to a VLC the user already has open and exits.
+        # --no-metadata-network-access: no album-art or metadata lookups online.
+        cmd = [vlc_cmd, "--no-one-instance", "--no-metadata-network-access"]
         if shuffle:
             cmd.append("--random")
 
@@ -363,26 +573,31 @@ class MediaPlayerService:
         else:
             return {"success": False, "error": "No files or directory specified"}
 
-        try:
-            proc = subprocess.Popen(
-                cmd,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                start_new_session=True,
-            )
-            file_count = len(files) if files else 0
-            return {
-                "success": True,
-                "pid": proc.pid,
-                "file_count": file_count,
-                "directory": directory,
-                "shuffle": shuffle,
-                "action": "launched VLC",
-            }
-        except FileNotFoundError:
-            return {"success": False, "error": "VLC not found. Install VLC to play music."}
-        except Exception as e:
-            return {"success": False, "error": f"Failed to launch VLC: {e}"}
+        with _vlc_launch_lock():
+            # Replace the VLC Guaardvark started before, so playlists do not pile up.
+            self._kill_existing_vlc()
+            try:
+                proc = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    start_new_session=True,
+                )
+            except FileNotFoundError:
+                return {"success": False, "error": "VLC not found. Install VLC to play music."}
+            except Exception as e:
+                return {"success": False, "error": f"Failed to launch VLC: {e}"}
+            self._record_vlc(proc.pid)
+
+        file_count = len(files) if files else 0
+        return {
+            "success": True,
+            "pid": proc.pid,
+            "file_count": file_count,
+            "directory": directory,
+            "shuffle": shuffle,
+            "action": "launched VLC",
+        }
 
     # ===== High-Level Play =====
 

@@ -279,7 +279,9 @@ def readonly_lifecycle_reason(relative_path: str) -> str | None:
 
 
 def forbidden_path_reason(relative_path: str) -> str | None:
-    normalized = relative_path.replace("\\", "/").strip("/")
+    # Compared case-folded: on a case-insensitive filesystem ".GIT/config" is
+    # the same file as ".git/config".
+    normalized = relative_path.replace("\\", "/").strip("/").lower()
     if not normalized:
         return "Empty path"
     parts = normalized.split("/")
@@ -293,6 +295,49 @@ def forbidden_path_reason(relative_path: str) -> str | None:
             return f"Self-code operations are not allowed inside '{segment}'"
     if parts[-1].startswith(".env"):
         return "Self-code operations are not allowed for environment files"
+    return None
+
+
+# Git-ignored paths are local data, not source, so the code-reading tools refuse
+# them. Uploads and outputs are the exception: Guaardvark already serves those
+# through its document and output tools, and uploaded code repositories live there.
+READABLE_IGNORED_PREFIXES = ("data/uploads/", "data/outputs/")
+# Used when the install is not a git checkout and check-ignore cannot answer.
+FALLBACK_PRIVATE_PREFIXES = ("docs/local-workspace-only/", "data/")
+
+
+def private_relative_paths(relative_paths: list[str], repo_root: str | Path | None = None) -> set[str]:
+    """Return the repo-relative paths that are local data rather than source.
+
+    A path is private when git ignores it (``.gitignore`` or ``.git/info/exclude``)
+    and it is not under READABLE_IGNORED_PREFIXES. Each path is also asked about
+    as a folder ("p/"), so a directory-only pattern such as "backups/" gives the
+    same answer whether or not the folder exists.
+    """
+    root = Path(repo_root).expanduser().resolve() if repo_root else default_repo_root()
+    candidates = [p.replace("\\", "/").lstrip("/") for p in relative_paths if p]
+    candidates = [p for p in candidates if not p.startswith(READABLE_IGNORED_PREFIXES)]
+    if not candidates:
+        return set()
+    queries = candidates + [p + "/" for p in candidates if not p.endswith("/")]
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(root), "check-ignore", "--stdin", "-z"],
+            input="\0".join(queries) + "\0",
+            capture_output=True, text=True, timeout=20,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        proc = None
+    if proc is not None and proc.returncode in (0, 1):
+        ignored = {p for p in proc.stdout.split("\0") if p}
+        return {p for p in candidates if p in ignored or p + "/" in ignored}
+    return {p for p in candidates if (p + "/").startswith(FALLBACK_PRIVATE_PREFIXES)}
+
+
+def private_path_reason(relative_path: str, repo_root: str | Path | None = None) -> str | None:
+    """Block reason for one repo-relative path that is git-ignored local data."""
+    if private_relative_paths([relative_path], repo_root):
+        return f"'{relative_path}' is git-ignored local data, not source code"
     return None
 
 

@@ -166,27 +166,40 @@ class WebAnalysisTool(BaseTool):
 
     name = "analyze_website"
     read_only = True
-    description = "Analyze a website URL to extract content, SEO information, structure, and provide insights"
+    description = (
+        "Audit one public web page's SEO live and return a JSON report, computed without an LLM: "
+        "url (as requested, https:// added to a bare domain) and final_url (after redirects), title, meta "
+        "description, a 500-character preview; a metadata block (on by default) checking title and "
+        "meta-description lengths against 30-60 and 120-160 characters; and, by analysis_type, an seo "
+        "block (word count of the page's main text, reading time, content density, https), a structure "
+        "block (domain, path, scheme, subdomain) "
+        "and an insights block (sentence stats, readability and keyword hints for article, product or "
+        "landing page, from the ~2000-character extract). Use it to audit a page's title and "
+        "description; to read the page use fetch_url, to find pages web_search. Needs web access on "
+        "in Settings (off by default), and over MCP the Guaardvark backend running; private and local "
+        "addresses are refused, including after a redirect or a DNS change."
+    )
 
     parameters = {
         "url": ToolParameter(
             name="url",
             type="string",
             required=True,
-            description="Website URL to analyze (with or without protocol)"
+            description="Page URL or bare domain, e.g. 'https://example.com/about' or 'example.com' (https:// is added). Up to 5 redirects are followed; each hop must be a public address. The fetch gives up if the server does not answer for 15 s."
         ),
         "analysis_type": ToolParameter(
             name="analysis_type",
             type="string",
             required=False,
-            description="Type of analysis: 'full', 'seo', 'content', 'structure' (default: 'full')",
+            enum=["full", "seo", "structure", "content"],
+            description="Which blocks to add: 'seo' (word_count and estimated_reading_time at 200 words a minute for the page's main text, content_density, has_https, title/description present), 'structure' (domain, path, scheme, has_subdomain, is_secure), 'content' (sentence_count, average_sentence_length, readability, content_type_hints), or 'full' (default) for all three.",
             default="full"
         ),
         "include_metadata": ToolParameter(
             name="include_metadata",
             type="bool",
             required=False,
-            description="Include metadata analysis (meta tags, Open Graph, etc.)",
+            description="Default true: add a metadata block with has_title, has_description, their lengths, and whether they fall within 30-60 and 120-160 characters. Open Graph and other meta tags are not read.",
             default=True
         ),
         "query": ToolParameter(
@@ -194,9 +207,9 @@ class WebAnalysisTool(BaseTool):
             type="string",
             required=False,
             description=(
-                "What the user wants to know from the page. When given, the content "
-                "excerpt is the stretch of the page about it instead of the top of "
-                "the page (which is often navigation)."
+                "The user's question, in their words. When given, the preview and the insights block "
+                "come from the ~2000-character stretch of the page that contains the most of its words "
+                "instead of the top of the page (often navigation)."
             ),
             default="",
         ),
@@ -230,18 +243,18 @@ class WebAnalysisTool(BaseTool):
             from backend.api.web_search_api import extract_website_content
 
             # Extract basic content
-            content_result = extract_website_content(url, query=query)
-            
+            content_result = extract_website_content(url, query=query, public_only=True)
+
             if not content_result.get("success"):
                 return ToolResult(
                     success=False,
                     error=content_result.get("error", "Failed to extract website content"),
-                    output={"url": url, "raw_error": content_result}
                 )
 
             # Build analysis report
             analysis = {
                 "url": content_result.get("url", url),
+                "final_url": content_result.get("final_url", content_result.get("url", url)),
                 "title": content_result.get("title", ""),
                 "description": content_result.get("description", ""),
                 "content_preview": content_result.get("content", "")[:500] + "..." if len(content_result.get("content", "")) > 500 else content_result.get("content", ""),
@@ -258,7 +271,7 @@ class WebAnalysisTool(BaseTool):
 
             # Add structure analysis
             if analysis_type in ("full", "structure"):
-                analysis["structure"] = self._analyze_structure(url, content_result)
+                analysis["structure"] = self._analyze_structure(analysis["final_url"], content_result)
 
             # Add content insights
             if analysis_type in ("full", "content"):
@@ -299,12 +312,10 @@ class WebAnalysisTool(BaseTool):
         title = content_result.get("title", "").lower()
         description = content_result.get("description", "").lower()
 
-        # Basic SEO metrics
-        word_count = len(content.split())
-        heading_count = content.count("<h1>") + content.count("<h2>") + content.count("<h3>")
-        
-        # Check for common SEO elements
-        has_https = content_result.get("url", "").startswith("https://")
+        # Counts cover the whole page text, not only the returned extract.
+        word_count = content_result.get("page_word_count") or len(content.split())
+        final_url = content_result.get("final_url") or content_result.get("url", "")
+        has_https = final_url.startswith("https://")
         
         return {
             "word_count": word_count,
@@ -391,11 +402,15 @@ class FetchUrlTool(BaseTool):
     name = "fetch_url"
     read_only = True
     description = (
-        "Fetch a specific URL and return its page title, meta description, and "
-        "main text content (up to ~2000 chars). Use this for ANY question about "
-        "a specific webpage or domain — e.g. 'what's on example.com', 'read "
-        "https://site.com/page', 'tell me about acme-example.ai'. For open-ended "
-        "searches without a specific URL, use web_search instead."
+        "Read one public web page live, for ANY question about a specific webpage or domain (e.g. "
+        "'what's on example.com', 'read https://site.com/page'). Returns JSON {url, final_url, title, "
+        "description, content, content_length}: the title ('' if the page has none), the meta "
+        "description and up to ~2000 characters of main text (scripts, styles, nav, footers and asides "
+        "removed; JavaScript is not run). Pass query with the user's question to get the stretch of the "
+        "page that contains the most of its words instead of the top of the page. For open-ended "
+        "searches use web_search; for a title and meta-description audit use analyze_website. Needs web "
+        "access on in Settings (off by default), and over MCP the Guaardvark backend running; private "
+        "and local addresses are refused, including after a redirect or a DNS change."
     )
 
     parameters = {
@@ -404,9 +419,9 @@ class FetchUrlTool(BaseTool):
             type="string",
             required=True,
             description=(
-                "URL or bare domain to fetch (e.g. 'https://example.com', "
-                "'example.com', 'www.example.com'). Protocol is optional — "
-                "https:// will be added automatically if missing."
+                "Page URL or bare domain, e.g. 'https://example.com/pricing' or 'example.com' "
+                "(https:// is added). Up to 5 redirects are followed; each hop must be a public "
+                "address. The fetch gives up if the server does not answer for 15 s."
             ),
         ),
         "query": ToolParameter(
@@ -414,9 +429,10 @@ class FetchUrlTool(BaseTool):
             type="string",
             required=False,
             description=(
-                "What the user wants to know from the page, in their words. When "
-                "given, the returned text is the ~2000-character stretch of the page "
-                "about it; without it, the top of the page, which is often navigation."
+                "The user's question, in their words. Its words of three or more letters or digits "
+                "(common stopwords ignored) pick the ~2000-character stretch with the most of them; "
+                "the top of the page is returned when there is no query, none of the words occur, "
+                "or the page already fits."
             ),
             default="",
         ),
@@ -445,12 +461,11 @@ class FetchUrlTool(BaseTool):
         try:
             from backend.api.web_search_api import extract_website_content
 
-            result = extract_website_content(url, query=query)
+            result = extract_website_content(url, query=query, public_only=True)
             if not result.get("success"):
                 return ToolResult(
                     success=False,
                     error=result.get("error", "Failed to fetch URL"),
-                    output={"url": url, "raw_error": result},
                 )
 
             # Return a flat, LLM-friendly shape. No SEO layers, no nested metadata —
@@ -459,6 +474,7 @@ class FetchUrlTool(BaseTool):
                 success=True,
                 output={
                     "url": result.get("url", url),
+                    "final_url": result.get("final_url", result.get("url", url)),
                     "title": result.get("title", ""),
                     "description": result.get("description", ""),
                     "content": result.get("content", ""),
@@ -529,8 +545,11 @@ class WebSearchTool(BaseTool):
 
         try:
             from backend.api.web_search_api import enhanced_web_search
+            from backend.utils.backend_http import is_mcp_transport
 
-            search_results = enhanced_web_search(query)
+            # A URL in the query is fetched directly; over MCP only a public
+            # address may be, as with fetch_url.
+            search_results = enhanced_web_search(query, public_only=is_mcp_transport(self))
 
             if not search_results or not search_results.get("success"):
                 error_msg = search_results.get("error") if search_results else "Web search failed"

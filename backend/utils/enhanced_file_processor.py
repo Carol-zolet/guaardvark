@@ -345,7 +345,8 @@ class XMLProcessor(FileProcessor):
             root = tree.getroot()
             
             # Extract text content
-            text_content = ET.tostring(root, encoding='unicode', method='text')
+            # One space between element texts, so words from adjacent elements stay apart.
+            text_content = " ".join(t.strip() for t in root.itertext() if t.strip())
             
             # Create structured representation
             structured_data = self._element_to_dict(root)
@@ -581,6 +582,7 @@ class ExcelProcessor(FileProcessor):
             
             # Extract structured data
             extraction_result = self.excel_extractor.extract_excel_content(file_path)
+            structured_data = None
             
             if extraction_result.get('success'):
                 structured_data = extraction_result.get('structured_data')

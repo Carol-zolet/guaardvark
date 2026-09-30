@@ -5,15 +5,18 @@ import logging
 import os
 import re
 import shutil
+import time
 import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+from backend.services import tool_jobs as _tool_jobs
 from backend.services.agent_tools import BaseTool, ToolParameter, ToolResult
+from backend.utils.backend_http import BackendError
 from backend.utils.backend_http import backend_base_url as _backend_base_url
 from backend.utils.backend_http import http_json as _http_json
-from backend.utils.backend_http import is_mcp_transport, run_tool_in_backend
+from backend.utils.backend_http import is_mcp_caller, is_mcp_transport, run_tool_in_backend
 from backend.services.job_types import RenderErrorKind, batch_failure, describe_failure, failure_kind, failure_text
 
 logger = logging.getLogger(__name__)
@@ -24,6 +27,23 @@ _KONTEXT_MODEL_IDS = frozenset({
 _QWEN_EDIT_MODEL_IDS = frozenset({
     "qwen", "qwen-image-edit", "qwen-edit", "qwenimage-edit",
 })
+
+# What the media-input parameters accept (rules: backend/utils/media_inputs.py).
+_SERVED_FORMS = (
+    "a URL an image or edit tool returned (/api/batch-image/image/<batch>/<file> or "
+    "/api/outputs/<path>, also with http://host:port in front), a guaardvark://outputs/<path> "
+    "resource URI"
+)
+_PATH_RULE = (
+    "Over MCP the file must be in Guaardvark's uploads folder or in an outputs folder MCP "
+    "resources serve (what resources/list shows); files named like keys or credentials "
+    "(.env, *.pem, *.key, id_rsa* and similar) are refused everywhere."
+)
+_IMAGE_INPUT_FORMS = f"{_SERVED_FORMS}, a data: URI, or a file path. {_PATH_RULE}"
+_VIDEO_INPUT_FORMS = (
+    f"a library document id or /api/files/document/<id>/download link, {_SERVED_FORMS}, "
+    f"or a file path. {_PATH_RULE}"
+)
 
 
 def _unwrap_nested_prompt_json(prompt: str) -> tuple[str, list[int]]:
@@ -210,6 +230,7 @@ class ImageGeneratorTool(BaseTool):
         "subject_ids": ToolParameter(
             name="subject_ids",
             type="list",
+            items="int",
             description=(
                 "Optional. Numeric Cast Library subject IDs with trained LoRAs to lock "
                 "identity (e.g. [26]). Separate parameter — never nest this inside prompt. "
@@ -609,24 +630,159 @@ def _quality_summary(quality) -> Optional[dict]:
     return {"checked": bool((quality.get("frames") or {}).get("readable")) or bool(flags), "flags": flags}
 
 
+# get_generation_status can wait for a job, for clients that cannot pause between
+# checks. Kept under the 60 s per-call limit common MCP clients apply (Codex, opencode).
+MAX_STATUS_WAIT_S = 50
+STATUS_POLL_S = 3
+_ACTIVE_JOB_STATUSES = {"queued", "pending", "running", "processing", "start", "in_progress"}
+
+
+# ---- tool jobs: photo edits and animations called over MCP ----------------------------------
+# These tools can run longer than an MCP client waits for one call. An MCP call
+# runs as a tool job in the backend (backend/services/tool_jobs.py) and answers
+# with a job id for get_generation_status; chat and the Studio run them inline.
+
+# What each tool's job is called in get_generation_status.
+_TOOL_JOB_KINDS = {
+    "edit_image": "image edit",
+    "inpaint_image": "inpaint",
+    "outpaint_image": "outpaint",
+    "remove_background": "background removal",
+    "generate_animation": "animation",
+}
+
+# Sentence for the descriptions of the tools that run as tool jobs over MCP.
+_TOOL_JOB_NOTE = (
+    " Over MCP the call returns a job id at once; poll get_generation_status with it for the "
+    "file, unless wait_for_result is true."
+)
+
+
+def _wait_for_result_param() -> ToolParameter:
+    return ToolParameter(
+        name="wait_for_result", type="bool", required=False, default=False,
+        description=(
+            "Over MCP: false (default) starts the work as a job and returns its job id at once; poll "
+            "get_generation_status with it for the file. true waits up to "
+            f"{_tool_jobs.MAX_WAIT_S:.0f} s (half the server's MCP timeout when that is shorter) and "
+            "returns the result, or the job id if it is still running. In chat the tool always runs "
+            "inline and this is ignored."
+        ),
+    )
+
+
+def _truthy(value) -> bool:
+    return str(value).lower() in ("1", "true", "yes")
+
+
+def _job_queued_result(snapshot: dict, waited_s: Optional[float] = None) -> ToolResult:
+    job_id = snapshot["job_id"]
+    kind = _TOOL_JOB_KINDS.get(snapshot["tool"], snapshot["tool"])
+    kind = kind[0].upper() + kind[1:]
+    if waited_s is None:
+        head = f"{kind} queued as job {job_id}."
+    else:
+        head = f"{kind} job {job_id} is still {snapshot.get('status') or 'running'} after {waited_s:.0f} s."
+    return ToolResult(
+        success=True,
+        output="\n".join([
+            head,
+            f"Poll: get_generation_status(batch_id=\"{job_id}\") for the file. The job runs in the "
+            "Guaardvark backend; closing this client does not stop it.",
+        ]),
+        metadata={"job_id": job_id, "queued": True, "tool": snapshot["tool"],
+                  "status_tool": "get_generation_status"},
+    )
+
+
+def _job_tool_result(snapshot: dict) -> Optional[ToolResult]:
+    """A finished job's own ToolResult, or None while it is queued or running."""
+    if snapshot.get("status") not in ("done", "failed"):
+        return None
+    result = snapshot.get("result") or {}
+    return ToolResult(
+        success=bool(result.get("success")),
+        output=result.get("output"),
+        error=result.get("error"),
+        metadata={**(result.get("metadata") or {}), "job_id": snapshot["job_id"]},
+    )
+
+
+def _run_or_queue(tool: BaseTool, run) -> ToolResult:
+    """``run()`` now, or as a tool job when an MCP client made the call.
+
+    The MCP server forwards these tools to the backend (``_forward_tool_job``),
+    where the call is marked as an MCP client's (``is_mcp_caller``). By the
+    time this runs the tool has checked its inputs, so a bad image is refused
+    at once rather than as a failed job. Every other caller, chat included,
+    gets ``run()`` inline.
+    """
+    if not is_mcp_caller(tool) or _tool_jobs.in_job():
+        return run()
+    try:
+        return _job_queued_result(_tool_jobs.submit(tool.name, run))
+    except _tool_jobs.ToolJobsBusy as e:
+        return ToolResult(success=False, error=str(e))
+
+
+def _forward_tool_job(tool: BaseTool, arguments: dict, wait_for_result) -> ToolResult:
+    """In the MCP server: start the call as a tool job in the backend.
+
+    The backend answers with the job id at once. With ``wait_for_result`` this
+    process then waits for the job up to ``tool_jobs.wait_seconds()``, which
+    follows this server's own call timeout, and returns the job's result or
+    its id.
+    """
+    started = run_tool_in_backend(tool.name, {k: v for k, v in arguments.items() if v is not None})
+    job_id = (started.metadata or {}).get("job_id")
+    if not _truthy(wait_for_result) or not started.success or not job_id:
+        return started
+    wait_s = _tool_jobs.wait_seconds()
+    try:
+        snapshot = _http_json("GET", f"/api/tools/jobs/{job_id}?wait_s={wait_s:g}", timeout=wait_s + 30)
+    except RuntimeError as e:
+        logger.warning("waiting for tool job %s: %s", job_id, e)
+        return started
+    return _job_tool_result(snapshot) or _job_queued_result(snapshot, waited_s=wait_s)
+
+
 class GenerationStatusTool(BaseTool):
-    """Read the state of a queued image or video batch by id."""
+    """Read the state of a queued image or video batch, bulk CSV job, song or tool job by id."""
 
     name = "get_generation_status"
     read_only = True
     idempotent = True
     description = (
         "Report the state of a queued generation: an image batch (ImageBatch_...) from "
-        "generate_image with wait_for_result=false or the batch image route, or a video batch "
-        "from generate_video. Returns status, progress, and the URL of each finished file. "
-        "Use after a queued generate call, or when the user asks whether a render is done."
+        "generate_image with wait_for_result=false or started in the Studio, a video batch "
+        "from generate_video, a bulk CSV job (bulk_gen_...) from generate_bulk_csv, a song "
+        "(a 32-character job id) from generate_music, or a tool job (tooljob_...) from edit_image, "
+        "inpaint_image, outpaint_image, remove_background or generate_animation called over MCP. "
+        "Returns status (a tool job is queued, running, done or failed, with the time since it "
+        "started), progress while running, and each finished file (URL for images, video and "
+        "animations; for a CSV, its path and how many rows it holds; for a song, its download "
+        "link), or the error of a failed job. Use after a queued generate call, or when the user "
+        "asks whether a render is done. Read-only; an unknown id is an error, and so is a backend "
+        "that does not answer (over MCP the backend must be running)."
     )
     parameters = {
         "batch_id": ToolParameter(
             name="batch_id",
             type="string",
-            description="The batch id a generate tool returned (e.g. ImageBatch_09-11-2026_132620_013).",
+            description=("The id a generate or edit tool returned, e.g. ImageBatch_09-11-2026_132620_013, "
+                         "bulk_gen_1790556697_3fa2c1, a song's job id or tooljob_3fa2c1_0123456789ab."),
             required=True,
+        ),
+        "wait_seconds": ToolParameter(
+            name="wait_seconds",
+            type="int",
+            required=False,
+            default=0,
+            minimum=0,
+            maximum=MAX_STATUS_WAIT_S,
+            description=(f"Wait up to this many seconds (0-{MAX_STATUS_WAIT_S}) for the job to finish before "
+                         "answering, instead of reporting 'still running' at once. Useful for a client that "
+                         "cannot pause between checks. Default 0: answer immediately."),
         ),
     }
 
@@ -758,14 +914,197 @@ class GenerationStatusTool(BaseTool):
             "studio_url": f"/video?batch={batch_id}",
         }
 
-    def execute(self, batch_id: str, **kwargs) -> ToolResult:
-        batch_id = (batch_id or "").strip()
-        if not batch_id:
-            return ToolResult(success=False, error="batch_id is required")
+    @staticmethod
+    def _bulk_info(job_id: str, progress: dict, output_filename, target_rows=None):
+        from backend.config import GUAARDVARK_ROOT, OUTPUT_DIR
+        status = {"start": "running", "processing": "running", "complete": "complete",
+                  "error": "error", "cancelled": "cancelled"}.get(progress.get("status"), progress.get("status"))
+        message = progress.get("message")
+        files = []
+        if status == "complete" and output_filename:
+            out_dir = Path(OUTPUT_DIR).resolve()
+            path = out_dir / output_filename
+            if path.is_file():
+                import csv
+                with open(path, encoding="utf-8", newline="") as f:
+                    rows = max(0, sum(1 for _ in csv.reader(f)) - 1)
+                root = Path(GUAARDVARK_ROOT).resolve()
+                shown = path.relative_to(root).as_posix() if path.is_relative_to(root) else str(path)
+                files = [{"url": shown}]
+                message = f"{rows} row(s) written" + (f" of {target_rows} asked for" if target_rows else "")
+            else:
+                status, message = "error", ("The job ended but its CSV is not in the outputs folder; a CSV that "
+                                            "fails validation is removed, and the Bulk Generation page shows why.")
+        return {
+            "kind": "bulk CSV", "batch_id": job_id, "status": status,
+            "progress": progress.get("progress"), "message": message,
+            "error": message if status == "error" else None, "errors": [],
+            "files": files, "studio_url": "/file-generation",
+        }
+
+    @classmethod
+    def _bulk_status_tracking(cls, job_id: str):
+        """A finished bulk job leaves the in-memory progress list about a minute after
+        it ends; the tracking file it writes under OUTPUT_DIR/tracking stays."""
+        if not job_id.startswith("bulk_gen_"):
+            return None
+        import glob
+        from backend.config import OUTPUT_DIR
+        found = sorted(glob.glob(os.path.join(OUTPUT_DIR, "tracking", f"{glob.escape(job_id)}_tracking_*.json")))
+        if not found:
+            return None
+        with open(found[-1], encoding="utf-8") as f:
+            meta = (json.load(f) or {}).get("metadata") or {}
+        name = (meta.get("job_parameters") or {}).get("output_filename")
+        if meta.get("status") == "completed":
+            return cls._bulk_info(job_id, {"status": "complete", "progress": 100}, name, meta.get("target_row_count"))
+        info = cls._bulk_info(job_id, {"status": "error", "message": (
+            "The job stopped before finishing (the backend may have restarted); "
+            "see the Bulk Generation page.")}, None)
+        info["stopped"] = True
+        return info
+
+    @classmethod
+    def _bulk_status(cls, job_id: str):
+        if not job_id.startswith("bulk_gen_"):
+            return None
+        from backend.utils.unified_progress_system import get_unified_progress
+        process = get_unified_progress().get_process(job_id)
+        if process is None:
+            return None
+        progress = {"status": process.status.value, "progress": process.progress, "message": process.message}
+        data = process.additional_data or {}
+        return cls._bulk_info(job_id, progress, data.get("output_filename"), data.get("num_items"))
+
+    @classmethod
+    def _bulk_status_http(cls, job_id: str):
+        if not job_id.startswith("bulk_gen_"):
+            return None
+        try:
+            d = _http_json("GET", f"/api/bulk-generate/status/{job_id}")
+        except RuntimeError as e:
+            if "not found" in str(e).lower() or "404" in str(e):
+                return None
+            raise
+        if not d or not d.get("progress_status"):
+            return None
+        return cls._bulk_info(job_id, d["progress_status"], d.get("output_filename"), d.get("num_items"))
+
+    _AUDIO_JOB_ID = re.compile(r"^[0-9a-f]{32}$")
+
+    @staticmethod
+    def _audio_info(job_id: str, job: dict):
+        """A song or voice job from Audio Foundry, in this tool's shape."""
+        from backend.tools.audio_tools import STUDIO_URL, _file_entry
+        status = {"done": "complete", "error": "error", "failed": "error"}.get(job.get("status"), job.get("status"))
+        prog = job.get("progress") or {}
+        pct = None
+        if prog.get("total"):
+            pct = int(100 * (prog.get("current") or 0) / prog["total"])
+        files = []
+        if status == "complete" and job.get("result"):
+            entry = _file_entry(job["result"])
+            entry.setdefault("url", entry["file"])
+            files.append(entry)
+        return {
+            "kind": {"music": "song", "voice": "speech", "fx": "sound effect"}.get(job.get("intent"), "audio"),
+            "batch_id": job_id, "status": status, "progress": pct, "message": prog.get("stage") or "",
+            "error": job.get("error"), "errors": [], "files": files, "studio_url": STUDIO_URL,
+        }
+
+    @classmethod
+    def _audio_status_http(cls, job_id: str):
+        if not cls._AUDIO_JOB_ID.match(job_id):
+            return None
+        try:
+            job = _http_json("GET", f"/api/audio-foundry/jobs/{job_id}")
+        except RuntimeError as e:
+            if "not found" in str(e).lower() or "unknown job" in str(e).lower() or "404" in str(e):
+                return None
+            raise
+        return cls._audio_info(job_id, job) if isinstance(job, dict) and job.get("status") else None
+
+    @classmethod
+    def _audio_status(cls, job_id: str):
+        if not cls._AUDIO_JOB_ID.match(job_id):
+            return None
+        import requests
+        from backend.api.audio_foundry_api import AUDIO_FOUNDRY_URL
+        from backend.services import comfyui_music_generator as m3
+        m3_job = m3.job_status(job_id)
+        if m3_job is not None:
+            job = {"intent": "music", "status": {"failed": "error"}.get(m3_job["status"], m3_job["status"]),
+                   "error": m3_job.get("error"),
+                   "result": {"path": m3_job.get("path"), "document_id": m3_job.get("document_id"),
+                              "duration_s": m3_job.get("seconds")} if m3_job.get("path") else None}
+            return cls._audio_info(job_id, job)
+        resp = requests.get(f"{AUDIO_FOUNDRY_URL}/jobs/{job_id}", timeout=5)
+        if resp.status_code == 404:
+            return None
+        resp.raise_for_status()
+        return cls._audio_info(job_id, resp.json())
+
+    @staticmethod
+    def _tool_job_info(snapshot: dict):
+        """A tool job (backend/services/tool_jobs.py) in this tool's shape."""
+        result = snapshot.get("result") or {}
+        meta = result.get("metadata") or {}
+        status = snapshot.get("status")
+        files = []
+        if status == "done":
+            for key in ("image_url", "gif_url", "video_url"):
+                url = meta.get(key)
+                if url and all(f["url"] != url for f in files):
+                    files.append({"url": url})
+        tool = snapshot.get("tool") or "tool"
+        return {
+            "kind": _TOOL_JOB_KINDS.get(tool, tool), "noun": "job", "tool": tool,
+            "batch_id": snapshot.get("job_id"), "status": status, "note": snapshot.get("note"),
+            "elapsed_s": snapshot.get("elapsed_s"),
+            "output": result.get("output") if status == "done" else None,
+            "error": result.get("error") if status == "failed" else None,
+            "errors": [], "files": files, "studio_url": None,
+        }
+
+    @classmethod
+    def _tool_job_status(cls, job_id: str):
+        if not _tool_jobs.is_job_id(job_id):
+            return None
+        snapshot = _tool_jobs.get(job_id)
+        if snapshot is None:
+            return {"missing": _tool_jobs.missing(job_id)[1]}
+        return cls._tool_job_info(snapshot)
+
+    @classmethod
+    def _tool_job_status_http(cls, job_id: str):
+        if not _tool_jobs.is_job_id(job_id):
+            return None
+        try:
+            snapshot = _http_json("GET", f"/api/tools/jobs/{job_id}")
+        except BackendError as e:
+            if e.status != 404:
+                raise
+            if isinstance(e.body, dict) and e.body.get("reason"):
+                return {"missing": str(e)}
+            return {"missing": (f"The Guaardvark backend does not know tool jobs yet ({e}); restart it "
+                                "so it runs the same version as this MCP server.")}
+        return cls._tool_job_info(snapshot)
+
+    def _read(self, batch_id: str):
+        """(info, unreachable): the job from whichever reader knows its id."""
         info = None
+        unreachable = None
         remote = self._context.get("transport") == "mcp"
-        readers = (self._image_status_http, self._video_status_http) if remote else (
-            self._image_status, self._video_status)
+        if _tool_jobs.is_job_id(batch_id):
+            readers = (self._tool_job_status_http,) if remote else (self._tool_job_status,)
+        else:
+            readers = (
+                (self._bulk_status_http, self._bulk_status_tracking, self._audio_status_http,
+                 self._image_status_http, self._video_status_http)
+                if remote else
+                (self._bulk_status, self._bulk_status_tracking, self._audio_status,
+                 self._image_status, self._video_status)
+            )
         for reader in readers:
             try:
                 info = reader(batch_id)
@@ -773,14 +1112,43 @@ class GenerationStatusTool(BaseTool):
                 continue
             except Exception as e:
                 logger.warning("get_generation_status %s via %s: %s", batch_id, reader.__name__, e)
+                if reader.__name__.endswith("_http"):
+                    unreachable = unreachable or e
                 continue
             if info is not None:
                 break
+        return info, unreachable
+
+    def execute(self, batch_id: str, wait_seconds: int = 0, **kwargs) -> ToolResult:
+        batch_id = (batch_id or "").strip()
+        if not batch_id:
+            return ToolResult(success=False, error="batch_id is required")
+        try:
+            wait_seconds = max(0, min(int(wait_seconds or 0), MAX_STATUS_WAIT_S))
+        except (TypeError, ValueError):
+            wait_seconds = 0
+        deadline = time.monotonic() + wait_seconds
+        info, unreachable = self._read(batch_id)
+        while (info is not None and unreachable is None
+               and str(info.get("status")).lower() in _ACTIVE_JOB_STATUSES
+               and time.monotonic() + STATUS_POLL_S < deadline):
+            time.sleep(STATUS_POLL_S)
+            info, unreachable = self._read(batch_id)
+        # Without an answer from the backend a live job cannot be told from a lost one,
+        # so neither "stopped" nor "no such batch" is reported.
+        if unreachable is not None and (info is None or info.get("stopped")):
+            return ToolResult(success=False, error=(
+                f"Could not read {batch_id}: the Guaardvark backend did not answer ({unreachable}). "
+                "Try again shortly."))
         if info is None:
-            return ToolResult(success=False, error=f"No image or video batch named {batch_id}")
+            return ToolResult(success=False, error=f"No image, video, audio or bulk CSV job named {batch_id}")
+        if info.get("missing"):
+            return ToolResult(success=False, error=info["missing"])
         total = info.get("total")
         done = info.get("completed") or 0
-        head = f"{info['kind'].title()} batch {batch_id}: {info['status']}"
+        noun = info.get("noun") or (
+            "job" if info["kind"] in ("song", "speech", "sound effect", "audio") else "batch")
+        head = f"{info['kind'][0].upper()}{info['kind'][1:]} {noun} {batch_id}: {info['status']}"
         if total:
             head += f" ({done}/{total} finished"
             if info.get("failed"):
@@ -789,6 +1157,12 @@ class GenerationStatusTool(BaseTool):
         lines = [head]
         for f in info["files"]:
             lines.append(f"File: {f['url']}")
+            if f.get("download"):
+                lines.append(f"Download: {f['download']}")
+            if f.get("duration_s") is not None:
+                lines.append(f"Length: {f['duration_s']} s")
+            if info["kind"] == "bulk CSV" and info.get("message"):
+                lines.append(info["message"])
             if info["kind"] == "image":
                 lines.append(f"Steps: {f.get('steps') if f.get('steps') is not None else 'unknown'}")
                 if f.get("steps_notice"):
@@ -811,9 +1185,18 @@ class GenerationStatusTool(BaseTool):
                 lines.append(f"Error: {info['error']}")
             for err in info.get("errors") or []:
                 lines.append(f"Failed item: {err}")
+        if info.get("progress") is not None and info["status"] == "running":
+            lines.append(f"Progress: {info['progress']}% — {info.get('message') or ''}".rstrip(" —"))
+        if info.get("elapsed_s") is not None:
+            lines.append(f"Elapsed: {info['elapsed_s']:.0f} s")
+        if info.get("note"):
+            lines.append(info["note"])
+        if info.get("output"):
+            lines.append(str(info["output"]))
         if info["status"] in ("queued", "pending", "running"):
-            lines.append("Still running; poll again in a few seconds.")
-        lines.append(f"Open Studio: {info['studio_url']}")
+            lines.append("Still running; poll again in a few seconds, or pass wait_seconds to wait here.")
+        if info.get("studio_url"):
+            lines.append(f"Open Studio: {info['studio_url']}")
         return ToolResult(success=True, output="\n".join(lines), metadata=info)
 
 
@@ -830,9 +1213,11 @@ class AnimationGeneratorTool(BaseTool):
     destructive = False
     description = (
         "Generate a short looping GIF or frame-morph MP4 from a text prompt with "
-        "motion description, via Stable Diffusion img2img. Use when the user asks "
-        "to animate, create a GIF, or make a looping frame morph. For a cinema "
-        "clip from a video model use generate_video instead."
+        "motion description: frame 1 from the prompt, each later frame by img2img on "
+        "a downloaded image model that supports it (Z-Image Turbo, SDXL or Stable "
+        "Diffusion, picked automatically). Use when the user asks to animate, create "
+        "a GIF, or make a looping frame morph. For a cinema clip from a video model "
+        "use generate_video instead." + _TOOL_JOB_NOTE
     )
     parameters = {
         "prompt": ToolParameter(
@@ -875,6 +1260,7 @@ class AnimationGeneratorTool(BaseTool):
             required=False,
             default=False,
         ),
+        "wait_for_result": _wait_for_result_param(),
     }
 
     def __init__(self):
@@ -882,16 +1268,22 @@ class AnimationGeneratorTool(BaseTool):
 
     def execute(self, prompt: str, motion: str, frames: int = 8,
                 strength: float = 0.20, format: str = "both",
-                vision_steering: bool = False, **kwargs) -> ToolResult:
+                vision_steering: bool = False, wait_for_result: bool = False, **kwargs) -> ToolResult:
         logger.info(f"AnimationGeneratorTool: prompt={prompt[:60]}..., motion={motion}, frames={frames}")
 
         if is_mcp_transport(self):
             # The frames render on the GPU, which belongs to the backend process.
-            return run_tool_in_backend(self.name, {
+            return _forward_tool_job(self, {
                 "prompt": prompt, "motion": motion, "frames": frames, "strength": strength,
                 "format": format, "vision_steering": vision_steering,
-            }, read_timeout=31 * 60)
+            }, wait_for_result)
+        return _run_or_queue(self, lambda: self._animate(
+            prompt, motion, frames=frames, strength=strength, format=format,
+            vision_steering=vision_steering,
+        ))
 
+    def _animate(self, prompt: str, motion: str, *, frames: int, strength: float,
+                 format: str, vision_steering: bool) -> ToolResult:
         try:
             from backend.services.animation_generator import (
                 get_animation_generator, AnimationRequest
@@ -908,23 +1300,32 @@ class AnimationGeneratorTool(BaseTool):
                 use_vision_steering=vision_steering,
             )
 
-            from backend.services.gpu_resource_policy import gpu_session
+            from backend.services.gpu_resource_policy import gpu_session, gpu_session_when_free
             from backend.services.job_operation_gate import GpuBusyError
             from backend.services.job_types import JobKind
             from backend.services.offline_image_generator import get_image_generator
+            # A tool job waits its turn for a busy GPU; chat is told at once.
+            gpu_wait = _job_gpu_wait()
             try:
                 # Use the image gen's ram estimate for the animation (reuses SD pipeline)
                 img_gen = get_image_generator()
                 ram_est = img_gen._ram_estimate_gb(request.model) if hasattr(img_gen, "_ram_estimate_gb") else 6.0
-                with gpu_session(JobKind.VIDEO_RENDER, f"chat_anim_{uuid.uuid4().hex[:8]}",
-                                 on_busy="raise", evict_ollama=True, vram_estimate_mb=8000,
-                                 ram_estimate_gb=ram_est, require_fit=True, cross_process=True):
+                op_id = f"chat_anim_{uuid.uuid4().hex[:8]}"
+                session_kwargs = dict(evict_ollama=True, vram_estimate_mb=8000,
+                                      ram_estimate_gb=ram_est, require_fit=True, cross_process=True)
+                if gpu_wait:
+                    claim = gpu_session_when_free(
+                        JobKind.VIDEO_RENDER, op_id, wait_s=gpu_wait["wait_s"],
+                        on_wait=gpu_wait["on_wait"], should_stop=gpu_wait["should_stop"],
+                        **session_kwargs,
+                    )
+                else:
+                    claim = gpu_session(JobKind.VIDEO_RENDER, op_id, on_busy="raise", **session_kwargs)
+                with claim:
                     result = anim_gen.generate(request)
-            except GpuBusyError:
-                return ToolResult(
-                    success=False,
-                    error="GPU is busy with another render right now — try again in a moment.",
-                )
+            except GpuBusyError as e:
+                return ToolResult(success=False, error=_gpu_refusal(e, gpu_wait) or (
+                    "GPU is busy with another render right now — try again in a moment."))
 
             if result.success:
                 output_lines = [
@@ -991,24 +1392,20 @@ def _dims_for_ratio(ratio: str, caps: dict) -> tuple:
     return width, height
 
 
-def _media_path(ref: Optional[str]) -> Optional[str]:
-    """A local path for a Document id or a path the caller already has."""
-    if ref is None:
-        return None
-    text = str(ref).strip()
-    if not text:
-        return None
-    if text.isdigit():
-        try:
-            from backend.models import Document
-            from backend.services.document_path_resolver import resolve_document_path
-            doc = Document.query.get(int(text))
-            path = resolve_document_path(doc) if doc else None
-            return str(path) if path else None
-        except Exception as e:  # noqa: BLE001 — a missing row is a plain "not found"
-            logger.info("document %s did not resolve: %s", text, e)
-            return None
-    return text if os.path.exists(text) else None
+def _document_file(doc_id: int) -> Optional[str]:
+    """The file behind a library document, or None."""
+    from backend.models import Document, db
+    from backend.services.document_path_resolver import resolve_document_path
+    doc = db.session.get(Document, doc_id)
+    path = resolve_document_path(doc) if doc else None
+    return str(path) if path else None
+
+
+def _media_input(ref, *, mcp: bool, label: str):
+    """A generate_video input (document id, served URL, resource URI or path)
+    as a MediaRef, under the shared media-input rules."""
+    from backend.utils.media_inputs import resolve_media_ref
+    return resolve_media_ref(ref, mcp=mcp, label=label, document_path=_document_file)
 
 
 class VideoGeneratorTool(BaseTool):
@@ -1082,25 +1479,29 @@ class VideoGeneratorTool(BaseTool):
         "first_image": ToolParameter(
             name="first_image",
             type="string",
-            description="Document id or path of the first frame (image-to-video).",
+            description=f"First frame (image-to-video): {_VIDEO_INPUT_FORMS}",
             required=False,
         ),
         "last_image": ToolParameter(
             name="last_image",
             type="string",
-            description="Document id or path of the last frame; needs a model with first+last-frame mode.",
+            description=("Last frame; needs a model with first+last-frame mode. Same forms as "
+                         "first_image."),
             required=False,
         ),
         "reference_images": ToolParameter(
             name="reference_images",
             type="list",
-            description="Document ids or paths of reference images (identity, look); needs the reference build.",
+            items="string",
+            description=("Reference images (identity, look), each as a string in the same forms "
+                         "as first_image; needs the reference build."),
             required=False,
         ),
         "reference_audio": ToolParameter(
             name="reference_audio",
             type="string",
-            description="Document id or path of a voice or music reference; needs the reference build.",
+            description=("A voice or music reference, in the same forms as first_image (a generated "
+                         "song's document id works); needs the reference build."),
             required=False,
         ),
         "speed_profile": ToolParameter(
@@ -1155,7 +1556,7 @@ class VideoGeneratorTool(BaseTool):
         model_id = (model or "").strip()
         if not model_id:
             role = "i2v" if first_image else "t2v"
-            picked, _resolve_err = resolve_active_video_model(role)
+            picked, _resolve_err = resolve_active_video_model(role, comfyui_down_ok=True)
             model_id = picked or DEFAULT_T2V_MODEL
         entry = VIDEO_MODEL_REGISTRY.get(model_id)
         if not entry:
@@ -1290,6 +1691,19 @@ class VideoGeneratorTool(BaseTool):
         duration_frames = params["duration_frames"]
         num_inference_steps = params.get("num_inference_steps")
 
+        # Inputs resolve before the model preflight, which may start ComfyUI.
+        mcp = is_mcp_caller(self)
+        inputs = [("first_image", first_image), ("last_image", last_image)]
+        inputs += [("reference image", r) for r in (reference_images or []) if str(r or "").strip()]
+        inputs.append(("reference_audio", reference_audio))
+        resolved = []
+        for label, ref in inputs:
+            found = _media_input(ref, mcp=mcp, label=label)
+            if found.error:
+                return ToolResult(success=False, error=found.error)
+            resolved.append(found.path)
+        first_path, last_path, *ref_paths, ref_audio_path = resolved
+
         logger.info("VideoGeneratorTool: model=%s frames=%s steps=%s wait=%s prompt=%r",
                     model_id, duration_frames, num_inference_steps, wait_for_result, prompt[:100])
         try:
@@ -1305,19 +1719,6 @@ class VideoGeneratorTool(BaseTool):
             generator = get_batch_video_generator()
             if not generator.service_available:
                 return ToolResult(success=False, error="Video generation service not available")
-
-            first_path = _media_path(first_image) if first_image else None
-            if first_image and not first_path:
-                return ToolResult(success=False, error=f"first_image not found: {first_image}")
-            last_path = _media_path(last_image) if last_image else None
-            if last_image and not last_path:
-                return ToolResult(success=False, error=f"last_image not found: {last_image}")
-            ref_paths = [_media_path(r) for r in (reference_images or [])]
-            if any(p is None for p in ref_paths):
-                return ToolResult(success=False, error="A reference image was not found")
-            ref_audio_path = _media_path(reference_audio) if reference_audio else None
-            if reference_audio and not ref_audio_path:
-                return ToolResult(success=False, error=f"reference_audio not found: {reference_audio}")
 
             if ref_paths or ref_audio_path:
                 # The reference build reads the references from the batch
@@ -1449,9 +1850,9 @@ class EditImageTool(BaseTool):
         "the user has attached/uploaded an image (or names one) and asks to add, "
         "remove, or change something in it, e.g. 'put a cowboy hat on this character'. "
         "Preserves the original subject and only applies the requested edit. If the "
-        "user did not attach an image, ask them to attach one. Do NOT use this to make "
+        "user did not attach an image, ask them to attach one (an MCP client passes image). Do NOT use this to make "
         "a brand-new image from scratch — use generate_image. For a new scene that "
-        "keeps a face from an attached photo, use generate_identity."
+        "keeps a face from an attached photo, use generate_identity." + _TOOL_JOB_NOTE
     )
     parameters = {
         "instruction": ToolParameter(
@@ -1461,8 +1862,8 @@ class EditImageTool(BaseTool):
         ),
         "image": ToolParameter(
             name="image", type="string",
-            description=("Path, URL, or reference of the image to edit. Usually omit this — "
-                         "the image the user just attached is used automatically."),
+            description=("The image to edit. In chat, omit it to use the image the user just attached; "
+                         f"otherwise {_IMAGE_INPUT_FORMS}"),
             required=False, default="",
         ),
         "steps": ToolParameter(
@@ -1481,14 +1882,15 @@ class EditImageTool(BaseTool):
         ),
         "reference_image_2": ToolParameter(
             name="reference_image_2", type="string",
-            description="Optional second reference (another person or style). Qwen-Image-Edit only.",
+            description="Optional second reference (another person or style), in the same forms as image. Qwen-Image-Edit only.",
             required=False, default="",
         ),
         "reference_image_3": ToolParameter(
             name="reference_image_3", type="string",
-            description="Optional third reference. Qwen-Image-Edit only.",
+            description="Optional third reference, in the same forms as image. Qwen-Image-Edit only.",
             required=False, default="",
         ),
+        "wait_for_result": _wait_for_result_param(),
     }
 
     @staticmethod
@@ -1584,62 +1986,71 @@ class EditImageTool(BaseTool):
         )
 
     def _resolve_image(self, image: str):
-        """Resolve a path / URL / data-URI to a local file. None if unresolvable.
-        (The common case — the user's attached image — is injected by the chat engine
-        as a real disk path, so this is the fallback for explicit paths/URLs.)"""
+        """The local file for ``image``, or None when it cannot be used."""
+        return self._resolve_image_ref(image).path
+
+    def _resolve_image_ref(self, image: str, label: str = "image"):
+        """``image`` (data URI, served URL, resource URI or path) as a MediaRef.
+
+        The chat engine injects the user's attached image as a disk path in the
+        uploads folder; explicit URLs and paths go through the shared
+        media-input rules (backend/utils/media_inputs.py), which are stricter
+        for MCP clients and never download a remote URL.
+        """
+        from backend.utils.media_inputs import MediaRef, resolve_media_ref
         if not image:
-            return None
-        if os.path.exists(image):
-            return image
-        try:
-            from backend.config import OUTPUT_DIR
-        except Exception:
-            OUTPUT_DIR = "."
-        edit_dir = os.path.join(OUTPUT_DIR, "edit_inputs")
-        os.makedirs(edit_dir, exist_ok=True)
-        # data URI or bare base64 blob
+            return MediaRef()
+        # data URI or bare base64 blob: the caller sent the bytes, nothing is read from disk
         if image.startswith("data:") or (len(image) > 256 and "/" not in image[:64] and " " not in image[:64]):
             try:
                 import base64
+                from backend.config import OUTPUT_DIR
+                edit_dir = os.path.join(OUTPUT_DIR, "edit_inputs")
+                os.makedirs(edit_dir, exist_ok=True)
                 raw = base64.b64decode(image.split(",", 1)[1] if image.startswith("data:") else image)
                 p = os.path.join(edit_dir, f"edit_src_{uuid.uuid4().hex[:12]}.png")
                 with open(p, "wb") as f:
                     f.write(raw)
-                return p
-            except Exception:
-                return None
-        # a served output URL → map back to disk
-        if "/api/outputs/" in image:
-            cand = os.path.join(OUTPUT_DIR, image.split("/api/outputs/", 1)[1].split("?", 1)[0])
-            if os.path.exists(cand):
-                return cand
-        # OFFLINE-FIRST: never fetch an external URL. A remote image URL (e.g. a
-        # files.oaiusercontent.com / CDN link that rode in with the attachment) must
-        # NOT trigger an outbound request. Same-host app URLs were already mapped to
-        # disk above; anything else is refused, not downloaded.
-        if image.startswith("http://") or image.startswith("https://"):
-            logger.warning(
-                "edit_image: refusing to fetch a non-local image URL (offline-first): %s",
-                image[:80],
-            )
-            return None
-        return None
+                return MediaRef(path=p)
+            except Exception as e:  # noqa: BLE001 — undecodable input is a plain refusal
+                return MediaRef(error=f"{label} looked like base64 image data but did not decode: {e}")
+        return resolve_media_ref(image, mcp=is_mcp_caller(self), label=label)
 
     def execute(self, instruction: str, image: str = "", steps: int = 28,
                 model: str = "auto", reference_image_2: str = "",
-                reference_image_3: str = "", **kwargs) -> ToolResult:
-        src = self._resolve_image(image)
-        if not src:
+                reference_image_3: str = "", wait_for_result: bool = False, **kwargs) -> ToolResult:
+        if is_mcp_transport(self):
+            # The edit renders on the GPU, which belongs to the backend process.
+            return _forward_tool_job(self, {
+                "instruction": instruction, "image": image, "steps": steps, "model": model,
+                "reference_image_2": reference_image_2, "reference_image_3": reference_image_3,
+            }, wait_for_result)
+        inputs = self._edit_inputs(image, reference_image_2, reference_image_3)
+        if isinstance(inputs, ToolResult):
+            return inputs
+        src, extra = inputs
+        return _run_or_queue(self, lambda: self._edit(
+            src, extra, instruction=instruction, steps=steps, model=model,
+        ))
+
+    def _edit_inputs(self, image: str, reference_image_2: str = "", reference_image_3: str = ""):
+        """(source path, extra reference paths), or the ToolResult that refuses them."""
+        found = self._resolve_image_ref(image)
+        if not found.path:
             return ToolResult(
                 success=False,
-                error="No image to edit. Ask the user to attach the image they want edited.",
+                error=found.error or "No image to edit. Ask the user to attach the image they want edited.",
             )
         extra = []
-        for raw in (reference_image_2, reference_image_3):
-            if raw:
-                p = self._resolve_image(raw)
-                if p:
-                    extra.append(p)
+        for label, raw in (("reference_image_2", reference_image_2), ("reference_image_3", reference_image_3)):
+            ref = self._resolve_image_ref(raw, label=label)
+            if ref.refused:
+                return ToolResult(success=False, error=ref.error)
+            if ref.path:
+                extra.append(ref.path)
+        return found.path, extra
+
+    def _edit(self, src: str, extra: list, *, instruction: str, steps, model: str) -> ToolResult:
         gpu_wait = None
         try:
             from backend.config import OUTPUT_DIR
@@ -1706,6 +2117,32 @@ _GPU_STILL_BUSY = (
     "The GPU stayed busy with another render for {mins} minutes, so this did not run. "
     "Say \"try again\" when it is free."
 )
+_JOB_GPU_STILL_BUSY = (
+    "The GPU stayed busy with other work for {mins} minutes, so this job did not run. Start it "
+    "again when the GPU is free (inspect_gpu shows what holds it)."
+)
+
+
+def _image_vram_wait_s() -> float:
+    """GUAARDVARK_IMAGE_VRAM_WAIT_S: how long image work waits for a busy GPU (default 600 s,
+    the batch image wait)."""
+    try:
+        return max(0.0, float(os.environ.get("GUAARDVARK_IMAGE_VRAM_WAIT_S", "600")))
+    except ValueError:
+        return 600.0
+
+
+def _job_gpu_wait() -> dict | None:
+    """In a tool job, queue behind a busy GPU the way a batch image job does.
+
+    No client holds the call open, so the job waits up to
+    GUAARDVARK_IMAGE_VRAM_WAIT_S and get_generation_status shows it as queued
+    meanwhile. Anywhere else: None.
+    """
+    if not _tool_jobs.in_job():
+        return None
+    return {"wait_s": _image_vram_wait_s(), "on_wait": _tool_jobs.note_gpu_wait,
+            "should_stop": None, "still_busy": _JOB_GPU_STILL_BUSY}
 
 
 def _chat_gpu_wait() -> dict | None:
@@ -1713,17 +2150,14 @@ def _chat_gpu_wait() -> dict | None:
 
     Waits up to GUAARDVARK_IMAGE_VRAM_WAIT_S (the batch image wait, default
     600 s) with a status line in the chat, and gives up when the person presses
-    Stop. Other callers (the MCP server, scripts) get None and keep the
-    immediate answer, since a client there may time out while it waits.
+    Stop. A tool job waits too (``_job_gpu_wait``). Other callers (scripts, the
+    Tools page) get None and keep the immediate answer.
     """
     from backend.services.agent_control_service import get_chat_emit_fn, get_chat_stop_check
     stop = get_chat_stop_check()
     if stop is None:
-        return None
-    try:
-        wait_s = max(0.0, float(os.environ.get("GUAARDVARK_IMAGE_VRAM_WAIT_S", "600")))
-    except ValueError:
-        wait_s = 600.0
+        return _job_gpu_wait()
+    wait_s = _image_vram_wait_s()
     emit = get_chat_emit_fn()
 
     def on_wait(reason: str) -> None:
@@ -1735,7 +2169,7 @@ def _chat_gpu_wait() -> dict | None:
 
 
 def _gpu_refusal(e: Exception, gpu_wait: dict | None) -> str | None:
-    """Chat text for a GPU refusal, or None when ``e`` is not one."""
+    """Chat (or tool job) text for a GPU refusal, or None when ``e`` is not one."""
     from backend.services.gpu_resource_policy import GpuWaitStopped
     from backend.services.job_operation_gate import GpuBusyError, GpuCapacityError
     if isinstance(e, GpuWaitStopped):
@@ -1744,9 +2178,17 @@ def _gpu_refusal(e: Exception, gpu_wait: dict | None) -> str | None:
         return None
     if isinstance(e, GpuBusyError):
         if gpu_wait and gpu_wait.get("wait_s"):
-            return _GPU_STILL_BUSY.format(mins=max(1, round(gpu_wait["wait_s"] / 60)))
+            text = gpu_wait.get("still_busy") or _GPU_STILL_BUSY
+            return text.format(mins=max(1, round(gpu_wait["wait_s"] / 60)))
         return "GPU is busy with another render right now — try again in a moment."
     return None
+
+
+def _edit_tool_for(caller: BaseTool) -> "EditImageTool":
+    """An EditImageTool that shares ``caller``'s context, so input rules see the same transport."""
+    tool = EditImageTool()
+    tool.set_context(dict(getattr(caller, "_context", None) or {}))
+    return tool
 
 
 def _chat_png_path(prefix: str) -> tuple[str, str]:
@@ -1766,21 +2208,29 @@ class RemoveBackgroundTool(BaseTool):
     description = (
         "Remove the background from an attached photo and return a transparent PNG. "
         "Use for product shots, stickers, and cut-outs. Does not invent a new scene — "
-        "use generate_identity or edit_image for that. The attached image is used "
-        "automatically if `image` is omitted."
+        "use generate_identity or edit_image for that. In chat the attached image is used "
+        "when `image` is omitted; an MCP client passes `image`." + _TOOL_JOB_NOTE
     )
     parameters = {
         "image": ToolParameter(
             name="image", type="string",
-            description="Path of the photo. Usually omit — the attached image is used.",
+            description=f"The photo. In chat, omit it to use the attached image; otherwise {_IMAGE_INPUT_FORMS}",
             required=False, default="",
         ),
+        "wait_for_result": _wait_for_result_param(),
     }
 
-    def execute(self, image: str = "", **kwargs) -> ToolResult:
-        src = EditImageTool()._resolve_image(image)
-        if not src:
-            return ToolResult(success=False, error="Attach the photo to cut out.")
+    def execute(self, image: str = "", wait_for_result: bool = False, **kwargs) -> ToolResult:
+        if is_mcp_transport(self):
+            # The cut-out model runs on the GPU when it can, which belongs to the backend process.
+            return _forward_tool_job(self, {"image": image}, wait_for_result)
+        found = _edit_tool_for(self)._resolve_image_ref(image)
+        if not found.path:
+            return ToolResult(success=False, error=found.error or "Attach the photo to cut out.")
+        return _run_or_queue(self, lambda: self._cut_out(found.path))
+
+    @staticmethod
+    def _cut_out(src: str) -> ToolResult:
         from PIL import Image
         from backend.services.background_removal import (
             BackgroundRemovalNotInstalled, installed_model, remove_background,
@@ -1815,7 +2265,7 @@ class InpaintImageTool(BaseTool):
         "instruction ('remove the coffee cup', 'replace the sky with sunset'). "
         "Uses Qwen-Image-Edit when installed, else FLUX Kontext. For extending the "
         "canvas use outpaint_image. For a brand-new scene of a person's face use "
-        "generate_identity."
+        "generate_identity." + _TOOL_JOB_NOTE
     )
     parameters = {
         "instruction": ToolParameter(
@@ -1825,7 +2275,7 @@ class InpaintImageTool(BaseTool):
         ),
         "image": ToolParameter(
             name="image", type="string",
-            description="Path of the photo. Usually omit — the attached image is used.",
+            description=f"The photo. In chat, omit it to use the attached image; otherwise {_IMAGE_INPUT_FORMS}",
             required=False, default="",
         ),
         "steps": ToolParameter(
@@ -1833,13 +2283,25 @@ class InpaintImageTool(BaseTool):
             description="Diffusion steps. Default 20.",
             required=False, default=20,
         ),
+        "wait_for_result": _wait_for_result_param(),
     }
 
-    def execute(self, instruction: str, image: str = "", steps: int = 20, **kwargs) -> ToolResult:
+    def execute(self, instruction: str, image: str = "", steps: int = 20,
+                wait_for_result: bool = False, **kwargs) -> ToolResult:
+        if is_mcp_transport(self):
+            return _forward_tool_job(self, {
+                "instruction": instruction, "image": image, "steps": steps, "model": kwargs.get("model"),
+            }, wait_for_result)
         model = kwargs.get("model") or "auto"
-        return EditImageTool().execute(
-            instruction=instruction, image=image, steps=int(steps) or 20, model=model,
-        )
+        steps = int(steps) or 20
+        edit = _edit_tool_for(self)
+        inputs = edit._edit_inputs(image)
+        if isinstance(inputs, ToolResult):
+            return inputs
+        src, extra = inputs
+        return _run_or_queue(self, lambda: edit._edit(
+            src, extra, instruction=instruction, steps=steps, model=model,
+        ))
 
 
 class OutpaintImageTool(BaseTool):
@@ -1851,12 +2313,12 @@ class OutpaintImageTool(BaseTool):
     description = (
         "Expand an attached photo in one or more directions and fill the new area "
         "so it matches the scene. Use when the user says extend, expand the canvas, "
-        "or outpaint. Prefer Qwen-Image-Edit when installed."
+        "or outpaint. Prefer Qwen-Image-Edit when installed." + _TOOL_JOB_NOTE
     )
     parameters = {
         "image": ToolParameter(
             name="image", type="string",
-            description="Path of the photo. Usually omit — the attached image is used.",
+            description=f"The photo. In chat, omit it to use the attached image; otherwise {_IMAGE_INPUT_FORMS}",
             required=False, default="",
         ),
         "instruction": ToolParameter(
@@ -1869,13 +2331,21 @@ class OutpaintImageTool(BaseTool):
         "top": ToolParameter(name="top", type="int", description="Pixels to add on the top.", required=False, default=0),
         "bottom": ToolParameter(name="bottom", type="int", description="Pixels to add on the bottom.", required=False, default=0),
         "steps": ToolParameter(name="steps", type="int", description="Diffusion steps. Default 20.", required=False, default=20),
+        "wait_for_result": _wait_for_result_param(),
     }
 
     def execute(self, image: str = "", instruction: str = "", left: int = 0, right: int = 0,
-                top: int = 0, bottom: int = 0, steps: int = 20, **kwargs) -> ToolResult:
-        src = EditImageTool()._resolve_image(image)
-        if not src:
-            return ToolResult(success=False, error="Attach the photo to extend.")
+                top: int = 0, bottom: int = 0, steps: int = 20, wait_for_result: bool = False,
+                **kwargs) -> ToolResult:
+        if is_mcp_transport(self):
+            return _forward_tool_job(self, {
+                "image": image, "instruction": instruction, "left": left, "right": right,
+                "top": top, "bottom": bottom, "steps": steps,
+            }, wait_for_result)
+        found = _edit_tool_for(self)._resolve_image_ref(image)
+        if not found.path:
+            return ToolResult(success=False, error=found.error or "Attach the photo to extend.")
+        src = found.path
         pad = {
             "left": max(0, int(left) or 0),
             "right": max(0, int(right) or 0),
@@ -1886,10 +2356,16 @@ class OutpaintImageTool(BaseTool):
         if not any(pad[k] for k in ("left", "right", "top", "bottom")):
             # Default: grow 256 px on every side when the user didn't specify.
             pad.update({"left": 256, "right": 256, "top": 256, "bottom": 256})
+        # The model is shown the original picture, not the padded canvas, so the
+        # instruction describes a wider view of the scene rather than a border to fill.
         fill = (instruction or "").strip() or (
-            "Fill the extended canvas so it continues the original scene, matching lighting, "
-            "perspective and style. Do not change the original subject."
+            "Show the same scene in a wider shot, continuing it past the edges with matching "
+            "lighting, perspective and style. Keep everything already in the picture unchanged."
         )
+        return _run_or_queue(self, lambda: self._outpaint(src, pad, fill, steps))
+
+    @staticmethod
+    def _outpaint(src: str, pad: dict, fill: str, steps) -> ToolResult:
         gpu_wait = None
         try:
             from backend.services.comfyui_image_generator import ComfyUIImageGenerator
@@ -1967,7 +2443,7 @@ class GenerateIdentityTool(BaseTool):
         ),
         "image": ToolParameter(
             name="image", type="string",
-            description="Face reference. Usually omit — the attached image is used.",
+            description=f"Face reference. In chat, omit it to use the attached image; otherwise {_IMAGE_INPUT_FORMS}",
             required=False, default="",
         ),
         "consented": ToolParameter(
@@ -2017,9 +2493,11 @@ class GenerateIdentityTool(BaseTool):
                       "likeness the user has the right to use (their photo or a Cast subject "
                       "they uploaded).",
             )
-        src = EditImageTool()._resolve_image(image)
-        if not src:
-            return ToolResult(success=False, error="Attach a face photo, then describe the new scene.")
+        found = _edit_tool_for(self)._resolve_image_ref(image)
+        if not found.path:
+            return ToolResult(success=False,
+                              error=found.error or "Attach a face photo, then describe the new scene.")
+        src = found.path
         if not has_consent(src):
             return ToolResult(
                 success=False,

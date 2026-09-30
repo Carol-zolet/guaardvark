@@ -14,6 +14,7 @@ HTML = f"<html><head><title>K20 bracket kit</title></head><body><div>{MENU}</div
 
 class _Page:
     content = HTML.encode("utf-8")
+    url = "https://example.com/k20"
 
     def raise_for_status(self):
         return None
@@ -21,7 +22,7 @@ class _Page:
 
 @pytest.fixture
 def page(monkeypatch):
-    monkeypatch.setattr(web_search_api.requests, "get", lambda *args, **kwargs: _Page())
+    monkeypatch.setattr(web_search_api.requests.Session, "get", lambda *args, **kwargs: _Page())
 
 
 def test_without_a_query_the_content_is_the_head_of_the_page(page):
@@ -42,8 +43,8 @@ def test_fetch_url_and_analyze_website_pass_the_query_through(monkeypatch):
 
     seen = []
 
-    def fake_extract(url, query=None):
-        seen.append((url, query))
+    def fake_extract(url, query=None, public_only=False):
+        seen.append((url, query, public_only))
         return {"success": True, "url": url, "title": "t", "description": "", "content": "c", "content_length": 1}
 
     monkeypatch.setattr(web_search_api, "extract_website_content", fake_extract)
@@ -51,6 +52,7 @@ def test_fetch_url_and_analyze_website_pass_the_query_through(monkeypatch):
     web_tools.FetchUrlTool().execute(url="example.com", query="  which bolts  ")
     web_tools.FetchUrlTool().execute(url="example.com")
     web_tools.WebAnalysisTool().execute(url="example.com", query="opening hours")
-    assert seen[0] == ("example.com", "which bolts")
-    assert seen[1] == ("example.com", None)
-    assert seen[2] == ("example.com", "opening hours")
+    # Both tools also ask the extractor to refuse private and local addresses.
+    assert seen[0] == ("example.com", "which bolts", True)
+    assert seen[1] == ("example.com", None, True)
+    assert seen[2] == ("example.com", "opening hours", True)

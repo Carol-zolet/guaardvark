@@ -32,6 +32,90 @@ def _confine_candidates(paths):
     return [p for p in paths if is_within(p, allowed, base=root) and not is_sensitive(p)]
 
 
+def _read_code_input(tool: BaseTool, filepath: str) -> tuple[Optional[str], Optional[str], Optional[str]]:
+    """Text of a file a code tool was pointed at, as (content, error, resolved path).
+
+    Tried in order: a path inside this checkout, or in chat an absolute path the
+    user named, under read_code's rules (.env, credential and key files, excluded
+    folders and git-ignored data other than uploads and outputs are refused); then
+    a path inside UPLOAD_DIR; then, for a bare file name in chat, the upload's
+    Document row. Over MCP nothing outside the checkout and the uploads is read.
+    """
+    from backend.services.guarded_code_service import GuardedCodeError
+    from backend.tools.llama_code_tools import _read_source_file
+    from backend.utils.backend_http import is_mcp_transport
+    from backend.utils.path_safety import is_sensitive, is_within, safe_join
+
+    try:
+        file_data = _read_source_file(filepath, allow_external=not is_mcp_transport(tool))
+        if file_data["scope"] == "external" and not _confine_candidates([file_data["path"]]):
+            return None, f"'{filepath}' is outside the project folder (Settings: Project folder only)", None
+        return file_data["content"], None, file_data["path"]
+    except GuardedCodeError as e:
+        if e.code != "FILE_NOT_FOUND":
+            return None, f"'{filepath}' was refused: {e}", None
+
+    from backend import config
+    upload_dir = getattr(config, "UPLOAD_DIR", "")
+    if upload_dir:
+        try:
+            candidate = safe_join(upload_dir, filepath)
+        except ValueError:
+            candidate = None
+        if candidate and os.path.isfile(candidate):
+            if is_sensitive(candidate):
+                return None, f"'{filepath}' was refused: credential and key files are not read by the code tools", None
+            try:
+                with open(candidate, 'r', encoding='utf-8') as f:
+                    return f.read(), None, os.path.realpath(candidate)
+            except UnicodeDecodeError:
+                return None, f"'{filepath}' is not UTF-8 text", None
+
+    # A chat upload may be known only by its Document row (needs the app database).
+    # Only a bare file name is looked up this way, and only inside the uploads.
+    if "/" not in filepath.replace("\\", "/") and upload_dir:
+        try:
+            from backend.utils.uploaded_file_resolver import find_uploaded_file
+            uploaded = find_uploaded_file(filepath)
+            if uploaded:
+                content, on_disk = uploaded
+                if on_disk and not is_within(on_disk, [upload_dir]):
+                    uploaded = None
+                elif content is not None:
+                    return content, None, on_disk
+                elif on_disk and not is_sensitive(on_disk):
+                    with open(on_disk, 'r', encoding='utf-8') as f:
+                        return f.read(), None, os.path.realpath(on_disk)
+        except Exception as e:
+            logger.warning(f"Upload fallback failed for {filepath}: {e}")
+
+    return None, f"'{filepath}' was not found in this Guaardvark checkout or its uploads", None
+
+
+def _output_file_path(output_dir: str, output_filename: Any) -> str:
+    """The file codegen writes: a relative name strictly inside output_dir.
+    Raises ValueError with the reason otherwise."""
+    from backend.utils.path_safety import safe_join
+
+    name = str(output_filename or "").strip().replace("\\", "/")
+    parts = name.split("/")
+    if not name or name.endswith("/"):
+        raise ValueError("it must name a file")
+    if name.startswith(("/", "~")) or re.match(r"^[A-Za-z]:", name):
+        raise ValueError("absolute paths are refused")
+    if any(part in ("", ".", "..") for part in parts):
+        raise ValueError("'.', '..' and empty folder names are refused")
+    path = safe_join(output_dir, name)
+    if os.path.isdir(path):
+        raise ValueError("it names an existing folder")
+    parent = os.path.dirname(path)
+    while parent and os.path.realpath(parent) != os.path.realpath(output_dir):
+        if os.path.exists(parent) and not os.path.isdir(parent):
+            raise ValueError(f"'{os.path.relpath(parent, output_dir)}' is a file, not a folder")
+        parent = os.path.dirname(parent)
+    return path
+
+
 class CodeGeneratorTool(BaseTool):
     """
     Complete file analysis and code generation tool.
@@ -45,40 +129,53 @@ class CodeGeneratorTool(BaseTool):
     read_only = False
     # Writes OUTPUT_DIR/code/<output_filename>, replacing a file of that name.
     destructive = True
-    description = "Analyze uploaded code files and generate complete, modified versions with requested changes"
+    description = (
+        "Ask Guaardvark's local LLM (Ollama) for a complete version of a code file and save its reply "
+        "as data/outputs/code/<output_filename>, replacing any file of that name there; input_file is "
+        "only read and can never be the output. With input_file the prompt holds that file's full text "
+        "(a file longer than the model's context window is cut by Ollama) plus your instructions; "
+        "without it the model writes a new file from the instructions alone, and the call is refused "
+        "if the instructions name a file that exists in the checkout or the uploads. An empty reply is an error "
+        "and writes nothing. Returns output_path, filename, language, line and character counts and "
+        "the first 500 characters. The model call stops after 180 s; over MCP the call returns an "
+        "error after its timeout (120 s by default); the run is not cancelled and saves if the model "
+        "answers within 180 s of the start, and "
+        "repeating the call with the same idempotency_key waits for that run instead of starting "
+        "another. For review notes without writing, use analyze_code; for non-code files, generate_file."
+    )
 
     parameters = {
         "input_file": ToolParameter(
             name="input_file",
             type="string",
             required=False,
-            description="Path to input file to analyze and modify (optional)",
+            description="Existing file to rewrite: a path relative to the Guaardvark checkout (e.g. 'backend/app.py'; refused like read_code: .env, key files, git-ignored data other than uploads and outputs), or a path inside the uploads folder (e.g. 'Code/app.py'). Over MCP an absolute path works only inside the checkout; in Guaardvark's own chat one elsewhere works too, except system and key folders, and not with Settings > Project folder only on. Leave empty to write a new file. A named file that is missing, unreadable or empty is an error.",
             default=""
         ),
         "output_filename": ToolParameter(
             name="output_filename",
             type="string",
             required=True,
-            description="Output filename for generated code"
+            description="File name to write under data/outputs/code, e.g. 'app_v2.py' or 'web/form.jsx'; subfolders are created. Absolute paths, '~', '.', '..' and existing folder names are refused. Its extension picks the language when language is 'auto'."
         ),
         "instructions": ToolParameter(
             name="instructions",
             type="string",
             required=True,
-            description="Modification instructions or code generation request"
+            description="What to change in input_file, or what the new file should do. Besides this text the model gets only input_file's content, the file names and the language: no chat history and no other files."
         ),
         "language": ToolParameter(
             name="language",
             type="string",
             required=False,
-            description="Programming language (auto-detected from extension if not specified)",
+            description="Language name for the prompt, e.g. 'python' or 'typescript'. Default 'auto' maps output_filename's extension (.py, .js, .jsx, .ts, .tsx, .go, .rs, .java, .sh, .sql, .html, .css, .json, .yaml and others); for other extensions name the language.",
             default="auto"
         ),
         "preserve_structure": ToolParameter(
             name="preserve_structure",
             type="bool",
             required=False,
-            description="Preserve original file structure and formatting",
+            description="With input_file: true (default) tells the model to keep the file's exact layout and formatting apart from the requested changes; false lets it reorganise where the changes call for it.",
             default=True
         )
     }
@@ -127,43 +224,8 @@ class CodeGeneratorTool(BaseTool):
         ext = os.path.splitext(filename)[1].lower()
         return self.LANGUAGE_MAP.get(ext, 'unknown')
 
-    def _read_input_file(self, filepath: str) -> Optional[str]:
-        """Read input file content if it exists"""
-        if not filepath:
-            return None
-
-        # Try multiple possible locations
-        possible_paths = [
-            filepath,
-            os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), filepath),
-            os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "uploads", filepath),
-        ]
-        possible_paths = _confine_candidates(possible_paths)
-
-        for path in possible_paths:
-            if os.path.exists(path):
-                try:
-                    with open(path, 'r', encoding='utf-8') as f:
-                        return f.read()
-                except Exception as e:
-                    logger.warning(f"Failed to read {path}: {e}")
-
-        # Final fallback: maybe the file is a chat upload (Documents row +
-        # bytes under data/uploads/), which none of the paths above check.
-        try:
-            from backend.utils.uploaded_file_resolver import find_uploaded_file
-            uploaded = find_uploaded_file(filepath)
-            if uploaded:
-                content, on_disk = uploaded
-                if content is not None:
-                    return content
-                if on_disk:
-                    with open(on_disk, 'r', encoding='utf-8') as f:
-                        return f.read()
-        except Exception as e:
-            logger.warning(f"Upload fallback failed for {filepath}: {e}")
-
-        return None
+    def _read_input_file(self, filepath: str) -> tuple[Optional[str], Optional[str], Optional[str]]:
+        return _read_code_input(self, filepath)
 
     def _referenced_existing_file(self, instructions: str) -> Optional[str]:
         """If the instructions name a file that already exists (uploaded or in
@@ -173,13 +235,14 @@ class CodeGeneratorTool(BaseTool):
             cand = cand.strip()
             if not cand:
                 continue
+            # Looked up exactly as input_file would be (checkout, then uploads), so a
+            # refused path (outside the checkout over MCP, git-ignored, credentials)
+            # reads as absent and the answer never reveals whether it exists.
             try:
-                from backend.utils.uploaded_file_resolver import find_uploaded_file
-                if find_uploaded_file(cand):
-                    return cand
+                _content, _error, found = _read_code_input(self, cand)
             except Exception:
-                pass
-            if os.path.exists(cand):
+                continue
+            if found:
                 return cand
         return None
 
@@ -192,8 +255,32 @@ class CodeGeneratorTool(BaseTool):
         preserve_structure = kwargs.get("preserve_structure", True)
 
         try:
-            # Read input file first (no LLM needed).
-            input_content = self._read_input_file(input_file) if input_file else None
+            # Check the output name before spending any model time on it.
+            from backend.config import OUTPUT_DIR
+            output_dir = os.path.join(OUTPUT_DIR, "code")
+            try:
+                output_path = _output_file_path(output_dir, output_filename)
+            except ValueError as e:
+                return ToolResult(
+                    success=False,
+                    error=f"output_filename '{output_filename}' must be a file name inside data/outputs/code: {e}",
+                )
+            clean_name = os.path.relpath(output_path, output_dir)
+
+            # Read input file first (no LLM needed). A named input that cannot be
+            # read, or is empty, is an error, never a silent generate-from-scratch.
+            input_content = None
+            if input_file:
+                input_content, read_error, source_path = self._read_input_file(input_file)
+                if read_error:
+                    return ToolResult(success=False, error=f"codegen could not read input_file: {read_error}")
+                if not (input_content or "").strip():
+                    return ToolResult(success=False, error=f"input_file '{input_file}' is empty")
+                if source_path and os.path.realpath(source_path) == os.path.realpath(output_path):
+                    return ToolResult(
+                        success=False,
+                        error="output_filename names input_file itself; choose a different output name",
+                    )
 
             # Refuse to fabricate before doing any work: if nothing was read but
             # the instructions name an existing file, require input_file rather
@@ -214,8 +301,16 @@ class CodeGeneratorTool(BaseTool):
             llm = self._get_llm()
 
             # Detect language
-            if language == "auto":
-                language = self._detect_language(output_filename)
+            if not language or language == "auto":
+                language = self._detect_language(clean_name)
+            fence = "" if language == "unknown" else language
+            kind = "" if language == "unknown" else f"{language} "
+
+            layout_rule = (
+                "Maintain exact formatting, indentation, and structure"
+                if preserve_structure not in (False, "false", "False", 0)
+                else "You may reorganise and reformat the file where the requested changes call for it"
+            )
 
             # Build the generation prompt
             if input_content:
@@ -226,11 +321,11 @@ CRITICAL INSTRUCTIONS:
 2. Generate a complete, identical file with the requested modifications
 3. Preserve ALL existing functionality except specified changes
 4. Never truncate or summarize - return the complete file
-5. Maintain exact formatting, indentation, and structure
+5. {layout_rule}
 6. Include all imports, functions, classes, and dependencies
 
 INPUT FILE ({input_file}):
-```{language}
+```{fence}
 {input_content}
 ```
 
@@ -247,16 +342,16 @@ OUTPUT THE COMPLETE FILE NOW (no explanations, just code):"""
             else:
                 prompt = f"""You are CodeGen, an expert AI specialized in code generation.
 
-TASK: Generate a complete {language} file
+TASK: Generate a complete {kind}file
 
-FILENAME: {output_filename}
+FILENAME: {clean_name}
 
 REQUIREMENTS:
 {instructions}
 
 QUALITY STANDARDS:
 - Generate clean, readable, maintainable code
-- Follow {language} best practices
+- Follow the conventions of the language the file name implies
 - Include proper error handling
 - Add appropriate comments for complex logic
 - Ensure the file is immediately usable
@@ -286,20 +381,14 @@ OUTPUT THE COMPLETE FILE NOW (no explanations, no markdown fences, just code):""
                     lines = lines[:-1]
                 code_content = '\n'.join(lines)
 
-            # Save to disk — use project's configured OUTPUT_DIR
-            from backend.config import OUTPUT_DIR
-            output_dir = os.path.join(OUTPUT_DIR, "code")
-            
-            # Use context to determine output logic if available
-            if self._context:
-                # Example: If project_id is present, maybe save to a project-specific folder
-                # For now, we just log it as a proof of concept
-                project_id = self._context.get("project_id")
-                if project_id:
-                    logger.info(f"CodeGenerator using context: project_id={project_id}")
-            
-            os.makedirs(output_dir, exist_ok=True)
-            output_path = os.path.join(output_dir, output_filename)
+            # Checked after the fence is removed: a reply of only a fence is empty too.
+            if not code_content.strip():
+                return ToolResult(
+                    success=False,
+                    error="The model returned no code, so nothing was written. Try again or reword the instructions.",
+                )
+
+            os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
             with open(output_path, 'w', encoding='utf-8') as f:
                 f.write(code_content)
@@ -312,7 +401,7 @@ OUTPUT THE COMPLETE FILE NOW (no explanations, no markdown fences, just code):""
                 success=True,
                 output={
                     "output_path": output_path,
-                    "filename": output_filename,
+                    "filename": clean_name,
                     "language": language,
                     "line_count": line_count,
                     "char_count": char_count,
@@ -341,20 +430,31 @@ class CodeAnalysisTool(BaseTool):
 
     name = "analyze_code"
     read_only = True
-    description = "Analyze code files for structure, patterns, best practices, and potential improvements"
+    description = (
+        "Review one text file with Guaardvark's local LLM (Ollama) and return its written findings; "
+        "nothing is changed or written, and an empty reply is an error. The model is told to cite a line number for each finding, "
+        "which is not checked. analysis_type picks the focus. A file over 48,000 characters is not "
+        "sent whole: the model gets its first 28,800 and last 14,400 characters plus an outline of "
+        "imports, classes and function lines, and the result has truncated=true. Returns file, "
+        "language, analysis_type, analysis, line_count, char_count, truncated and visible_lines. The "
+        "model call stops after 180 s; over MCP a call that outlasts its timeout (120 s by default) "
+        "returns an error. To read the file yourself use read_code (for an upload, 'data/uploads/<path>'); "
+        "for a changed copy, codegen."
+    )
 
     parameters = {
         "file_path": ToolParameter(
             name="file_path",
             type="string",
             required=True,
-            description="Path to the code file to analyze"
+            description="File to review: a path relative to the Guaardvark checkout (e.g. 'backend/app.py'; refused like read_code: .env, key files, git-ignored data other than uploads and outputs), or a path inside the uploads folder (e.g. 'Code/app.py'). Over MCP an absolute path works only inside the checkout; in Guaardvark's own chat one elsewhere works too, except system and key folders, and not with Settings > Project folder only on."
         ),
         "analysis_type": ToolParameter(
             name="analysis_type",
             type="string",
             required=False,
-            description="Type of analysis: 'full', 'structure', 'security', 'performance', 'style'",
+            enum=["full", "structure", "security", "performance", "style"],
+            description="Focus of the review: full (default) covers everything; structure (imports, classes, functions, organisation); security (injection, auth, unsafe calls); performance (bottlenecks, memory); style (naming, formatting, documentation).",
             default="full"
         )
     }
@@ -368,40 +468,6 @@ class CodeAnalysisTool(BaseTool):
             from backend.utils.llm_service import get_default_llm
             self._llm = get_default_llm()
         return self._llm
-
-    def _read_file(self, filepath: str) -> Optional[str]:
-        """Read file content"""
-        possible_paths = [
-            filepath,
-            os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), filepath),
-            os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "uploads", filepath),
-        ]
-        possible_paths = _confine_candidates(possible_paths)
-
-        for path in possible_paths:
-            if os.path.exists(path):
-                try:
-                    with open(path, 'r', encoding='utf-8') as f:
-                        return f.read()
-                except Exception as e:
-                    logger.warning(f"Failed to read {path}: {e}")
-
-        # Final fallback: maybe the file is a chat upload (Documents row +
-        # bytes under data/uploads/), which none of the paths above check.
-        try:
-            from backend.utils.uploaded_file_resolver import find_uploaded_file
-            uploaded = find_uploaded_file(filepath)
-            if uploaded:
-                content, on_disk = uploaded
-                if content is not None:
-                    return content
-                if on_disk:
-                    with open(on_disk, 'r', encoding='utf-8') as f:
-                        return f.read()
-        except Exception as e:
-            logger.warning(f"Upload fallback failed for {filepath}: {e}")
-
-        return None
 
     def _extract_structure(self, content: str, language: str) -> str:
         """Extract code structure summary for large files"""
@@ -439,16 +505,17 @@ class CodeAnalysisTool(BaseTool):
         MAX_CONTENT_SIZE = 48000
 
         try:
-            content = self._read_file(file_path)
+            content, read_error, _source = _read_code_input(self, file_path)
+            if read_error:
+                return ToolResult(success=False, error=f"Could not read file: {read_error}")
             if not content:
-                return ToolResult(
-                    success=False,
-                    error=f"Could not read file: {file_path}"
-                )
+                return ToolResult(success=False, error=f"'{file_path}' is empty; there is nothing to analyse")
 
             llm = self._get_llm()
             original_size = len(content)
-            line_count = len(content.split('\n'))
+            # A final newline ends the last line; it does not start another.
+            ends_with_newline = content.endswith('\n')
+            line_count = content.count('\n') + (0 if ends_with_newline else 1)
 
             ext = os.path.splitext(file_path)[1].lower()
             language = CodeGeneratorTool.LANGUAGE_MAP.get(ext, 'unknown')
@@ -475,11 +542,11 @@ class CodeAnalysisTool(BaseTool):
                 head_text = content[:first_portion]
                 tail_text = content[-last_portion:]
                 head_last_line = head_text.count('\n') + 1
-                tail_first_line = line_count - tail_text.count('\n')
+                tail_first_line = line_count - tail_text.count('\n') + (1 if ends_with_newline else 0)
                 omitted_lines = max(tail_first_line - head_last_line - 1, 0)
                 content = (
                     head_text +
-                    f"\n\n... [TRUNCATED: {original_size - MAX_CONTENT_SIZE} chars / "
+                    f"\n\n... [TRUNCATED: {original_size - first_portion - last_portion} chars / "
                     f"~{omitted_lines} lines omitted. You are seeing lines 1-{head_last_line} "
                     f"and lines {tail_first_line}-{line_count} only.] ...\n\n" +
                     tail_text
@@ -504,13 +571,14 @@ class CodeAnalysisTool(BaseTool):
                     "Do not pad the review with generic best-practice advice that isn't tied to something you actually observed.\n"
                 )
 
-            prompt = f"""Analyze this {language} code file.
+            label = "" if language == "unknown" else f"{language} "
+            prompt = f"""Analyze this {label}code file.
 
 FILE: {file_path}
 SIZE: {original_size} chars, {line_count} lines{' (TRUNCATED for analysis)' if truncated else ''}
 {f'STRUCTURE SUMMARY: {structure_summary}' if structure_summary else ''}
 
-```{language}
+```{"" if language == "unknown" else language}
 {content}
 ```
 
@@ -531,6 +599,8 @@ Provide a structured analysis grounded in the visible code, with line citations 
                     analysis = analysis.strip()
             else:
                 analysis = ""
+            if not analysis:
+                return ToolResult(success=False, error="The model returned no analysis. Try again.")
 
             return ToolResult(
                 success=True,
@@ -541,7 +611,10 @@ Provide a structured analysis grounded in the visible code, with line citations 
                     "analysis": analysis,
                     "line_count": line_count,
                     "char_count": original_size,
-                    "truncated": truncated
+                    "truncated": truncated,
+                    "visible_lines": (
+                        [[1, head_last_line], [tail_first_line, line_count]] if truncated else [[1, line_count]]
+                    ),
                 },
                 metadata={
                     "file": file_path,

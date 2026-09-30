@@ -23,6 +23,11 @@ PROTECTED_PREFIXES = (
     # Social outreach has kill switches, draft approval, and fetch-meta — none of
     # which should be reachable from another machine on the LAN without an API key.
     '/api/social-outreach/',
+    # Raw file download for everything under data/outputs, chat exports and
+    # screenshots included (backend/routes/download_route.py). Only MCP resource
+    # links point here, and those are local; the web UI loads outputs through
+    # /api/outputs, which stays open to LAN browsers.
+    '/outputs/',
 )
 
 # Browser/desktop/MCP automation and direct tool execution can read files, run
@@ -31,7 +36,8 @@ PROTECTED_PREFIXES = (
 # API-key field; GUAARDVARK_PROTECT_TOOL_ENDPOINTS=true closes them to remote
 # hosts without the key.
 if os.environ.get("GUAARDVARK_PROTECT_TOOL_ENDPOINTS", "").strip().lower() in ("1", "true", "yes", "on"):
-    PROTECTED_PREFIXES = PROTECTED_PREFIXES + ('/api/automation/', '/api/tools/execute')
+    # Tool jobs hold the results of tool calls, so they follow /api/tools/execute.
+    PROTECTED_PREFIXES = PROTECTED_PREFIXES + ('/api/automation/', '/api/tools/execute', '/api/tools/jobs/')
 
 # File APIs include both the document library and the live repository editor.
 # Keep read-only document browser GETs public for the local UI, but protect

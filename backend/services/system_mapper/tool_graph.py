@@ -334,13 +334,14 @@ def _find_invocations(root: Path, tool_names: set[str]) -> dict[str, list[str]]:
         return out
     name_re = {name: re.compile(rf"""['"]\b{re.escape(name)}\b['"]""") for name in tool_names}
     for py in backend.rglob("*.py"):
-        if "/__pycache__/" in str(py) or "/venv/" in str(py):
+        rel = str(py.relative_to(root))
+        # Tested below root, so a checkout under a folder named venv is still read.
+        if "/__pycache__/" in f"/{rel}" or "/venv/" in f"/{rel}":
             continue
         try:
             text = py.read_text(encoding="utf-8", errors="ignore")
         except Exception:
             continue
-        rel = str(py.relative_to(root))
         for name, rx in name_re.items():
             if rx.search(text):
                 out[name].append(rel)
