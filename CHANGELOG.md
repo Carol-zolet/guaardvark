@@ -13,6 +13,16 @@
   progress and voice; its connection was refused before. The Interconnector's status, register
   and heartbeat routes still accept any private-network page, which is how a client node's
   Settings page reaches its master.
+- **A browser preflight no longer needs the API key.** Once a key existed, a UI built with an
+  absolute `VITE_API_BASE_URL` could not call protected routes: the browser's CORS preflight
+  (an OPTIONS request, which never carries a key or cookie) was refused, so the real request was
+  never sent. OPTIONS requests that Flask answers itself now pass; the request that follows still
+  needs the key or a signed-in browser.
+- **The restart log server answers only this install's pages.** During a restart from Settings
+  the log shown on the page came from a small server that listened on every network address,
+  let any web page read the restart log, and had a `/shutdown` link that did not stop it but kept
+  the process from ever exiting. It now listens on this machine only, only Guaardvark's own
+  pages can read the log, and `POST /shutdown` stops it.
 - **`start.sh` stops when run as root.** With `sudo`, the install landed under `/root` and left
   files the normal user could not write. It now says to run it as your normal user; it asks
   for your password itself when it installs system packages. Machines where root is the only

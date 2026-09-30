@@ -288,7 +288,7 @@ const RebootProgressModal = ({ open, onClose }) => {
 
     // Shutdown the log server (best-effort)
     if (logServerUrlRef.current) {
-      fetch(`${logServerUrlRef.current}/shutdown`).catch(() => {});
+      fetch(`${logServerUrlRef.current}/shutdown`, { method: 'POST' }).catch(() => {});
     }
 
     setTimeout(() => {

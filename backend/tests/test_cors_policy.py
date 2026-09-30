@@ -5,22 +5,28 @@ machine's names and addresses, VITE_FRONTEND_URL, and GUAARDVARK_CORS_ORIGINS.
 The Interconnector's three node routes also take private-network and loopback
 origins. Flask-CORS is driven through init_cors (what backend/app.py calls) on
 a bare Flask app, Engine.IO through a real Socket.IO server using the same
-check, and the sign-in cookie through api_session. The machine's names are a
-fixed stand-in; no backend, GPU or network.
+check, and the sign-in cookie through api_session. Preflights to protected
+routes go through the real auth hook and tools blueprint with a stand-in tool
+registry. The machine's names are a fixed stand-in; no backend, GPU or network.
 """
+
+from types import SimpleNamespace
 
 import pytest
 import socketio as python_socketio
-from flask import Flask
+from flask import Flask, request
 from werkzeug.test import Client
 
-from backend.utils import api_session, cors_policy
+from backend.api.tools_api import tools_bp
+from backend.services.agent_tools import ToolResult
+from backend.utils import api_session, auth_guard, cors_policy
 
 MACHINE = frozenset({"localhost", "127.0.0.1", "::1", "192.168.1.20", "workstation", "workstation.local"})
 OTHER_DEVICE = "http://192.168.1.77:5173"
+REMOTE = {"REMOTE_ADDR": "192.0.2.10"}  # TEST-NET-1: never one of this machine's addresses
 ENV_NAMES = (
     "VITE_PORT", "FLASK_PORT", "PORT", "VITE_FRONTEND_URL", "VITE_ALLOWED_HOSTS",
-    cors_policy.EXTRA_ORIGINS_ENV,
+    cors_policy.EXTRA_ORIGINS_ENV, auth_guard.API_KEY_ENV, auth_guard.TOOL_ENDPOINTS_ENV,
 )
 
 
@@ -258,3 +264,78 @@ def test_the_cookie_is_accepted_from_this_installs_frontend_only(site, origin, a
         headers["Origin"] = origin
     with Flask(__name__).test_request_context("/api/tools/execute", method="POST", headers=headers):
         assert api_session.request_origin_allowed() is accepted
+
+
+# ---- preflights to protected routes -----------------------------------------
+
+KEY = "preflight-test-key-0123456789abcdef"
+CALL = {"tool_name": "echo", "parameters": {}}
+
+
+@pytest.fixture
+def guarded(monkeypatch):
+    """Protected routes behind the real auth hook and this policy, with a key
+    configured. ``ran`` records every view and tool that actually ran."""
+    monkeypatch.setenv(auth_guard.API_KEY_ENV, KEY)
+    ran = []
+    app = Flask(__name__)
+    app.before_request(auth_guard.check_endpoint_auth)
+    app.register_blueprint(tools_bp)
+    app.tool_registry = SimpleNamespace(
+        get_tool=lambda name: SimpleNamespace(parameters={}),
+        execute_tool=lambda name, **params: ran.append(name) or ToolResult(success=True, output="ran"),
+    )
+
+    @app.route("/api/code-execution/handles-options", methods=["POST", "OPTIONS"])
+    def handles_options():
+        ran.append(request.method)
+        return {"ran": True}
+
+    cors_policy.init_cors(app)
+    return app.test_client(), ran
+
+
+def _guarded_preflight(client, path, origin):
+    return client.options(path, environ_base=REMOTE, headers={
+        "Origin": origin,
+        "Access-Control-Request-Method": "POST",
+        "Access-Control-Request-Headers": "content-type,x-api-key",
+    })
+
+
+def test_a_preflight_to_a_protected_route_is_answered_for_this_install(guarded):
+    client, ran = guarded
+    response = _guarded_preflight(client, "/api/tools/execute", "http://localhost:5173")
+    assert response.status_code == 200
+    assert _allow_origin(response) == "http://localhost:5173"
+    assert response.headers.get("Access-Control-Allow-Credentials") == "true"
+    assert "x-api-key" in response.headers["Access-Control-Allow-Headers"].lower()
+    assert ran == []
+
+
+@pytest.mark.parametrize("origin", ["https://evil.example", OTHER_DEVICE])
+def test_a_preflight_from_another_page_gets_no_cors_headers(guarded, origin):
+    client, ran = guarded
+    response = _guarded_preflight(client, "/api/tools/execute", origin)
+    assert _allow_origin(response) is None
+    assert ran == []
+
+
+def test_the_request_after_the_preflight_still_needs_the_key(guarded):
+    client, ran = guarded
+    headers = {"Origin": "http://localhost:5173"}
+    refused = client.post("/api/tools/execute", json=CALL, headers=headers, environ_base=REMOTE)
+    assert refused.status_code == 401
+    assert refused.get_json()["code"] == auth_guard.API_KEY_CODE
+    assert ran == []
+    allowed = client.post("/api/tools/execute", json=CALL, environ_base=REMOTE,
+                          headers={**headers, auth_guard.API_KEY_HEADER: KEY})
+    assert allowed.status_code == 200
+    assert ran == ["echo"]
+
+
+def test_an_options_a_view_handles_itself_is_still_guarded(guarded):
+    client, ran = guarded
+    response = _guarded_preflight(client, "/api/code-execution/handles-options", "http://localhost:5173")
+    assert response.status_code == 401
+    assert ran == []

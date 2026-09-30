@@ -6,7 +6,16 @@ Launched by reboot_api.py before start.sh runs. Survives Flask shutdown because:
   2. Its command doesn't match stop.sh's kill patterns (python.*backend[./]app)
   3. It runs in its own process group (os.setsid)
 
-Auto-terminates after a configurable timeout (default 5 minutes).
+Stops after a configurable timeout (default 5 minutes), or earlier on
+POST /shutdown.
+
+It listens on 127.0.0.1 only. The reboot page is handed
+http://localhost:<port>, which only a browser on this machine can reach; a
+browser on another device goes straight to polling the backend's health.
+A reply names the requesting page in Access-Control-Allow-Origin only when
+the page is one of this install's frontend origins, which reboot_api.py passes
+as --allow-origin, so no other page can read the log. POST /shutdown is
+refused to a page on any other origin; the backend's own call sends no Origin.
 """
 
 import argparse
@@ -25,9 +34,10 @@ class RebootLogHandler(BaseHTTPRequestHandler):
     log_file_path = ""
     server_start_time = 0.0
     max_lifetime = 300
+    allowed_origins: frozenset = frozenset()
 
     def do_OPTIONS(self):
-        self.send_response(200)
+        self.send_response(204)
         self._cors()
         self.end_headers()
 
@@ -36,11 +46,20 @@ class RebootLogHandler(BaseHTTPRequestHandler):
         if path == "/log":
             self._handle_log()
         elif path == "/shutdown":
-            self._json({"ok": True})
-            import threading
-            threading.Timer(0.3, self.server.shutdown).start()
+            # A GET can be sent by any page (an <img> tag), so it stops nothing.
+            self.send_error(405, "Use POST")
         else:
             self.send_error(404)
+
+    def do_POST(self):
+        if urlparse(self.path).path != "/shutdown":
+            self.send_error(404)
+            return
+        if self.headers.get("Origin") is not None and not self._origin_allowed():
+            self._json({"ok": False, "error": "origin not allowed"}, 403)
+            return
+        self.server.stop_requested = True
+        self._json({"ok": True})
 
     # ---- handlers ----
 
@@ -78,6 +97,10 @@ class RebootLogHandler(BaseHTTPRequestHandler):
 
     # ---- helpers ----
 
+    def _origin_allowed(self):
+        origin = (self.headers.get("Origin") or "").strip().rstrip("/").lower()
+        return origin in self.allowed_origins
+
     def _json(self, data, code=200):
         body = json.dumps(data).encode("utf-8")
         self.send_response(code)
@@ -88,9 +111,10 @@ class RebootLogHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _cors(self):
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "*")
+        self.send_header("Vary", "Origin")
+        if self._origin_allowed():
+            self.send_header("Access-Control-Allow-Origin", self.headers["Origin"])
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
 
     def log_message(self, fmt, *args):
         pass  # suppress access logs
@@ -101,24 +125,31 @@ def main():
     parser.add_argument("--port", type=int, required=True)
     parser.add_argument("--log-file", type=str, required=True)
     parser.add_argument("--timeout", type=int, default=300)
+    parser.add_argument("--allow-origin", action="append", default=[],
+                        help="a page origin allowed to read the log (repeatable)")
     args = parser.parse_args()
 
     RebootLogHandler.log_file_path = os.path.abspath(args.log_file)
     RebootLogHandler.server_start_time = time.time()
     RebootLogHandler.max_lifetime = args.timeout
+    RebootLogHandler.allowed_origins = frozenset(
+        o.strip().rstrip("/").lower() for o in args.allow_origin if o.strip()
+    )
 
     try:
-        server = HTTPServer(("0.0.0.0", args.port), RebootLogHandler)
+        server = HTTPServer(("127.0.0.1", args.port), RebootLogHandler)
     except OSError as exc:
         print(f"Cannot bind port {args.port}: {exc}", file=sys.stderr, flush=True)
         sys.exit(1)
 
-    server.timeout = 1  # wake every second to check lifetime
+    server.timeout = 1  # wake every second to check lifetime and /shutdown
+    server.stop_requested = False
 
-    print(f"Log server on :{args.port}  file={args.log_file}  timeout={args.timeout}s", flush=True)
+    print(f"Log server on 127.0.0.1:{args.port}  file={args.log_file}  timeout={args.timeout}s", flush=True)
 
     try:
-        while time.time() - RebootLogHandler.server_start_time < args.timeout:
+        while (not server.stop_requested
+               and time.time() - RebootLogHandler.server_start_time < args.timeout):
             server.handle_request()
     except KeyboardInterrupt:
         pass
