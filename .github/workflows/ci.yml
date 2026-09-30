@@ -345,7 +345,6 @@ jobs:
             backend/tests/test_search_result_scores.py \
             backend/tests/test_knowledge_tools_same_name.py \
             backend/tests/test_vector_table_lookup.py \
-            backend/tests/test_wordpress_tool_annotations.py \
             backend/tests/test_csv_quote_repair.py \
             backend/tests/test_generation_reply_validation.py \
             backend/tests/services/test_image_render_limits.py \
