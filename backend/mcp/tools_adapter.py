@@ -242,6 +242,22 @@ def _error_result(text: str) -> mcp_types.CallToolResult:
     )
 
 
+def _drop_internal_arguments(arguments: dict[str, Any], schema: dict[str, Any]) -> list[str]:
+    """Remove, in place, the underscore keys a client sent that the tool does
+    not publish, and return their names.
+
+    Inside the backend an underscore key carries the caller's own context to a
+    tool: ``_agent_context`` holds the chat's session, project and workspace
+    root, and tools act on it (``save_memory`` files the memory under that
+    project). An MCP client has no such context to give, so it may not supply
+    one."""
+    published = schema.get("properties") or {}
+    dropped = sorted(key for key in arguments if str(key).startswith("_") and key not in published)
+    for key in dropped:
+        del arguments[key]
+    return dropped
+
+
 def _argument_error(validator: Draft202012Validator | None, arguments: dict[str, Any]) -> str | None:
     """The most relevant schema violation in ``arguments``, or None.
     A null value counts as an omitted optional argument."""
@@ -410,7 +426,10 @@ def build_tool_handlers(config: MCPConfig) -> tuple[Any, Any, int]:
                 rec["error_code"] = "tool_not_exposed"
                 return _error_result(f"Tool '{name}' is not exposed by this MCP server.")
 
-            base_tool, _ = pair
+            base_tool, mcp_tool = pair
+            dropped = _drop_internal_arguments(arguments, mcp_tool.input_schema)
+            if dropped:
+                logger.warning("MCP: ignored internal argument(s) %s sent to '%s'", dropped, name)
             read_only = getattr(base_tool, "read_only", None) is True
             key = arguments.pop(IDEMPOTENCY_KEY, None)
             key = str(key) if key not in (None, "") else None

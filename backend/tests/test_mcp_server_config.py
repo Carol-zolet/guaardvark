@@ -1,16 +1,20 @@
 """The MCP server's own configuration: its on/off switch and per-call ceiling
-(kept apart from the backend's MCP client settings, which share ``.env``), and
-how ``data/config/mcp.json`` is read."""
+(kept apart from the backend's MCP client settings, which share ``.env``), how
+``data/config/mcp.json`` is read, and what the tools adapter does with the
+arguments and waits of a call."""
 
+import asyncio
 import json
 import logging
 from pathlib import Path
 
+import mcp.types as mcp_types
 import pytest
 
 from backend.mcp import config as mcp_config
 from backend.mcp import tools_adapter
 from backend.mcp.config import MCPConfig
+from backend.services.agent_tools import BaseTool, ToolParameter, ToolResult
 
 _ENV = ("GUAARDVARK_MCP_SERVER_ENABLED", "GUAARDVARK_MCP_SERVER_TIMEOUT",
         "GUAARDVARK_MCP_TIMEOUT", "GUAARDVARK_MCP_ENABLED")
@@ -186,3 +190,44 @@ def test_argument_defaults_merge_with_the_built_in_map(mcp_json):
     mcp_json({"server": {"tools": {"argument_defaults": {"generate_image": {"wait_for_result": True}}}}})
     assert mcp_config.load_config().tools.argument_defaults == {"generate_image": {"wait_for_result": True}}
     assert MCPConfig().tools.argument_defaults == built_in
+
+
+# ---- arguments a client may not supply --------------------------------------------------------
+class _Echo(BaseTool):
+    name, description, read_only = "echo", "records what it is given", True
+    parameters = {"text": ToolParameter(name="text", type="string", required=True)}
+
+    def __init__(self):
+        super().__init__()
+        self.seen = None
+
+    def execute(self, **kwargs):
+        self.seen = kwargs
+        return ToolResult(success=True, output="ok")
+
+
+def _call(monkeypatch, tool, arguments):
+    published = mcp_types.Tool(
+        name=tool.name, description=tool.description,
+        input_schema=tools_adapter._tool_input_schema(tool), annotations=tools_adapter._annotations(tool))
+    monkeypatch.setattr(tools_adapter, "collect_exposed_tools", lambda _cfg: [(tool, published)])
+    _on_list, on_call, _count = tools_adapter.build_tool_handlers(MCPConfig())
+    return asyncio.run(on_call(None, mcp_types.CallToolRequestParams(name=tool.name, arguments=arguments)))
+
+
+def test_underscore_keys_from_a_client_do_not_reach_the_tool(monkeypatch):
+    tool = _Echo()
+
+    result = _call(monkeypatch, tool, {
+        "text": "hi", "_agent_context": {"project_id": 7, "workspace_root": "/x"}, "_anything": 1, "extra": 2})
+
+    assert not result.is_error
+    assert tool.seen == {"text": "hi", "extra": 2}
+
+
+def test_an_underscore_key_the_tool_publishes_is_kept():
+    arguments = {"_mode": "a", "_agent_context": {"project_id": 7}}
+
+    dropped = tools_adapter._drop_internal_arguments(arguments, {"properties": {"_mode": {"type": "string"}}})
+
+    assert dropped == ["_agent_context"] and arguments == {"_mode": "a"}
