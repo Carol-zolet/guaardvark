@@ -390,24 +390,10 @@ class WebAnalysisTool(BaseTool):
 
 
 def _web_access_block_reason(action: str) -> str | None:
-    """None when web access is enabled; otherwise the error the tool returns."""
-    disabled = f"Web access is disabled. Enable it in Settings to {action}."
-    try:
-        from flask import has_app_context
-        from backend.utils.settings_utils import get_web_access
-        if has_app_context():
-            return None if get_web_access() else disabled
-    except Exception:
-        pass
-    from backend.utils.backend_http import BackendError, in_mcp_process, request_json
-    if in_mcp_process():
-        # The MCP server has no Flask app; the backend owns the setting.
-        try:
-            data = request_json("GET", "/api/settings/web_access").data or {}
-        except BackendError as e:
-            return f"Could not check whether web access is enabled: {e}"
-        return None if data.get("allow_web_search") else disabled
-    return disabled
+    """None when web access is enabled; otherwise the error the tool returns.
+    The check is the one research tasks and the outreach recon make too."""
+    from backend.utils.settings_utils import web_access_block_reason
+    return web_access_block_reason(action)
 
 
 def _is_web_access_allowed() -> bool:
@@ -531,7 +517,8 @@ class WebSearchTool(BaseTool):
         f"says so; when {SEARCH_ENGINE} refuses the search or cannot be reached, the call fails with "
         f"the reason. A question about the weather in a named place goes to {WEATHER_SOURCE} "
         "instead; the current time and plain arithmetic are answered on this machine; a URL in the "
-        "query is fetched directly. Needs web access on in Settings (off by default)."
+        "query is fetched directly, as fetch_url fetches it: private and local addresses are refused, "
+        "including after a redirect. Needs web access on in Settings (off by default)."
     )
 
     parameters = {
@@ -577,15 +564,11 @@ class WebSearchTool(BaseTool):
 
         try:
             from backend.api.web_search_api import enhanced_web_search, search_result_count
-            from backend.utils.backend_http import is_mcp_transport
 
             # Chat callers are not held to the schema's bounds, so the number
             # is brought into range here.
             max_results = search_result_count(kwargs.get("max_results", DEFAULT_SEARCH_RESULTS))
-            # A URL in the query is fetched directly; over MCP only a public
-            # address may be, as with fetch_url.
-            search_results = enhanced_web_search(
-                query, public_only=is_mcp_transport(self), max_results=max_results)
+            search_results = enhanced_web_search(query, max_results=max_results)
 
             if search_results and not search_results.get("success") and (
                     (search_results.get("data") or {}).get("type") == "no_results"):
