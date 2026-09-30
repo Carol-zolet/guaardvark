@@ -13,12 +13,10 @@ from backend.utils.response_utils import success_response, error_response
 from backend.utils.settings_utils import get_web_access
 from backend.utils.safe_math import evaluate_arithmetic
 from backend.utils.text_focus import focus_window
+from backend.utils.web_fetch import FetchFailed, FetchRefused, decode_page, fetch_page
 
 web_search_bp = Blueprint("web_search_api", __name__, url_prefix="/api/web-search")
 logger = logging.getLogger(__name__)
-
-MAX_REDIRECTS = 5
-
 
 def extract_website_content(url: str, query: Optional[str] = None, public_only: bool = False) -> Dict[str, Any]:
     """Fetch a page and return its title, description and up to 2,000 characters of its text.
@@ -26,6 +24,10 @@ def extract_website_content(url: str, query: Optional[str] = None, public_only: 
     ``public_only`` refuses any address that is not globally routable, on every
     redirect hop (the fetch_url and analyze_website tools ask for it). Logins
     saved in ~/.netrc are never sent, with or without it.
+
+    The fetch is bounded in size and time (:mod:`backend.utils.web_fetch`). A
+    page that was read only in part is still returned, with ``page_cut`` saying
+    what was left out; the key is absent for a page read in full.
 
     With ``query`` the text is the stretch of the page about the query
     (:func:`backend.utils.text_focus.focus_window`); without it, the head of the page.
@@ -44,46 +46,15 @@ def extract_website_content(url: str, query: Optional[str] = None, public_only: 
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
         }
 
-        current = url
-        if public_only:
-            # Redirects are followed one hop at a time so every hop is checked: a
-            # public page must not be able to bounce the fetch onto this machine.
-            from urllib.parse import urljoin
-            from backend.utils.hosts import (
-                PrivateAddressError, private_address_reason, public_only_session,
-            )
-            with public_only_session() as session:
-                for _hop in range(MAX_REDIRECTS + 1):
-                    refused = private_address_reason(current)
-                    if refused:
-                        return {"success": False, "url": url, "error": f"Refused to fetch {current}: {refused}"}
-                    try:
-                        response = session.get(current, headers=headers, timeout=15, allow_redirects=False)
-                    except requests.exceptions.ConnectionError as e:
-                        # The connect-time check: the name resolved differently from
-                        # the check above, or requests decoded the host differently.
-                        reason = getattr(e.args[0], "reason", None) if e.args else None
-                        if isinstance(reason, PrivateAddressError):
-                            return {"success": False, "url": url,
-                                    "error": f"Refused to fetch {current}: {reason.host_name} resolves "
-                                             f"to a private or local address ({reason.address})"}
-                        raise
-                    location = session.get_redirect_target(response)
-                    if location:
-                        current = urljoin(current, location)
-                        continue
-                    break
-                else:
-                    return {"success": False, "url": url, "error": f"Too many redirects (more than {MAX_REDIRECTS})"}
-        else:
-            from backend.utils.hosts import no_netrc_session
-            with no_netrc_session() as session:
-                response = session.get(url, headers=headers, timeout=15, allow_redirects=True)
-            current = response.url
-        response.raise_for_status()
-        
-        soup = BeautifulSoup(response.content, 'html.parser', from_encoding='utf-8')
-        
+        try:
+            page = fetch_page(url, headers=headers, public_only=public_only)
+        except (FetchRefused, FetchFailed) as e:
+            return {"success": False, "url": url, "error": str(e)}
+        current = page.url
+
+        text, _encoding = decode_page(page.body, page.charset, complete=page.cut is None)
+        soup = BeautifulSoup(text, 'html.parser')
+
         for script in soup(["script", "style", "nav", "footer", "aside"]):
             script.decompose()
         
@@ -113,7 +84,7 @@ def extract_website_content(url: str, query: Optional[str] = None, public_only: 
         page_word_count = len(content_text.split())
         content_text = focus_window(content_text, query, 2000) if query else content_text[:2000]
         
-        return {
+        result = {
             "success": True,
             "url": url,
             "final_url": current,
@@ -123,7 +94,10 @@ def extract_website_content(url: str, query: Optional[str] = None, public_only: 
             "content_length": len(content_text),
             "page_word_count": page_word_count,
         }
-        
+        if page.cut:
+            result["page_cut"] = page.cut
+        return result
+
     except requests.RequestException as e:
         logger.error(f"Website scraping failed for {url}: {e}")
         return {
@@ -234,6 +208,8 @@ def enhanced_web_search(query: str, public_only: bool = False) -> Dict[str, Any]
                     "snippet": f"Website: {website_data['title']}\n\nDescription: {website_data['description']}\n\nContent: {website_data['content'][:500]}..."
                 }
             })
+            if website_data.get("page_cut"):
+                results["data"]["page_cut"] = website_data["page_cut"]
             return results
         else:
             results["data"]["website_error"] = website_data["error"]

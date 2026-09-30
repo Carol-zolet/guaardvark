@@ -10,8 +10,21 @@ import re
 from urllib.parse import urlparse
 
 from backend.services.agent_tools import BaseTool, ToolParameter, ToolResult
+from backend.utils.web_fetch import (
+    DEADLINE_SECONDS, IDLE_SECONDS, MAX_PAGE_BYTES, MAX_REDIRECTS, megabytes,
+)
 
 logger = logging.getLogger(__name__)
+
+# What fetch_url and analyze_website tell a caller about the limits of a fetch;
+# the numbers live in backend/utils/web_fetch.py.
+_FETCH_LIMITS = (
+    f"Up to {MAX_REDIRECTS} redirects are followed; each hop must be a public address. The fetch "
+    f"gives up when the server is silent for {IDLE_SECONDS} s or the whole fetch passes "
+    f"{DEADLINE_SECONDS} s. Only the first {megabytes(MAX_PAGE_BYTES)} of a page are read; a page "
+    "that was cut short comes back with a page_cut field saying so. A URL that is not a page (a "
+    "PDF, an image, a download) is refused."
+)
 
 
 def extract_facts_from_search_results(search_output: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -185,7 +198,10 @@ class WebAnalysisTool(BaseTool):
             name="url",
             type="string",
             required=True,
-            description="Page URL or bare domain, e.g. 'https://example.com/about' or 'example.com' (https:// is added). Up to 5 redirects are followed; each hop must be a public address. The fetch gives up if the server does not answer for 15 s."
+            description=(
+                "Page URL or bare domain, e.g. 'https://example.com/about' or 'example.com' "
+                "(https:// is added). " + _FETCH_LIMITS
+            ),
         ),
         "analysis_type": ToolParameter(
             name="analysis_type",
@@ -260,6 +276,8 @@ class WebAnalysisTool(BaseTool):
                 "content_preview": content_result.get("content", "")[:500] + "..." if len(content_result.get("content", "")) > 500 else content_result.get("content", ""),
                 "content_length": content_result.get("content_length", 0),
             }
+            if content_result.get("page_cut"):
+                analysis["page_cut"] = content_result["page_cut"]
 
             # Add metadata analysis if requested
             if include_metadata:
@@ -420,8 +438,7 @@ class FetchUrlTool(BaseTool):
             required=True,
             description=(
                 "Page URL or bare domain, e.g. 'https://example.com/pricing' or 'example.com' "
-                "(https:// is added). Up to 5 redirects are followed; each hop must be a public "
-                "address. The fetch gives up if the server does not answer for 15 s."
+                "(https:// is added). " + _FETCH_LIMITS
             ),
         ),
         "query": ToolParameter(
@@ -470,17 +487,17 @@ class FetchUrlTool(BaseTool):
 
             # Return a flat, LLM-friendly shape. No SEO layers, no nested metadata —
             # the single-purpose framing is the whole point of this tool.
-            return ToolResult(
-                success=True,
-                output={
-                    "url": result.get("url", url),
-                    "final_url": result.get("final_url", result.get("url", url)),
-                    "title": result.get("title", ""),
-                    "description": result.get("description", ""),
-                    "content": result.get("content", ""),
-                    "content_length": result.get("content_length", 0),
-                },
-            )
+            output = {
+                "url": result.get("url", url),
+                "final_url": result.get("final_url", result.get("url", url)),
+                "title": result.get("title", ""),
+                "description": result.get("description", ""),
+                "content": result.get("content", ""),
+                "content_length": result.get("content_length", 0),
+            }
+            if result.get("page_cut"):
+                output["page_cut"] = result["page_cut"]
+            return ToolResult(success=True, output=output)
         except Exception as e:
             logger.error(f"fetch_url failed for {url}: {e}", exc_info=True)
             return ToolResult(
@@ -582,6 +599,8 @@ class WebSearchTool(BaseTool):
                     "url": data.get("url", ""),
                     "snippet": data.get("snippet", "")
                 }]
+                if data.get("page_cut"):
+                    formatted_results["page_cut"] = data["page_cut"]
             elif data.get("snippet"):
                 # Single result format
                 formatted_results["results"] = [{
