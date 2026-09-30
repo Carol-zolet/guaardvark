@@ -28,7 +28,13 @@ from jsonschema import Draft202012Validator
 from jsonschema.exceptions import best_match
 
 from backend.mcp.audit import audit_call
-from backend.mcp.config import WAIT_TIMEOUT_SECONDS, MCPConfig, tool_is_exposed
+from backend.mcp.config import (
+    SERVER_TIMEOUT_ENV,
+    WAIT_HEADROOM_SECONDS,
+    WAIT_TIMEOUT_SECONDS,
+    MCPConfig,
+    tool_is_exposed,
+)
 from backend.services.agent_tools import BaseTool, get_tool_registry
 from backend.services.tool_execution_guard import ToolExecutionGuard
 
@@ -197,16 +203,25 @@ def _content_blocks_from_result(result: Any) -> list[mcp_types.ContentBlock]:
     return [mcp_types.TextContent(type="text", text=str(result))]
 
 
-def _call_timeout(config: MCPConfig, arguments: dict[str, Any]) -> float:
+def _call_timeout(config: MCPConfig, arguments: dict[str, Any], tool: Any = None) -> float:
     """The per-call ceiling: the configured timeout, or the wait ceiling when
     the caller asked a generation tool to block until the render finishes.
+
+    This is the one place that decides how long a waiting call may take. A
+    tool that gives up on its own declares how long it waits as ``MAX_WAIT_S``
+    next to its definition, and the ceiling stays ``WAIT_HEADROOM_SECONDS``
+    above that, so the tool's "still running (batch X)" answer reaches the
+    client instead of this adapter's timeout.
 
     Tools that run as tool jobs (backend/services/tool_jobs.py) wait at most
     half the configured timeout even with wait_for_result, so this ceiling
     never cuts them off first."""
     wait = arguments.get("wait_for_result")
     if str(wait).lower() in ("1", "true", "yes"):
-        return float(max(config.timeout_seconds, WAIT_TIMEOUT_SECONDS))
+        own_wait = getattr(tool, "MAX_WAIT_S", None)
+        if isinstance(own_wait, bool) or not isinstance(own_wait, (int, float)):
+            own_wait = 0
+        return float(max(config.timeout_seconds, WAIT_TIMEOUT_SECONDS, own_wait + WAIT_HEADROOM_SECONDS))
     return float(config.timeout_seconds)
 
 
@@ -218,7 +233,7 @@ def _timeout_message(name: str, timeout: float, read_only: bool = False, key: st
     if read_only:
         return head + (
             " It changes nothing, so calling it again is safe; for longer work raise "
-            "GUAARDVARK_MCP_TIMEOUT or data/config/mcp.json server.timeout_seconds."
+            f"{SERVER_TIMEOUT_ENV} or data/config/mcp.json server.timeout_seconds."
         )
     if key:
         return head + (
@@ -240,6 +255,22 @@ def _error_result(text: str) -> mcp_types.CallToolResult:
         content=[mcp_types.TextContent(type="text", text=text)],
         is_error=True,
     )
+
+
+def _drop_internal_arguments(arguments: dict[str, Any], schema: dict[str, Any]) -> list[str]:
+    """Remove, in place, the underscore keys a client sent that the tool does
+    not publish, and return their names.
+
+    Inside the backend an underscore key carries the caller's own context to a
+    tool: ``_agent_context`` holds the chat's session, project and workspace
+    root, and tools act on it (``save_memory`` files the memory under that
+    project). An MCP client has no such context to give, so it may not supply
+    one."""
+    published = schema.get("properties") or {}
+    dropped = sorted(key for key in arguments if str(key).startswith("_") and key not in published)
+    for key in dropped:
+        del arguments[key]
+    return dropped
 
 
 def _argument_error(validator: Draft202012Validator | None, arguments: dict[str, Any]) -> str | None:
@@ -410,7 +441,10 @@ def build_tool_handlers(config: MCPConfig) -> tuple[Any, Any, int]:
                 rec["error_code"] = "tool_not_exposed"
                 return _error_result(f"Tool '{name}' is not exposed by this MCP server.")
 
-            base_tool, _ = pair
+            base_tool, mcp_tool = pair
+            dropped = _drop_internal_arguments(arguments, mcp_tool.input_schema)
+            if dropped:
+                logger.warning("MCP: ignored internal argument(s) %s sent to '%s'", dropped, name)
             read_only = getattr(base_tool, "read_only", None) is True
             key = arguments.pop(IDEMPOTENCY_KEY, None)
             key = str(key) if key not in (None, "") else None
@@ -426,7 +460,7 @@ def build_tool_handlers(config: MCPConfig) -> tuple[Any, Any, int]:
 
             state = _state_for(ctx)
             keyed_state = _state_for(ctx, per_connection=True)
-            timeout = _call_timeout(config, arguments)
+            timeout = _call_timeout(config, arguments, base_tool)
             args_hash = ToolExecutionGuard._hash_call(name, arguments)
 
             if key is not None:
