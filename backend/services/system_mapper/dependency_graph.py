@@ -101,7 +101,7 @@ def analyze(root: Path, extra_excludes: frozenset[str] = frozenset(),
     # 1. Discover all internal modules (those we own and can analyze)
     modules: dict[str, Path] = {}  # module_name -> path
     for py in root.rglob("*.py"):
-        if is_excluded(py, extra_excludes):
+        if is_excluded(py, extra_excludes, root=root):
             continue
         try:
             rel = py.relative_to(root)
@@ -308,7 +308,7 @@ def _collect_test_basenames(root: Path, extra_excludes: frozenset[str]) -> set[s
     """Set of module stems that have a `test_<stem>.py` somewhere in the tree."""
     out: set[str] = set()
     for py in root.rglob("test_*.py"):
-        if is_excluded(py, extra_excludes):
+        if is_excluded(py, extra_excludes, root=root):
             continue
         out.add(py.stem[len("test_"):])
     return out

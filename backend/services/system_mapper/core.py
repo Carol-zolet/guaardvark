@@ -127,9 +127,26 @@ DEFAULT_EXCLUDE_DIRS: frozenset[str] = frozenset({
 })
 
 
-def is_excluded(path: Path, extra_excludes: frozenset[str] = frozenset()) -> bool:
+def is_excluded(
+    path: Path,
+    extra_excludes: frozenset[str] = frozenset(),
+    root: Path | None = None,
+) -> bool:
+    """True when a folder on ``path`` has an excluded name.
+
+    With ``root``, only the parts below ``root`` are tested, so a checkout that
+    itself sits under a folder named data, build or env is still mapped.
+    Without it every part of ``path`` is tested, which suits a path that is
+    already relative to the mapped root.
+    """
     excludes = DEFAULT_EXCLUDE_DIRS | extra_excludes
-    return any(part in excludes for part in path.parts)
+    parts = path.parts
+    if root is not None:
+        try:
+            parts = path.relative_to(root).parts
+        except ValueError:
+            pass
+    return any(part in excludes for part in parts)
 
 
 def filter_findings(
