@@ -27,29 +27,69 @@ _SWARM_OFFLINE_ERROR = (
     "Swarm plugin is not running (port 8210). Start it from /plugins or say so — "
     "do not pretend a swarm launched."
 )
+# The sidecar is up but its status could not be read (timeout, a 5xx, a body
+# that is not JSON, a rejected internal token). Not the same as offline:
+# starting the plugin again is not the fix.
+_SWARM_FAULT_ERROR = "The swarm service is running but did not return its status: {detail}"
 
 # Swarm ids look like "swarm-20260930-120000-a1b2c3" (generate_swarm_id in
 # plugins/swarm/service/models.py). The id becomes a URL path segment, so
 # anything else, such as "../../gpu/status", is refused rather than sent.
 _SWARM_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
-_LOG_ALLOWLIST = frozenset({
-    "backend.log",
-    "celery_main.log",
-    "celery_training.log",
-    "frontend.log",
-    "setup.log",
-    "xfce_agent.log",
-    "x11vnc_agent.log",
-    "ollama.log",
-    "comfyui.log",
-    "audio_foundry.log",
-    "swarm.log",
-    "video_editor.log",
-    "upscaling.log",
-    "vision_pipeline.log",
-    "discord.log",
-})
+# The log files read_logs serves, each with the file that writes it (checked
+# by backend/tests/test_read_logs.py, which also scans the start scripts for
+# names missing here). A log a new script or plugin writes is added here or to
+# _LOG_NOT_SERVED; a name nothing writes does not belong in either.
+_LOG_WRITERS: Dict[str, str] = {
+    # Core services.
+    "backend.log": "backend/app.py",
+    "backend_startup.log": "start.sh",
+    "frontend.log": "start.sh",
+    "setup.log": "start.sh",
+    "preflight.log": "start.sh",
+    "dep_reconciler.log": "start.sh",
+    "celery.log": "start.sh",
+    "celery_main.log": "start_celery.sh",
+    "celery_training.log": "start_celery.sh",
+    "celery_beat.log": "start_celery.sh",
+    "ollama_bootstrap.log": "start.sh",
+    "whisper_server.log": "start.sh",
+    "reboot.log": "backend/api/reboot_api.py",
+    "heal_backend_venv.log": "scripts/heal_backend_venv.sh",
+    "video_generation.log": "backend/services/batch_video_generator.py",
+    "lora_trainer_daemon.log": "plugins/lora_trainer/real_trainer.py",
+    # Agent display.
+    "xfce_agent.log": "scripts/start_agent_display.sh",
+    "x11vnc_agent.log": "scripts/start_agent_display.sh",
+    # Plugins.
+    "ollama_serve.log": "plugins/ollama/scripts/start.sh",
+    "comfyui.log": "plugins/comfyui/scripts/start.sh",
+    "audio_foundry.log": "plugins/audio_foundry/scripts/start.sh",
+    "swarm.log": "plugins/swarm/scripts/start.sh",
+    "video_editor.log": "plugins/video_editor/scripts/start.sh",
+    "upscaling.log": "plugins/upscaling/scripts/start.sh",
+    "vision_pipeline.log": "plugins/vision_pipeline/scripts/start.sh",
+    "gpu_embedding_service.log": "plugins/gpu_embedding/scripts/start.sh",
+    "discord_bot.log": "plugins/discord/scripts/start.sh",
+}
+_LOG_ALLOWLIST = frozenset(_LOG_WRITERS)
+
+# Written under logs/ but never served: these hold what people typed and what
+# models answered, or belong to a password-protected service, rather than
+# service diagnostics. Redaction masks credentials, not conversations.
+_LOG_NOT_SERVED: Dict[str, str] = {
+    "llm_debug.log": "prompts and model replies (backend/app.py)",
+    "memory_audit.log": "saved memories (backend/utils/memory_audit_log.py)",
+    "mcp_audit.log": "arguments of MCP calls (backend/services/mcp_client_service.py)",
+    "terminal.log": "the web terminal's server log (scripts/terminal_server.sh)",
+}
+
+# With a query, only this many of the newest matching lines are examined. Each
+# one is redacted before it is matched again (a line that matches only inside
+# a masked secret is not a match), and redaction costs about 60 microseconds a
+# line (5,000 lines in 0.3 s, measured 2026-09-30).
+_LOG_QUERY_CANDIDATES = 5000
 
 
 def _repo_root() -> Path:
@@ -479,13 +519,18 @@ class ReadLogsTool(BaseTool):
     name = "read_logs"
     read_only = True
     description = (
-        "Tail a Guaardvark log file under logs/. Use when the user says 'review the "
-        "logs', 'check backend.log', 'celery errors', or 'what did the last crash say'."
+        "Tail one of Guaardvark's log files under logs/: the backend, Celery workers and "
+        "beat, the frontend, startup and setup, and each plugin's log. Use when the user "
+        "says 'review the logs', 'check backend.log', 'celery errors', or 'what did the "
+        "last crash say'. Credentials in the text (passwords in URLs, tokens, API keys, "
+        "Authorization headers) are replaced with ***. A log that was never written on "
+        "this machine (a plugin that has not run) is reported as not found."
     )
     parameters = {
         "name": ToolParameter(
             name="name", type="string", required=False, default="backend.log",
             description="Log filename (not a path). Default backend.log.",
+            enum=sorted(_LOG_ALLOWLIST),
         ),
         "lines": ToolParameter(
             name="lines", type="int", required=False, default=80,
@@ -493,12 +538,20 @@ class ReadLogsTool(BaseTool):
         ),
         "query": ToolParameter(
             name="query", type="string", required=False, default="",
-            description="Optional case-insensitive substring filter.",
+            description=(
+                "Optional case-insensitive substring filter, matched against the text as "
+                "it is returned (after credentials are masked)."
+            ),
         ),
     }
 
     def execute(self, **kwargs) -> ToolResult:
         raw_name = os.path.basename(str(kwargs.get("name") or "backend.log").strip() or "backend.log")
+        if raw_name in _LOG_NOT_SERVED:
+            return ToolResult(
+                success=False,
+                error=f"'{raw_name}' is not served by read_logs: it holds {_LOG_NOT_SERVED[raw_name]}.",
+            )
         if raw_name not in _LOG_ALLOWLIST:
             return ToolResult(
                 success=False,
@@ -506,30 +559,51 @@ class ReadLogsTool(BaseTool):
             )
         try:
             from backend.utils.display_paths import display_path, display_text
+            from backend.utils.secret_redaction import redact_secrets
 
             path = _log_dir() / raw_name
             if not path.is_file():
-                return ToolResult(success=False, error=f"Log file not found: {display_path(path)}")
+                return ToolResult(
+                    success=False,
+                    error=(
+                        f"Log file not found: {display_path(path)}. Its writer "
+                        f"({_LOG_WRITERS[raw_name]}) has not run on this machine, or the log was rotated."
+                    ),
+                )
             n = max(10, min(int(kwargs.get("lines") or 80), 400))
             text = path.read_text(encoding="utf-8", errors="replace")
             rows = text.splitlines()
             query = (kwargs.get("query") or "").strip().lower()
+            capped = False
             if query:
-                rows = [ln for ln in rows if query in ln.lower()]
+                candidates = [ln for ln in rows if query in ln.lower()]
+                capped = len(candidates) > _LOG_QUERY_CANDIDATES
+                # Matched again after masking, so a query cannot be used to
+                # test what a masked value contains.
+                rows = [
+                    ln for ln in (redact_secrets(c) for c in candidates[-_LOG_QUERY_CANDIDATES:])
+                    if query in ln.lower()
+                ]
             tail = rows[-n:]
-            return ToolResult(
-                success=True,
-                output={
-                    # Relative to the checkout: this result crosses the MCP boundary.
-                    "path": display_path(path),
-                    "matched_lines": len(rows),
-                    "returned_lines": len(tail),
-                    "query": query or None,
-                    # Tracebacks and file logs name the checkout and the home
-                    # directory on nearly every line; those leave with the text.
-                    "text": "\n".join(display_text(ln) for ln in tail),
-                },
-            )
+            # Redacted as one block so a multi-line secret (a PEM key) is
+            # caught; path shortening comes last so it cannot split a match.
+            shown = display_text(redact_secrets("\n".join(tail)))
+            output = {
+                # Relative to the checkout: this result crosses the MCP boundary.
+                "path": display_path(path),
+                "matched_lines": len(rows),
+                "returned_lines": len(tail),
+                "query": query or None,
+                # Tracebacks and file logs name the checkout and the home
+                # directory on nearly every line; those leave with the text.
+                "text": shown,
+            }
+            if capped:
+                output["note"] = (
+                    f"Only the newest {_LOG_QUERY_CANDIDATES} matching lines were examined; "
+                    "matched_lines counts those."
+                )
+            return ToolResult(success=True, output=output)
         except Exception as e:
             logger.exception("read_logs failed")
             return ToolResult(success=False, error=str(e))
@@ -576,8 +650,15 @@ class SwarmStatusTool(BaseTool):
                 error=_SWARM_OFFLINE_ERROR,
                 metadata={"http_status": 503, "data": data},
             )
+        if status == 404:
+            return ToolResult(success=False, error="Swarm not found", metadata={"http_status": 404})
         if status >= 400:
-            return ToolResult(success=False, error=swarm_api._extract_error(data, "swarm status failed"), metadata={"http_status": status})
+            detail = swarm_api._extract_error(data, "swarm status failed") if isinstance(data, dict) else "swarm status failed"
+            return ToolResult(
+                success=False,
+                error=_SWARM_FAULT_ERROR.format(detail=detail),
+                metadata={"http_status": status},
+            )
         return ToolResult(success=True, output=data)
 
     def _status_via_backend(self, swarm_id: str) -> ToolResult:
@@ -587,12 +668,28 @@ class SwarmStatusTool(BaseTool):
         except BackendError as e:
             if e.kind == "plugin_offline":
                 return ToolResult(success=False, error=_SWARM_OFFLINE_ERROR, metadata={"http_status": 503})
+            if e.status in (502, 504):
+                return ToolResult(
+                    success=False,
+                    error=_SWARM_FAULT_ERROR.format(detail=e),
+                    metadata={"http_status": e.status},
+                )
             return ToolResult(success=False, error=str(e), metadata={"http_status": e.status})
         # GET /api/swarm/status answers 200 with an empty list when the sidecar
         # is down, so the offline case is only visible in its message.
         if isinstance(resp.body, dict) and resp.body.get("message") == "Swarm service offline":
             return ToolResult(success=False, error=_SWARM_OFFLINE_ERROR, metadata={"http_status": 503})
-        return ToolResult(success=True, output=resp.data)
+        # A status is never just an error message. A backend that wraps the
+        # sidecar's failure in a success envelope must not be read as one.
+        data = resp.data
+        if isinstance(data, dict) and data and set(data) <= {"error", "detail", "message"}:
+            detail = data.get("error") or data.get("detail") or data.get("message")
+            return ToolResult(
+                success=False,
+                error=_SWARM_FAULT_ERROR.format(detail=detail),
+                metadata={"http_status": resp.status},
+            )
+        return ToolResult(success=True, output=data)
 
 
 class LaunchSwarmTool(BaseTool):
