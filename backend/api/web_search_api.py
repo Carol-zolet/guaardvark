@@ -196,9 +196,11 @@ def enhanced_web_search(query: str, public_only: bool = False,
             
         logger.info(f"Direct website access for: {url}")
         website_data = extract_website_content(url, public_only=public_only)
-        if not website_data["success"] and str(website_data.get("error", "")).startswith("Refused"):
-            # A refused address ends the call: searching the web for the URL's text
-            # would answer a question nobody asked.
+        if not website_data["success"] and str(website_data.get("error", "")).startswith(
+                ("Refused", "Not a web page")):
+            # A refused address, or a URL that serves a file instead of a page,
+            # ends the call: searching the web for the URL's text would answer a
+            # question nobody asked, and would send the query to the search engine.
             results["error"] = website_data["error"]
             results["data"] = {"message": website_data["error"]}
             return results

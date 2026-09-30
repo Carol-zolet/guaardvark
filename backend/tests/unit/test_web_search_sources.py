@@ -114,6 +114,29 @@ def test_fallback_results_are_labelled_as_the_fallback_and_carry_no_login(engine
     assert urlsplit(url).hostname == "r.jina.ai" and authorization is None
 
 
+def test_a_url_that_serves_a_file_ends_the_call_without_a_search(engine, monkeypatch):
+    """The query is not sent on to the search engine when its URL is a PDF."""
+    asked, _ = engine
+    sent = []
+
+    def fake_send(self, request, **kwargs):
+        sent.append(request.url)
+        response = requests.Response()
+        response.request = request
+        response.url = request.url
+        response.status_code = 200
+        response.headers["Content-Type"] = "application/pdf"
+        response._content = b"%PDF-1.4"
+        response._content_consumed = True
+        return response
+
+    monkeypatch.setattr(HTTPAdapter, "send", fake_send)
+    result = web_search_api.enhanced_web_search("summarize https://site.example/report.pdf")
+    assert not result["success"] and result["error"].startswith("Not a web page")
+    assert sent == ["https://site.example/report.pdf"]
+    assert asked == []
+
+
 def test_the_weather_lookup_carries_no_login_and_names_its_service(engine, transport):
     result = web_search_api.enhanced_web_search("what's the weather like in Paris today?")
     assert result["strategy_used"] == "weather_service"
