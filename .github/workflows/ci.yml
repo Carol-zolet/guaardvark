@@ -336,6 +336,12 @@ jobs:
             backend/tests/services/test_video_vram_wait.py \
             backend/tests/test_mcp_tool_jobs.py \
             backend/tests/api/test_batch_video_lifecycle.py \
+            backend/tests/services/test_background_removal_device.py \
+            backend/tests/unit/test_video_status_progress.py \
+            backend/tests/api/test_batch_image_unknown_model.py \
+            backend/tests/unit/test_video_tool_profile_steps.py \
+            backend/tests/services/test_edit_backend_refusals.py \
+            backend/tests/services/test_edit_step_floor.py \
             backend/tests/services/test_offline_image_unload_hooks.py \
             backend/tests/services/test_offline_image_oom_ladder.py \
             backend/tests/services/test_offline_image_vae_tiling.py \

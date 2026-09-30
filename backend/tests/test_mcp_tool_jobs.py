@@ -197,6 +197,8 @@ def test_an_mcp_call_in_the_backend_returns_a_job_and_other_callers_run_inline(t
         return ToolResult(success=True, output=f"Image edited.\nImage URL: {EDITED}", metadata={"image_url": EDITED})
 
     monkeypatch.setattr(it.EditImageTool, "_edit", fake_edit)
+    # An editing pack is installed; without one the call is refused before any job starts.
+    monkeypatch.setattr(it.EditImageTool, "_pick_edit_backend", staticmethod(lambda model: "qwen"))
     app = _backend([it.EditImageTool(), it.InpaintImageTool()])
     with app.test_client() as client:
         body = {"tool_name": "edit_image", "parameters": {"instruction": "night", "image": IMG},
