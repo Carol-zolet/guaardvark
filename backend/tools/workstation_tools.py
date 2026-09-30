@@ -70,9 +70,18 @@ def _safe_root(root_arg: Optional[str]) -> Path:
         candidate = base / candidate
     candidate = candidate.resolve()
     try:
-        candidate.relative_to(base)
+        rel = candidate.relative_to(base)
     except ValueError as exc:
         raise ValueError(f"root must be inside the Guaardvark tree ({base})") from exc
+    # The mapper skips these folders at any depth below the checkout, so a root
+    # inside one (data/uploads, logs, a venv) is refused rather than mapped.
+    from backend.services.system_mapper.core import DEFAULT_EXCLUDE_DIRS
+    skipped = next((part for part in rel.parts if part in DEFAULT_EXCLUDE_DIRS), None)
+    if skipped:
+        raise ValueError(
+            f"root is inside '{skipped}', a folder the System Mapper always skips. "
+            "For an uploaded Code Repository use get_repository_map or get_dependency_graph."
+        )
     if not candidate.is_dir():
         raise ValueError(f"Not a directory: {candidate}")
     return candidate
@@ -142,7 +151,7 @@ class MapCodebaseTool(BaseTool):
         ),
         "root": ToolParameter(
             name="root", type="string", required=False, default="",
-            description="Folder inside the Guaardvark checkout to map instead of all of it, absolute or relative to the checkout (e.g. 'backend/api'); paths outside are refused. Folders named data, logs, backups, outputs, build, dist, env, venv, node_modules, migrations, plans, audit, voice or ComfyUI, among others, are always skipped.",
+            description="Folder inside the Guaardvark checkout to map instead of all of it, absolute or relative to the checkout (e.g. 'backend/api'); paths outside are refused. Folders named data, logs, backups, outputs, build, dist, env, venv, node_modules, migrations, plans, audit, voice or ComfyUI, among others, are always skipped, and a root inside one is refused.",
         ),
         "limit": ToolParameter(
             name="limit", type="int", required=False, default=15, minimum=1, maximum=40,
