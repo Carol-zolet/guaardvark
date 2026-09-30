@@ -218,6 +218,9 @@ def resolve_media_ref(ref, *, mcp: bool, label: str = "file",
     if url_path is not None:
         from backend import config
 
+        if ".." in url_path.split("/"):
+            return MediaRef(error=f"{label} '{text}' leaves the folder that URL serves. {accepted}",
+                            refused=True)
         doc = _DOCUMENT_URL.match(url_path)
         if doc:
             return from_document(int(doc.group(1)))
