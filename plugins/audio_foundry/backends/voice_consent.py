@@ -107,7 +107,9 @@ def locate_clip(ref: PathLike, ref_dir: PathLike) -> Path:
     if not raw:
         raise ConsentRequired("No reference clip was named.")
     real = os.path.realpath(raw if os.path.isabs(raw) else os.path.join(base, raw))
-    if real == base or os.path.commonpath([real, base]) != base:
+    # Both sides are real, normalised paths, so a prefix test with the
+    # separator appended is exact: /refs2 does not pass for /refs.
+    if real == base or not real.startswith(base.rstrip(os.sep) + os.sep):
         raise ConsentRequired(
             "A reference clip must be one imported in Audio Studio (its voice references "
             "folder); other files are never cloned."
