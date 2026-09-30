@@ -146,8 +146,8 @@ class ReadCodeTool(BaseTool):
         "between START/END markers, without line numbers. Paths are relative to the checkout root; an "
         "absolute path works when it lies inside the checkout. Refused: git-ignored local data (files "
         "under data/uploads and data/outputs stay readable), .env and credential or key files (*.pem, "
-        "*.key, id_rsa, .netrc, credentials.*), and anything under .git, venv, node_modules, dist, logs "
-        "or __pycache__. In Guaardvark's own chat an absolute path outside the checkout also works, "
+        "*.key, id_rsa, .netrc, credentials.* and similar), and anything under .git, venv, node_modules, "
+        "dist, logs or __pycache__. In Guaardvark's own chat an absolute path outside the checkout also works, "
         "except system and key folders; over MCP it is refused. To find a file use search_code or "
         "search_codebase; for PDF or Office files process_file; for logs read_logs."
     )

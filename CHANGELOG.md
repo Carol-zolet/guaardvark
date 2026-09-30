@@ -6,6 +6,9 @@
   files the normal user could not write. It now says to run it as your normal user; it asks
   for your password itself when it installs system packages. Machines where root is the only
   account set `GUAARDVARK_ALLOW_ROOT=1`.
+- **More credential files are off limits to the agent's file and code tools.** Added to the names
+  they refuse to read, list or grep: `*.env`, `.npmrc`, `.pypirc`, `*.ppk`, `*.jks`, `*.keystore`,
+  `*.secret`, `client_secret*.json` and dot-files with "secret" in the name.
 
 ## 2.9.3 — The command line does what it says, agents make music and voice, outpaint fills the frame
 
