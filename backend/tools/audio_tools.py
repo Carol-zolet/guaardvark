@@ -10,6 +10,7 @@ writes, after the person confirms they have the right to clone that voice.
 from __future__ import annotations
 
 import logging
+import time
 from pathlib import Path
 from typing import Any, Optional
 
@@ -20,23 +21,55 @@ logger = logging.getLogger(__name__)
 STUDIO_URL = "/audio"
 MAX_SPEECH_CHARS = 3000
 
+# generate_speech runs as an Audio Foundry job and waits for its file at most
+# tool_jobs.wait_seconds() (60 s, or half the MCP per-call timeout when that
+# is shorter), then answers with the job id to poll, so the answer reaches an
+# MCP client before its call times out. That bound comes from the timeout,
+# not from a timed render. What makes the job necessary is the plugin's own
+# estimate (config.yaml async.chars_per_sec_est: 30): about 100 s of synthesis
+# for a 3000-character read, before Chatterbox's 3.3 GB load.
+SPEECH_POLL_S = 2.0
+# The submit itself answers as soon as the job is queued. An Audio Foundry
+# started before the `queue` field existed still renders short text inline
+# on this request, which must fit: 110 s stays under the MCP server's
+# default 120 s per-call timeout (backend/mcp/config.py).
+SPEECH_SUBMIT_TIMEOUT_S = 110
+
+AUDIO_FOUNDRY_NOT_RUNNING = (
+    "Audio Foundry is not running. Start it from the Studio's Plugins page "
+    "(or POST /api/plugins/audio_foundry/start), then try again."
+)
+
 
 def _kokoro_voice_ids() -> list[str]:
     from backend.services.audio_foundry_models import kokoro_voice_ids
     return kokoro_voice_ids()
 
 
-def _post(path: str, payload: dict, read_timeout: float) -> tuple[Optional[dict], Optional[str]]:
+def _backend_error_text(error) -> str:
+    if error.kind == "plugin_offline":
+        return AUDIO_FOUNDRY_NOT_RUNNING
+    return str(error)
+
+
+def _call(method: str, path: str, payload: Optional[dict] = None,
+          read_timeout: float = 30) -> tuple[Optional[dict], Optional[str]]:
     from backend.utils.backend_http import BackendError, request_json
     try:
-        reply = request_json("POST", path, payload=payload, read_timeout=read_timeout)
+        reply = request_json(method, path, payload=payload, read_timeout=read_timeout)
     except BackendError as e:
-        if e.kind == "plugin_offline":
-            return None, ("Audio Foundry is not running. Start it from the Studio's Plugins page "
-                          "(or POST /api/plugins/audio_foundry/start), then try again.")
-        return None, str(e)
+        return None, _backend_error_text(e)
     body = reply.body if isinstance(reply.body, dict) else {}
     return body, None
+
+
+def _post(path: str, payload: dict, read_timeout: float) -> tuple[Optional[dict], Optional[str]]:
+    return _call("POST", path, payload, read_timeout)
+
+
+def _speech_wait_s() -> float:
+    from backend.services.tool_jobs import wait_seconds
+    return wait_seconds()
 
 
 def _file_entry(result: dict) -> dict:
@@ -146,9 +179,12 @@ class GenerateSpeechTool(BaseTool):
     read_only = False
     destructive = False
     description = (
-        "Turn text into speech on this machine with Guaardvark's Audio Foundry. Waits for the file, "
-        "usually seconds, and returns its name, library document id, length and a download link. "
-        "Up to 3000 characters per call; split longer scripts. Voices: naming a voice (a Kokoro id "
+        "Turn text into speech on this machine with Guaardvark's Audio Foundry. Waits up to about "
+        "a minute for the file (usually seconds) and returns its name, library document id, length "
+        "and a download link. A longer read, such as a script near the 3000-character limit or a "
+        "cold start, answers with a job_id instead: poll get_generation_status with it, and do not "
+        "call again, since the file lands in the library either way. Up to 3000 characters per "
+        "call; split longer scripts. Voices: naming a voice (a Kokoro id "
         "such as 'af_heart' or 'bm_george') always speaks with Kokoro; with no voice, engine 'auto' "
         "uses Chatterbox's single stock voice when Chatterbox is installed and Kokoro's default "
         "voice otherwise. Chatterbox has no voice ids, so engine 'chatterbox' with a voice is "
@@ -208,19 +244,66 @@ class GenerateSpeechTool(BaseTool):
             # auto mode routes it there too, but naming the engine keeps the
             # request unambiguous.
             engine = "kokoro"
-        payload: dict[str, Any] = {"text": text, "backend": engine}
+        # Always an Audio Foundry job (``queue``), so a long or cold read that
+        # outlasts the wait still has an id to poll instead of an error while
+        # the file is made anyway.
+        payload: dict[str, Any] = {"text": text, "backend": engine, "async": True, "queue": True}
         if voice:
             payload["voice_id"] = voice
 
-        body, err = _post("/api/audio-foundry/generate/voice", payload, read_timeout=110)
+        started = time.monotonic()
+        body, err = _post("/api/audio-foundry/generate/voice", payload, read_timeout=SPEECH_SUBMIT_TIMEOUT_S)
         if err:
             return ToolResult(success=False, error=err)
-        if not body.get("path"):
+        if body.get("path"):
+            return self._finished(body)
+        job_id = body.get("job_id")
+        if not job_id:
             return ToolResult(success=False, error=body.get("error") or body.get("detail") or "No audio came back")
-        meta = body.get("meta") or {}
-        return ToolResult(
-            success=True,
-            output={"status": "complete", **_file_entry(body),
-                    "engine": meta.get("backend") or meta.get("engine"),
-                    "voice": meta.get("voice") or meta.get("voice_id")},
-        )
+
+        deadline = started + _speech_wait_s()
+        job: dict = {"status": body.get("status") or "queued"}
+        while True:
+            now = time.monotonic()
+            if now + SPEECH_POLL_S > deadline:
+                break
+            time.sleep(SPEECH_POLL_S)
+            polled, poll_err = _call("GET", f"/api/audio-foundry/jobs/{job_id}", read_timeout=10)
+            if poll_err:
+                # The job was accepted; the client can poll once the reader recovers.
+                logger.info("generate_speech: reading job %s failed (%s)", job_id, poll_err)
+                break
+            job = polled
+            status = job.get("status")
+            if status == "done":
+                return self._finished(job.get("result") or {}, job_id=job_id)
+            if status in ("error", "cancelled"):
+                return ToolResult(success=False, error=(
+                    f"Speech job {job_id} {'failed' if status == 'error' else 'was cancelled'}: "
+                    f"{job.get('error') or 'no reason given'}"), metadata={"job_id": job_id})
+
+        progress = job.get("progress") or {}
+        output: dict[str, Any] = {
+            "status": job.get("status") or "queued",
+            "job_id": job_id,
+            "estimate_s": body.get("estimate_s"),
+            "studio_url": STUDIO_URL,
+            "next": ("Poll get_generation_status with this job_id (wait_seconds lets it wait); "
+                     "the file is saved to the library when it finishes. Do not call "
+                     "generate_speech again for the same text."),
+        }
+        if progress.get("total"):
+            output["progress"] = f"{progress.get('current') or 0}/{progress['total']} parts"
+        return ToolResult(success=True, output=output, metadata={"job_id": job_id})
+
+    @staticmethod
+    def _finished(result: dict, job_id: Optional[str] = None) -> ToolResult:
+        if not result.get("path"):
+            return ToolResult(success=False, error="Audio Foundry finished without a file")
+        meta = result.get("meta") or {}
+        output = {"status": "complete", **_file_entry(result),
+                  "engine": meta.get("backend") or meta.get("engine"),
+                  "voice": meta.get("voice") or meta.get("voice_id")}
+        if job_id:
+            output["job_id"] = job_id
+        return ToolResult(success=True, output=output)

@@ -62,6 +62,10 @@ class VoiceRequest(BaseModel):
     seed: Optional[int] = None
     output_format: str = Field("wav", pattern="^(wav|mp3)$")
     async_mode: bool = Field(False, alias="async")
+    # With async: queue a job however short the text, so the caller always
+    # gets a job id to poll (MCP's generate_speech, which must answer before
+    # its client's call timeout even on a cold model load).
+    queue: bool = False
 
 
 class MusicRequest(BaseModel):
@@ -180,7 +184,8 @@ def _estimate_seconds(intent: Intent, params: dict) -> float:
 
 
 def _dispatch(intent: Intent, req) -> Any:
-    """Inline if short / async not requested; otherwise queue a job and 202."""
+    """Inline if short / async not requested; otherwise queue a job and 202.
+    ``queue`` (voice) queues whatever the estimate."""
     # Fail fast before accepting a job: a backend that can't run on this
     # machine (e.g. SAO without CUDA) must 503 here, not crash the job later.
     try:
@@ -191,8 +196,9 @@ def _dispatch(intent: Intent, req) -> Any:
         raise HTTPException(status_code=503, detail=str(e))
     params = req.model_dump(exclude_none=True)
     want_async = bool(params.pop("async_mode", False))
+    always_queue = bool(params.pop("queue", False))
     est = _estimate_seconds(intent, params)
-    if _ASYNC_ENABLED and want_async and est >= _ASYNC_THRESHOLD_S:
+    if _ASYNC_ENABLED and want_async and (always_queue or est >= _ASYNC_THRESHOLD_S):
         job_id = _jobs.submit(intent.value, params)
         return JSONResponse(status_code=202, content={
             "mode": "async",

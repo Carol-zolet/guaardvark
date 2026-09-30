@@ -32,14 +32,16 @@ def test_a_named_voice_is_spoken_by_kokoro(sent, engine):
     kwargs = {"engine": engine} if engine else {}
     res = GenerateSpeechTool().execute(text="Welcome back", voice="am_michael", **kwargs)
     assert res.success, res.error
-    assert sent == [{"text": "Welcome back", "backend": "kokoro", "voice_id": "am_michael"}]
+    assert sent == [{"text": "Welcome back", "backend": "kokoro", "voice_id": "am_michael",
+                     "async": True, "queue": True}]
     assert res.output["engine"] == "kokoro" and res.output["voice"] == "am_michael"
 
 
 def test_no_voice_keeps_the_engine_choice(sent):
     GenerateSpeechTool().execute(text="hi")
     GenerateSpeechTool().execute(text="hi", engine="chatterbox")
-    assert sent == [{"text": "hi", "backend": "auto"}, {"text": "hi", "backend": "chatterbox"}]
+    assert sent == [{"text": "hi", "backend": "auto", "async": True, "queue": True},
+                    {"text": "hi", "backend": "chatterbox", "async": True, "queue": True}]
 
 
 def test_chatterbox_with_a_voice_is_refused(sent):
