@@ -33,8 +33,9 @@ _SERVED_FORMS = (
     "resource URI"
 )
 _PATH_RULE = (
-    "Over MCP a path must be inside Guaardvark's uploads or outputs folder; files named like "
-    "keys or credentials (.env, *.pem, *.key, id_rsa* and similar) are refused everywhere."
+    "Over MCP the file must be in Guaardvark's uploads folder or in an outputs folder MCP "
+    "resources serve (what resources/list shows); files named like keys or credentials "
+    "(.env, *.pem, *.key, id_rsa* and similar) are refused everywhere."
 )
 _IMAGE_INPUT_FORMS = f"{_SERVED_FORMS}, a data: URI, or a file path. {_PATH_RULE}"
 _VIDEO_INPUT_FORMS = (

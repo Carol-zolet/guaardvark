@@ -2,7 +2,8 @@
 
 Served URLs and resource URIs map back to disk and cannot climb out of the
 folder that serves them, credential-named files are refused for every caller,
-and an MCP caller only reaches the uploads and outputs folders.
+and an MCP caller only reaches the uploads folder and the outputs folders the
+MCP resources provider serves.
 """
 from __future__ import annotations
 
@@ -12,6 +13,7 @@ from types import SimpleNamespace
 import pytest
 
 from backend import config
+from backend.mcp import config as mcp_config
 from backend.utils import media_inputs as mi
 
 
@@ -32,12 +34,21 @@ def tree(tmp_path, monkeypatch):
     notes.write_text("inside the install folder")
     os.symlink(outside, outputs / "generated_images" / "link.png")
     os.symlink(root / ".env", uploads / "innocent.png")
+    # Outputs the MCP resources provider does not serve, and one it serves at the root.
+    for rel in ("chat-exports/session_1/index.json", "consent/likeness.json",
+                "generated_images/.hidden.png", "generated_images/edit_1.png.consent",
+                "outputs/x.png"):
+        (outputs / rel).parent.mkdir(parents=True, exist_ok=True)
+        (outputs / rel).write_text("{}")
+    (outputs / "report.csv").write_text("a,b")
+    policy = mcp_config.MCPConfig()
+    monkeypatch.setattr(mcp_config, "load_config", lambda: policy)
     monkeypatch.setattr(config, "UPLOAD_DIR", str(uploads))
     monkeypatch.setattr(config, "OUTPUT_DIR", str(outputs))
     monkeypatch.setattr(config, "GUAARDVARK_ROOT", root)
     monkeypatch.setattr(mi, "resources_root", lambda: str(outputs.resolve()))
     return SimpleNamespace(root=root, uploads=uploads, outputs=outputs, batch=batch, edit=edit,
-                           outside=outside, notes=notes)
+                           outside=outside, notes=notes, policy=policy)
 
 
 SERVED = [
@@ -103,9 +114,39 @@ def test_mcp_reaches_only_uploads_and_outputs(tree):
     for ref in (str(tree.outside), str(tree.notes), "/api/outputs/generated_images/link.png", "~/.bashrc"):
         found = mi.resolve_media_ref(ref, mcp=True)
         assert found.path is None and found.refused, ref
-        assert "uploads and outputs" in found.error
+        assert "MCP resources serve" in found.error
     escaped = mi.resolve_media_ref("../../../outside.png", mcp=True)
     assert escaped.refused and "may not leave" in escaped.error
+
+
+UNSERVED = ["chat-exports/session_1/index.json", "consent/likeness.json",
+            "generated_images/.hidden.png", "generated_images/edit_1.png.consent"]
+
+
+@pytest.mark.parametrize("rel", UNSERVED)
+@pytest.mark.parametrize("form", ["path", "url", "uri"])
+def test_mcp_reads_only_outputs_the_resources_provider_serves(tree, rel, form):
+    ref = {"path": str(tree.outputs / rel), "url": f"/api/outputs/{rel}",
+           "uri": f"guaardvark://outputs/{rel}"}[form]
+    found = mi.resolve_media_ref(ref, mcp=True)
+    assert found.path is None and found.refused
+    assert "outputs folders MCP resources serve" in found.error
+    chat = mi.resolve_media_ref(ref, mcp=False)
+    assert chat.path and os.path.realpath(chat.path) == str((tree.outputs / rel).resolve())
+
+
+def test_mcp_outputs_follow_the_configured_folders_and_root_files(tree):
+    assert mi.resolve_media_ref(str(tree.outputs / "report.csv"), mcp=True).path
+    tree.policy.resources.outputs_root_files = False
+    assert mi.resolve_media_ref(str(tree.outputs / "report.csv"), mcp=True).refused
+    tree.policy.resources.outputs_folders = ["chat-exports"]
+    assert mi.resolve_media_ref("/api/outputs/chat-exports/session_1/index.json", mcp=True).path
+    assert mi.resolve_media_ref("/api/outputs/generated_images/edit_1.png", mcp=True).refused
+
+
+def test_resource_uris_map_like_resources_read(tree):
+    nested = mi.resolve_media_ref("guaardvark://outputs/outputs/x.png", mcp=False)
+    assert nested.path == str((tree.outputs / "outputs" / "x.png").resolve())
 
 
 def test_an_mcp_refusal_does_not_say_whether_the_file_exists(tree):

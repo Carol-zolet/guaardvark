@@ -1,8 +1,8 @@
 """The image, video, film and music tools apply the shared media-input rules.
 
 Over MCP (in the MCP process, or in the backend for a call the MCP server
-forwarded) only uploads and outputs are read; chat keeps any existing path;
-credential-named files are refused everywhere. No GPU, network or database:
+forwarded) only uploads and the outputs folders MCP resources serve are read;
+chat keeps any existing path; credential-named files are refused everywhere. No GPU, network or database:
 every call here stops at input resolution or at a stubbed model preflight.
 """
 from __future__ import annotations
@@ -13,6 +13,7 @@ import pytest
 from flask import Flask
 
 from backend import config
+from backend.mcp import config as mcp_config
 from backend.utils import backend_http, media_inputs as mi
 from backend.utils.backend_http import calls_for_mcp_client, is_mcp_caller
 
@@ -28,6 +29,11 @@ def tree(tmp_path, monkeypatch):
     (root / ".env").write_text("KEY=not-a-secret")
     outside = tmp_path / "outside.png"
     outside.write_bytes(b"png")
+    export = outputs / "chat-exports" / "session_1" / "index.json"
+    export.parent.mkdir(parents=True)
+    export.write_text('{"title": "a private conversation"}\n')
+    policy = mcp_config.MCPConfig()
+    monkeypatch.setattr(mcp_config, "load_config", lambda: policy)
     monkeypatch.setattr(config, "UPLOAD_DIR", str(uploads))
     monkeypatch.setattr(config, "OUTPUT_DIR", str(outputs))
     monkeypatch.setattr(config, "GUAARDVARK_ROOT", root)
@@ -93,11 +99,11 @@ def test_edit_family_refuses_files_outside_uploads_and_outputs_over_mcp(tree):
     from backend.tools import image_tools as it
 
     res = _tool(it.RemoveBackgroundTool, "mcp").execute(image=str(tree.outside))
-    assert not res.success and "uploads and outputs" in res.error
+    assert not res.success and "MCP resources serve" in res.error
     res = _tool(it.InpaintImageTool, "mcp").execute(instruction="x", image="/api/outputs/../../../outside.png")
     assert not res.success and "leaves the outputs folder" in res.error
     res = _tool(it.OutpaintImageTool, "mcp").execute(image=str(tree.outside))
-    assert not res.success and "uploads and outputs" in res.error
+    assert not res.success and "MCP resources serve" in res.error
     edit = _tool(it.EditImageTool, "mcp")
     res = edit.execute(instruction="x", image="/api/batch-image/image/ImageBatch_1/a.png",
                        reference_image_2=str(tree.outside))
@@ -135,7 +141,7 @@ def test_generate_video_forwarded_from_mcp_reads_only_uploads_and_outputs(tree, 
     tool, preflights = video
     with calls_for_mcp_client(True):
         res = tool.execute(prompt="push in", first_image=str(tree.outside))
-        assert not res.success and "uploads and outputs" in res.error and not preflights
+        assert not res.success and "MCP resources serve" in res.error and not preflights
         res = tool.execute(prompt="push in", first_image="/api/batch-image/image/ImageBatch_1/a.png",
                            last_image="guaardvark://outputs/generated_images/edit_1.png")
         assert "stub preflight" in res.error and preflights == ["m"]
@@ -170,7 +176,7 @@ def test_script_files_are_text_only_capped_and_confined(tree):
         body, err = vpt._script_body(str(tree.env), mcp=mcp)
         assert body is None and "keys or credentials" in err
     body, err = vpt._script_body(str(tree.outside), mcp=True)
-    assert body is None and "uploads and outputs" in err and "screenplay itself" in err
+    assert body is None and "MCP resources serve" in err and "screenplay itself" in err
 
 
 def test_a_one_line_script_that_names_no_file_is_the_script(tree):
@@ -187,6 +193,43 @@ def test_song_refs_refuse_credentials_and_outside_files_before_any_database_use(
     doc, err = vpt._document_from_song_ref(str(tree.env))
     assert doc is None and "keys or credentials" in err
     doc, err = vpt._document_from_song_ref(str(tree.outside), mcp=True)
-    assert doc is None and "uploads and outputs" in err
+    assert doc is None and "MCP resources serve" in err
     doc, err = vpt._document_from_song_ref(str(tree.outside))
     assert doc is None and "install root" in err
+
+
+EXPORT = "chat-exports/session_1/index.json"
+
+
+def _forms(tree, rel):
+    return [str(tree.outputs / rel), f"/api/outputs/{rel}", f"guaardvark://outputs/{rel}"]
+
+
+def test_film_and_music_refuse_unserved_outputs_over_mcp(tree):
+    from backend.tools import video_pipeline_tools as vpt
+
+    for ref in _forms(tree, EXPORT):
+        body, err = vpt._script_body(ref, mcp=True)
+        assert body is None and "MCP resources serve" in err, ref
+        doc, err = vpt._document_from_song_ref(ref, mcp=True)
+        assert doc is None and "MCP resources serve" in err, ref
+        body, err = vpt._script_body(ref, mcp=False)
+        assert err is None and "private conversation" in body, ref
+
+
+def test_served_outputs_stay_accepted_over_mcp(tree):
+    from backend.tools import video_pipeline_tools as vpt
+
+    scene = tree.outputs / "files" / "scene.txt"
+    scene.parent.mkdir(parents=True)
+    scene.write_text("INT. ROOM.\nHi.\n")
+    song = tree.outputs / "audio" / "song.wav"
+    song.parent.mkdir(parents=True)
+    song.write_bytes(b"RIFF")
+    for ref in _forms(tree, "files/scene.txt"):
+        assert vpt._script_body(ref, mcp=True) == (scene.read_text(), None), ref
+    for ref in _forms(tree, "audio/song.wav"):
+        found = mi.resolve_media_ref(ref, mcp=True, label="song file", within_install=True)
+        assert found.path == str(song.resolve()), ref
+    for ref in _forms(tree, "generated_images/edit_1.png"):
+        assert mi.resolve_media_ref(ref, mcp=True).path, ref

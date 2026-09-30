@@ -33,7 +33,7 @@ from urllib.parse import quote, unquote, urlparse
 import mcp.types as mcp_types
 
 from backend.mcp.audit import audit_call
-from backend.mcp.config import MCPConfig, ResourcePolicy
+from backend.mcp.config import MCPConfig, ResourcePolicy, load_config
 from backend.utils.backend_http import backend_base_url
 
 logger = logging.getLogger(__name__)
@@ -141,6 +141,26 @@ def _path_for_uri(uri: str, root: Path) -> Path | None:
         logger.warning("MCP: rejected out-of-chroot URI %s", uri)
         return None
     return candidate
+
+
+def outputs_root() -> Path:
+    """The outputs root the provider serves under the loaded config."""
+    return _outputs_root(load_config())
+
+
+def is_served(path: str | os.PathLike, root: str | os.PathLike,
+              policy: ResourcePolicy | None = None) -> bool:
+    """True when ``path`` (symlinks resolved) is a file under ``root`` that the
+    outputs provider would list and read under ``policy`` (default: the loaded
+    config). Tools that take outputs as inputs from MCP clients check this, so
+    they accept exactly what resources/read would return."""
+    if policy is None:
+        policy = load_config().resources
+    try:
+        rel = Path(os.path.realpath(path)).relative_to(os.path.realpath(root))
+    except ValueError:
+        return False
+    return OutputScope.from_policy(policy).serves(rel.parts)
 
 
 def _mime_for(path: Path) -> str:

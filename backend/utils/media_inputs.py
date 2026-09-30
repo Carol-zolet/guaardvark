@@ -10,10 +10,12 @@ rules to every form:
   points.
 * A served URL maps back to the directory that serves it; one that climbs out
   of it (``/api/outputs/../..``) is refused.
-* For an MCP client (``mcp=True``) only files inside the uploads and outputs
-  folders are accepted, symlinks resolved. That is decided before the file is
-  looked at, so a refusal says nothing about what exists. Chat and Studio
-  callers may also name an existing file by path.
+* For an MCP client (``mcp=True``) only files in the uploads folder and in
+  the outputs folders the MCP resources provider serves are accepted, symlinks
+  resolved: the same ``OutputScope`` as resources/read, so transcripts, consent
+  records, dot-files and other unserved outputs are refused. That is decided
+  before the file is looked at, so a refusal says nothing about what exists.
+  Chat and Studio callers may also name an existing file by path.
 
 Nothing here downloads a remote URL.
 """
@@ -42,7 +44,10 @@ SENSITIVE_REFUSAL = (
     "files named like keys or credentials (.env, .env.*, *.pem, *.key, id_rsa*, "
     "credentials, .netrc and similar) are never read"
 )
-MCP_REFUSAL = "over MCP only files in Guaardvark's uploads and outputs folders are read"
+MCP_REFUSAL = (
+    "over MCP only files in Guaardvark's uploads folder and in the outputs folders MCP "
+    "resources serve (resources/list shows them) are read"
+)
 
 DocumentPath = Callable[[int], Optional[str]]
 
@@ -69,7 +74,7 @@ def accepted_forms(*, mcp: bool, documents: bool = False, within_install: bool =
     if documents:
         forms.append("a library document id or /api/files/document/<id>/download link")
     if mcp:
-        forms.append("a path inside Guaardvark's uploads or outputs folder")
+        forms.append("a path inside Guaardvark's uploads folder or an outputs folder MCP resources serve")
     elif within_install:
         forms.append("a path inside Guaardvark's uploads, outputs or install folder")
     else:
@@ -78,30 +83,37 @@ def accepted_forms(*, mcp: bool, documents: bool = False, within_install: bool =
     return f"{where}: {', '.join(forms[:-1])}, or {forms[-1]}."
 
 
-def mcp_media_roots() -> list[str]:
-    """Folders an MCP client's media inputs may come from.
+def mcp_upload_roots() -> list[str]:
+    """Upload folders an MCP client's inputs may come from, whole.
 
     The image and video batch folders live in uploads; they are listed on their
     own so a batch folder symlinked to another disk still counts.
     """
     from backend import config
 
-    uploads, outputs = str(config.UPLOAD_DIR), str(config.OUTPUT_DIR)
-    return [uploads, outputs, os.path.join(uploads, "Images"), os.path.join(uploads, "Videos")]
+    uploads = str(config.UPLOAD_DIR)
+    return [uploads, os.path.join(uploads, "Images"), os.path.join(uploads, "Videos")]
 
 
 def resources_root() -> str:
-    """The folder ``guaardvark://outputs/`` URIs name, as the MCP resources provider serves it."""
-    root = "data/outputs"
-    try:
-        from backend.mcp.config import load_config
+    """The folder ``guaardvark://outputs/`` URIs name: the MCP resources provider's root."""
+    from backend.mcp.resources_adapter import outputs_root
 
-        root = load_config().resources.outputs_root or root
-    except Exception as e:  # noqa: BLE001 — an unreadable config falls back to the default root
-        logger.debug("MCP config not read for the resources root: %s", e)
-    if not os.path.isabs(root):
-        root = os.path.join(Path(__file__).resolve().parents[2], root)
-    return os.path.realpath(root)
+    return str(outputs_root())
+
+
+def mcp_may_read(path: str) -> bool:
+    """True when an MCP client may use ``path`` as an input: anything in uploads;
+    in outputs, only a file the MCP resources provider serves."""
+    from backend import config
+    from backend.mcp.config import load_config
+    from backend.mcp.resources_adapter import is_served
+
+    if is_within(path, mcp_upload_roots()):
+        return True
+    policy = load_config().resources
+    roots = {os.path.realpath(config.OUTPUT_DIR), os.path.realpath(resources_root())}
+    return any(is_served(path, root, policy) for root in roots)
 
 
 def _served_path(text: str) -> Optional[str]:
@@ -126,7 +138,7 @@ def document_id_from_ref(ref) -> Optional[int]:
 
 
 def check_media_file(path: str, *, mcp: bool, label: str = "file", shown: Optional[str] = None,
-                     accepted: str = "", extra_roots: tuple = ()) -> MediaRef:
+                     accepted: str = "") -> MediaRef:
     """Apply the rules to a local path a tool already has (a document's file, say).
 
     Returns the path on success: symlinks resolved for an MCP client, as given
@@ -136,7 +148,7 @@ def check_media_file(path: str, *, mcp: bool, label: str = "file", shown: Option
     real = os.path.realpath(path)
     if is_sensitive(path) or is_sensitive(real):
         return MediaRef(error=f"{label} '{shown}' was refused: {SENSITIVE_REFUSAL}.", refused=True)
-    if mcp and not is_within(real, [*mcp_media_roots(), *extra_roots]):
+    if mcp and not mcp_may_read(real):
         tail = f" {accepted}" if accepted else ""
         return MediaRef(error=f"{label} '{shown}' was refused: {MCP_REFUSAL}.{tail}", refused=True)
     if not os.path.isfile(real):
@@ -164,9 +176,8 @@ def resolve_media_ref(ref, *, mcp: bool, label: str = "file",
     if "\x00" in text:
         return MediaRef(error=f"{label} is not a valid path or URL. {accepted}", refused=True)
 
-    def check(path: str, shown: str = text, extra_roots: tuple = ()) -> MediaRef:
-        return check_media_file(path, mcp=mcp, label=label, shown=shown, accepted=accepted,
-                                extra_roots=extra_roots)
+    def check(path: str, shown: str = text) -> MediaRef:
+        return check_media_file(path, mcp=mcp, label=label, shown=shown, accepted=accepted)
 
     def from_document(doc_id: int) -> MediaRef:
         if document_path is None:
@@ -180,14 +191,14 @@ def resolve_media_ref(ref, *, mcp: bool, label: str = "file",
             return MediaRef(error=f"{label} document {doc_id} was not found, or its file is missing.")
         return check(str(path), shown=f"document {doc_id}")
 
-    if text.lower().startswith(RESOURCE_URI_PREFIX):
-        root = resources_root()
-        rel = text[len(RESOURCE_URI_PREFIX):].split("?", 1)[0].split("#", 1)[0]
-        try:
-            path = contained_path(root, "/".join(unquote(seg) for seg in rel.split("/")))
-        except PathEscapesRoot:
+    if text.startswith(RESOURCE_URI_PREFIX):
+        # The same mapping resources/read uses, so a URI names the file it lists.
+        from backend.mcp.resources_adapter import _path_for_uri
+
+        path = _path_for_uri(text, Path(resources_root()))
+        if path is None:
             return MediaRef(error=f"{label} '{text}' leaves the outputs folder. {accepted}", refused=True)
-        return check(path, extra_roots=(root,))
+        return check(str(path))
 
     url_path = _served_path(text)
     if url_path is not None:

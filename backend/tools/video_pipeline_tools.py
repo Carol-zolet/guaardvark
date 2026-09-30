@@ -92,7 +92,8 @@ _REFERENCE_PREFIXES = ("http://", "https://", "guaardvark://", "/api/")
 
 
 def _script_accepted(mcp: bool) -> str:
-    where = "uploads or outputs folder" if mcp else "uploads, outputs or install folder"
+    where = ("uploads folder or an outputs folder MCP resources serve" if mcp
+             else "uploads, outputs or install folder")
     return (
         "Pass the screenplay itself as text, or a UTF-8 text file of up to "
         f"{SCRIPT_FILE_MAX_BYTES // (1024 * 1024)} MB inside Guaardvark's {where} (by path, "
@@ -212,9 +213,10 @@ class MusicVideoTool(BaseTool):
             description=(
                 "The song (mp3/wav/flac/ogg/m4a/aac): a library document id or "
                 "/api/files/document/<id>/download link, an /api/outputs/<path> URL, a "
-                "guaardvark://outputs/<path> resource URI, or a file path. Over MCP a path must be "
-                "inside Guaardvark's uploads or outputs folder (in chat, also its install folder); "
-                "files named like keys or credentials are refused everywhere."
+                "guaardvark://outputs/<path> resource URI, or a file path. Over MCP the file must be "
+                "in Guaardvark's uploads folder or in an outputs folder MCP resources serve (what "
+                "resources/list shows); in chat, anywhere in its uploads, outputs or install folder. "
+                "Files named like keys or credentials are refused everywhere."
             ),
             required=True,
         ),
@@ -332,8 +334,9 @@ class FilmCrewTool(BaseTool):
             description=(
                 "Screenplay or scene list as plain text. A single line that names a file (a path, an "
                 "/api/outputs/<path> URL or a guaardvark://outputs/<path> URI) is read instead: UTF-8 "
-                "text only, up to 1 MB. Over MCP the file must be inside Guaardvark's uploads or "
-                "outputs folder (in chat, also its install folder); files named like keys or "
+                "text only, up to 1 MB. Over MCP the file must be in Guaardvark's uploads folder or "
+                "in an outputs folder MCP resources serve (what resources/list shows); in chat, "
+                "anywhere in its uploads, outputs or install folder. Files named like keys or "
                 "credentials are refused everywhere."
             ),
             required=True,
