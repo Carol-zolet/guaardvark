@@ -674,6 +674,12 @@ GUAARDVARK_AGENT_DISPLAY=99          # Override virtual display number
 GUAARDVARK_AGENT_BROWSER=firefox     # Override agent's browser
 ```
 
+Running a tool directly (`/api/tools/execute`) and the automation routes
+(`/api/automation/*`) answer only the Guaardvark machine itself, or a client
+that sends `GUAARDVARK_API_KEY` in the `X-API-Key` header.
+`GUAARDVARK_PROTECT_TOOL_ENDPOINTS=false` opens them to every device that can
+reach the backend.
+
 ---
 
 ## CLI (guaardvark)
