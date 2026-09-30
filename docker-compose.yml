@@ -63,6 +63,10 @@ services:
       GUAARDVARK_API_KEY: ${GUAARDVARK_API_KEY:-}
       # Tells Settings → API key that the key is managed in that .env.
       GUAARDVARK_DOCKER: "1"
+      # Browser origins besides http://localhost:5173, comma-separated, e.g.
+      # http://192.168.1.20:5173 to open the UI from another device. The
+      # container cannot see this host's addresses.
+      GUAARDVARK_CORS_ORIGINS: ${GUAARDVARK_CORS_ORIGINS:-}
       # Optional — set your Anthropic key for Uncle Claude:
       # ANTHROPIC_API_KEY: sk-ant-...
     ports:

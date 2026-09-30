@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- **Only Guaardvark's own pages can read its replies.** A web page served from any device on the
+  local network (any 192.168.x, 10.x or 172.16–31.x address, on any port) could call the backend
+  and read what it answered. Browsers are now answered only for this install's own pages: its
+  frontend and backend ports on this machine's names and addresses (`localhost`, its IP addresses,
+  its hostname and `<hostname>.local`), `VITE_FRONTEND_URL`, and origins listed in the new
+  `GUAARDVARK_CORS_ORIGINS` for a reverse proxy or another name. Other local ports (3000, 5175)
+  count only when one is this install's `VITE_PORT`. Socket.IO uses the same list, so the UI
+  opened at the machine's LAN address from a phone or another computer now gets live chat,
+  progress and voice; its connection was refused before. The Interconnector's status, register
+  and heartbeat routes still accept any private-network page, which is how a client node's
+  Settings page reaches its master.
 - **`start.sh` stops when run as root.** With `sudo`, the install landed under `/root` and left
   files the normal user could not write. It now says to run it as your normal user; it asks
   for your password itself when it installs system packages. Machines where root is the only
