@@ -1,9 +1,10 @@
 """Photo edits render at the editing model's registry step counts and say what ran.
 
-FLUX.1 Kontext declares its floor and default on its registry entry; an edit,
-inpaint or outpaint that names no count renders the default, a lower count is
-raised to the floor with a sentence in the result, and a count marked as typed
-by a person stands. ComfyUI is a stand-in: no GPU, network or database.
+FLUX.1 Kontext declares a default on its registry entry and no floor: an edit,
+inpaint or outpaint that names no count renders the default, and a count that
+is given is used as given. Qwen-Image-Edit declares a floor: a lower count is
+raised to it with a sentence in the result. ComfyUI is a stand-in: no GPU,
+network or database.
 """
 from __future__ import annotations
 
@@ -49,38 +50,34 @@ def _sampler_steps(workflow: dict) -> int:
     return next(n["inputs"]["steps"] for n in workflow.values() if n.get("class_type") == "KSampler")
 
 
-def test_the_kontext_floor_is_declared_on_its_registry_entry():
+def test_kontext_declares_a_default_and_no_floor_on_its_registry_entry():
     entry = vmr.VIDEO_MODEL_REGISTRY["flux-kontext-dev"]
-    assert entry["min_steps"] == cig.KONTEXT_MIN_STEPS
-    assert entry["default_steps"] == cig.KONTEXT_DEFAULT_STEPS
-    assert entry["default_steps"] >= entry["min_steps"]
+    assert entry["default_steps"] == cig.KONTEXT_DEFAULT_STEPS > 20
+    assert "min_steps" not in entry
     assert not [p for p in vmr.verify_registry() if p.startswith("flux-kontext-dev:")]
 
 
-def test_edit_steps_defaults_floors_and_keeps_a_typed_count():
-    rule = dict(floor=28, default=28, label="FLUX.1 Kontext")
-    assert cig.edit_steps(None, **rule) == (28, None)
-    assert cig.edit_steps(0, **rule) == (28, None)
-    assert cig.edit_steps("junk", **rule) == (28, None)
-    assert cig.edit_steps(40, **rule) == (40, None)
-    steps, notice = cig.edit_steps(20, **rule)
-    assert steps == 28 and "raised 20 to 28" in notice
-    steps, notice = cig.edit_steps(12, explicit=True, **rule)
-    assert steps == 12 and "kept the 12" in notice and "28" in notice
-    # A default below the floor never renders.
-    assert cig.edit_steps(None, floor=28, default=20, label="x") == (28, None)
+def test_edit_steps_uses_a_given_count_and_raises_only_to_a_declared_floor():
+    # No floor declared: the default when nothing is given, otherwise the count as given.
+    assert cig.edit_steps(None, default=28) == (28, None)
+    assert cig.edit_steps(0, default=28) == (28, None)
+    assert cig.edit_steps("junk", default=28) == (28, None)
+    assert cig.edit_steps(4, default=28) == (4, None)
+    assert cig.edit_steps(40, default=28) == (40, None)
+    # A declared floor raises a lower count and says so; the default never renders below it.
+    steps, notice = cig.edit_steps(10, default=20, floor=20, label="Qwen-Image-Edit")
+    assert steps == 20 and notice == "Qwen-Image-Edit needs at least 20 steps; raised 10 to 20."
+    assert cig.edit_steps(30, default=20, floor=20, label="x") == (30, None)
+    assert cig.edit_steps(None, default=20, floor=28, label="x") == (28, None)
 
 
-def test_a_kontext_edit_queues_the_floor_not_the_count_below_it(comfy, photo, tmp_path):
-    floor = cig.KONTEXT_MIN_STEPS
-    for asked, explicit, rendered in ((None, False, cig.KONTEXT_DEFAULT_STEPS), (floor - 8, False, floor),
-                                      (4, False, floor), (floor + 12, False, floor + 12), (12, True, 12)):
-        gen = cig.ComfyUIImageGenerator()
-        gen.edit_image(image_path=photo, instruction="x", output_path=str(tmp_path / "o.png"),
-                       steps=asked, steps_explicit=explicit)
-        assert _sampler_steps(comfy[-1]) == rendered == gen.last_steps
-        changed_or_below = asked is not None and asked < floor
-        assert bool(gen.last_steps_notice) == changed_or_below
+@pytest.mark.parametrize("asked", [None, 4, 20, 40])
+def test_a_kontext_edit_renders_the_default_or_the_count_it_was_given(comfy, photo, tmp_path, asked):
+    gen = cig.ComfyUIImageGenerator()
+    gen.edit_image(image_path=photo, instruction="x", output_path=str(tmp_path / "o.png"), steps=asked)
+    rendered = cig.KONTEXT_DEFAULT_STEPS if asked is None else asked
+    assert _sampler_steps(comfy[-1]) == rendered == gen.last_steps
+    assert gen.last_steps_notice is None
 
 
 def test_inpaint_and_outpaint_render_kontext_at_its_default_when_no_count_is_given(comfy, photo):
@@ -94,15 +91,16 @@ def test_inpaint_and_outpaint_render_kontext_at_its_default_when_no_count_is_giv
     assert res.metadata["steps"] == cig.KONTEXT_DEFAULT_STEPS
 
 
-def test_a_low_count_from_a_tool_call_is_raised_and_the_result_says_so(comfy, photo):
-    floor = cig.KONTEXT_MIN_STEPS
+def test_a_count_given_to_a_kontext_tool_call_is_used_as_given(comfy, photo):
     res = it.EditImageTool().execute(instruction="make it night", image=photo, steps=4)
-    assert res.success and _sampler_steps(comfy[-1]) == floor
-    assert f"raised 4 to {floor}" in res.output and res.metadata["steps"] == floor
-    assert f"raised 4 to {floor}" in res.metadata["steps_notice"]
+    assert res.success and _sampler_steps(comfy[-1]) == 4
+    assert res.metadata["steps"] == 4 and res.metadata["steps_notice"] is None
+    assert "Steps: 4" in res.output and "raised" not in res.output
 
-    res = it.InpaintImageTool().execute(instruction="remove the cup", image=photo, steps=floor - 8)
-    assert _sampler_steps(comfy[-1]) == floor and f"raised {floor - 8} to {floor}" in res.output
+    res = it.InpaintImageTool().execute(instruction="remove the cup", image=photo, steps=20)
+    assert _sampler_steps(comfy[-1]) == 20 and "raised" not in res.output
+    res = it.OutpaintImageTool().execute(image=photo, steps=12)
+    assert _sampler_steps(comfy[-1]) == 12 and res.metadata["steps_notice"] is None
 
 
 def test_qwen_keeps_its_own_floor_and_reports_it(comfy, photo, monkeypatch, tmp_path):

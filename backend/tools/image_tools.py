@@ -1898,8 +1898,9 @@ class EditImageTool(BaseTool):
         ),
         "steps": ToolParameter(
             name="steps", type="int",
-            description=("Diffusion steps (more = higher fidelity, slower). Default 28. A value below "
-                         "the editing model's floor is raised to it, and the result says so."),
+            description=("Diffusion steps (more = higher fidelity, slower). Default 28. A value is used as "
+                         "given, except below a floor the editing model declares (Qwen-Image-Edit does), "
+                         "where it is raised and the result says so."),
             required=False, default=28,
         ),
         "model": ToolParameter(
@@ -2148,8 +2149,8 @@ class EditImageTool(BaseTool):
             gen = ComfyUIImageGenerator()
             gpu_wait = _chat_gpu_wait()
 
-            # No step count (None or 0) renders the model's own default, and the
-            # generator raises a lower one to the model's registry floor.
+            # No step count (None or 0) renders the model's own default; a given one
+            # is used as given unless the model's registry entry declares a floor.
             if backend == "qwen":
                 gen.edit_image_qwen(
                     image_paths=[src, *extra], instruction=instruction,
@@ -2274,8 +2275,9 @@ def _gpu_refusal(e: Exception, gpu_wait: dict | None) -> str | None:
 # `steps` on inpaint_image and outpaint_image. The counts live on the editing
 # models' registry entries (min_steps, default_steps), so none is repeated here.
 _EDIT_STEPS_PARAM = (
-    "Diffusion steps. Omit to render at the editing model's own count; a value below that "
-    "model's floor is raised to it, and the result says so."
+    "Diffusion steps. Omit to render at the editing model's own count. A value is used as given, "
+    "except below a floor the editing model declares (Qwen-Image-Edit does), where it is raised "
+    "and the result says so."
 )
 
 

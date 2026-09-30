@@ -143,8 +143,7 @@ try:
     )
     _KONTEXT = _VMR.get("flux-kontext-dev") or {}
     KONTEXT_UNET = _KONTEXT.get("hf_filename", "flux1-kontext-dev-Q6_K.gguf")
-    KONTEXT_MIN_STEPS = int(_KONTEXT.get("min_steps") or 28)
-    KONTEXT_DEFAULT_STEPS = int(_KONTEXT.get("default_steps") or KONTEXT_MIN_STEPS)
+    KONTEXT_DEFAULT_STEPS = int(_KONTEXT.get("default_steps") or 28)
     _QWEN_EDIT = _VMR.get("qwen-image-edit") or {}
     QWEN_EDIT_UNET = ((_QWEN_EDIT.get("files") or [{}])[0].get("dst")
                       or "qwen_image_edit_2509_fp8_e4m3fn.safetensors")
@@ -162,7 +161,6 @@ try:
     PULID_IDENTITY_DEFAULTS.update(_PULID.get("identity_defaults") or {})
 except Exception:  # pragma: no cover - registry import is environment-specific
     KONTEXT_UNET = "flux1-kontext-dev-Q6_K.gguf"
-    KONTEXT_MIN_STEPS = 28
     KONTEXT_DEFAULT_STEPS = 28
     QWEN_EDIT_UNET = "qwen_image_edit_2509_fp8_e4m3fn.safetensors"
     QWEN_EDIT_MIN_STEPS = 20
@@ -195,13 +193,12 @@ def _registry_vram(model_id: str, default: int = 12000) -> int:
         return default
 
 
-def edit_steps(steps, *, floor: int, default: int, label: str, explicit: bool = False) -> tuple:
+def edit_steps(steps, *, default: int, floor: int = 0, label: str = "") -> tuple:
     """Sampling steps for an edit graph: ``(steps, notice)``.
 
-    No count given renders the model's ``default``. A count below the
-    registry ``floor`` is raised to it and ``notice`` says so, unless
-    ``explicit`` marks it as one a person typed: that count stands and the
-    notice names the floor it is under.
+    No count given renders the model's ``default``; a count that is given is
+    used as given. Where the model's registry entry declares a ``floor``, a
+    count below it is raised to the floor and ``notice`` says so.
     """
     try:
         asked = int(steps or 0)
@@ -211,8 +208,6 @@ def edit_steps(steps, *, floor: int, default: int, label: str, explicit: bool = 
         return max(int(default), int(floor)), None
     if asked >= floor:
         return asked, None
-    if explicit:
-        return asked, f"{label} is set up for at least {floor} steps; kept the {asked} asked for."
     return int(floor), f"{label} needs at least {floor} steps; raised {asked} to {floor}."
 
 
@@ -888,12 +883,12 @@ class ComfyUIImageGenerator:
 
     def edit_image(self, *, image_path: str, instruction: str, output_path: str,
                    steps: int | None = None, guidance: float = 2.5, seed: int = 42,
-                   gpu_wait: dict | None = None, steps_explicit: bool = False) -> str:
+                   gpu_wait: dict | None = None) -> str:
         """Instruction-guided edit of an existing image via FLUX.1 Kontext [dev].
         Honest failure if ComfyUI is down or the Kontext model isn't installed —
-        never returns a fake/unedited image. Steps default to, and are floored at, the
-        registry entry's counts (``edit_steps``); ``steps_explicit`` keeps a count a
-        person typed. ``last_steps`` and ``last_steps_notice`` say what was rendered.
+        never returns a fake/unedited image. No step count renders the registry entry's
+        default_steps (Kontext is under-rendered at 20); a count that is given is used as
+        given. ``last_steps`` says what was rendered.
         Guidance ~2.5 (do not exceed ~3.5 — over-bakes/identity-drift; cfg stays 1.0).
 
         Holds the GPU for the whole edit (exclusivity + evict Ollama + free ComfyUI UNDER
@@ -908,9 +903,7 @@ class ComfyUIImageGenerator:
                 f"until that model finishes downloading."
             )
         self._require_up(f"ComfyUI not reachable at {self.comfy_url} — cannot edit image")
-        self.last_steps, self.last_steps_notice = edit_steps(
-            steps, floor=KONTEXT_MIN_STEPS, default=KONTEXT_DEFAULT_STEPS,
-            label="FLUX.1 Kontext", explicit=steps_explicit)
+        self.last_steps, self.last_steps_notice = edit_steps(steps, default=KONTEXT_DEFAULT_STEPS)
         import uuid as _uuid
         with self._edit_gpu_session(f"chat_edit_{_uuid.uuid4().hex[:8]}", gpu_wait,
                                     evict_ollama=True, free_comfyui=True,

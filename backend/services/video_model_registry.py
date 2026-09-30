@@ -649,13 +649,10 @@ VIDEO_MODEL_REGISTRY = {
         "check_files": ["flux1-kontext-dev-Q6_K.gguf"],
         "size_gb": 9.85,
         "vram_mb": 14000,
-        # 20 steps is under-rendered on this build; 28 is the count its edits
-        # were tuned at. No side-by-side of the two, or of the counts between
-        # them, is recorded, so 28 is both the default and the floor. Record the
-        # comparison here (image size, instruction, what each count looked like)
-        # before lowering either.
+        # The default follows the observation in the edit code that 20 steps
+        # under-renders on this build. No min_steps is declared: a floor belongs
+        # here only with a measured before/after comparison recorded beside it.
         "default_steps": 28,
-        "min_steps": 28,
         "type": "flux-edit",
     },
     # ── Qwen-Image-Edit 2509 FP8 — Chat editor + identity-in-a-new-scene ────────
