@@ -336,6 +336,7 @@ jobs:
             backend/tests/test_outreach_tools_mcp.py \
             backend/tests/utils/test_secret_redaction.py \
             backend/tests/test_read_logs.py \
+            backend/tests/api/test_swarm_status_errors.py \
             backend/tests/services/test_gpu_hard_fit.py \
             backend/tests/services/test_gpu_load_gates.py \
             backend/tests/services/test_gpu_session_wraps_generation.py \

@@ -27,6 +27,10 @@ _SWARM_OFFLINE_ERROR = (
     "Swarm plugin is not running (port 8210). Start it from /plugins or say so — "
     "do not pretend a swarm launched."
 )
+# The sidecar is up but its status could not be read (timeout, a 5xx, a body
+# that is not JSON, a rejected internal token). Not the same as offline:
+# starting the plugin again is not the fix.
+_SWARM_FAULT_ERROR = "The swarm service is running but did not return its status: {detail}"
 
 # Swarm ids look like "swarm-20260930-120000-a1b2c3" (generate_swarm_id in
 # plugins/swarm/service/models.py). The id becomes a URL path segment, so
@@ -644,8 +648,15 @@ class SwarmStatusTool(BaseTool):
                 error=_SWARM_OFFLINE_ERROR,
                 metadata={"http_status": 503, "data": data},
             )
+        if status == 404:
+            return ToolResult(success=False, error="Swarm not found", metadata={"http_status": 404})
         if status >= 400:
-            return ToolResult(success=False, error=swarm_api._extract_error(data, "swarm status failed"), metadata={"http_status": status})
+            detail = swarm_api._extract_error(data, "swarm status failed") if isinstance(data, dict) else "swarm status failed"
+            return ToolResult(
+                success=False,
+                error=_SWARM_FAULT_ERROR.format(detail=detail),
+                metadata={"http_status": status},
+            )
         return ToolResult(success=True, output=data)
 
     def _status_via_backend(self, swarm_id: str) -> ToolResult:
@@ -655,12 +666,28 @@ class SwarmStatusTool(BaseTool):
         except BackendError as e:
             if e.kind == "plugin_offline":
                 return ToolResult(success=False, error=_SWARM_OFFLINE_ERROR, metadata={"http_status": 503})
+            if e.status in (502, 504):
+                return ToolResult(
+                    success=False,
+                    error=_SWARM_FAULT_ERROR.format(detail=e),
+                    metadata={"http_status": e.status},
+                )
             return ToolResult(success=False, error=str(e), metadata={"http_status": e.status})
         # GET /api/swarm/status answers 200 with an empty list when the sidecar
         # is down, so the offline case is only visible in its message.
         if isinstance(resp.body, dict) and resp.body.get("message") == "Swarm service offline":
             return ToolResult(success=False, error=_SWARM_OFFLINE_ERROR, metadata={"http_status": 503})
-        return ToolResult(success=True, output=resp.data)
+        # A status is never just an error message. A backend that wraps the
+        # sidecar's failure in a success envelope must not be read as one.
+        data = resp.data
+        if isinstance(data, dict) and data and set(data) <= {"error", "detail", "message"}:
+            detail = data.get("error") or data.get("detail") or data.get("message")
+            return ToolResult(
+                success=False,
+                error=_SWARM_FAULT_ERROR.format(detail=detail),
+                metadata={"http_status": resp.status},
+            )
+        return ToolResult(success=True, output=data)
 
 
 class LaunchSwarmTool(BaseTool):
