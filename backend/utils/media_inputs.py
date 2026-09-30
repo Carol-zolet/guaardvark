@@ -218,9 +218,6 @@ def resolve_media_ref(ref, *, mcp: bool, label: str = "file",
     if url_path is not None:
         from backend import config
 
-        if ".." in url_path.split("/"):
-            return MediaRef(error=f"{label} '{text}' leaves the folder that URL serves. {accepted}",
-                            refused=True)
         doc = _DOCUMENT_URL.match(url_path)
         if doc:
             return from_document(int(doc.group(1)))
@@ -230,6 +227,11 @@ def resolve_media_ref(ref, *, mcp: bool, label: str = "file",
             except PathEscapesRoot:
                 return MediaRef(error=f"{label} '{text}' leaves the outputs folder. {accepted}", refused=True)
             return check(path)
+        # /api/outputs/ is confined above; any other served URL with a '..'
+        # segment is refused before its route is matched.
+        if ".." in url_path.split("/"):
+            return MediaRef(error=f"{label} '{text}' leaves the folder that URL serves. {accepted}",
+                            refused=True)
         batch = _BATCH_IMAGE_URL.match(url_path)
         if batch:
             base = (Path(config.UPLOAD_DIR) / "Images").resolve()
