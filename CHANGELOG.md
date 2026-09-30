@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- **Chatterbox's own voice stays its own after a clone.** Chatterbox kept the last cloned voice as
+  its default, so a later voiceover without a reference clip (the Audio Studio's default voice, a
+  Film Crew character without a voice) spoke in that clone's voice, even after its consent was
+  withdrawn, until the model unloaded. The stock voice now comes back after every generation, and
+  a clone reads its clip once rather than once per chunk.
 - **`start.sh` stops when run as root.** With `sudo`, the install landed under `/root` and left
   files the normal user could not write. It now says to run it as your normal user; it asks
   for your password itself when it installs system packages. Machines where root is the only

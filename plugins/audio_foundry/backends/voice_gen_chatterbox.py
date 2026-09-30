@@ -12,6 +12,7 @@ Install (handled at first start.sh run after the requirements.txt bump):
 from __future__ import annotations
 
 import logging
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -57,6 +58,13 @@ class ChatterboxBackend(AudioBackend):
         self._sample_rate = int(sample_rate)
         self._chunk_chars = int(chunk_chars)
         self._model: Any = None
+        # ChatterboxTTS keeps one set of voice conditionals (model.conds). The
+        # stock voice from conds.pt starts there, and cloning replaces it
+        # (prepare_conditionals). generate() holds this lock while it sets and
+        # uses them, and puts the stock voice back when it is done, so a later
+        # request without a clip never speaks in the last cloned voice.
+        self._generate_lock = threading.Lock()
+        self._stock_conds: Any = None
 
     @property
     def is_loaded(self) -> bool:
@@ -95,6 +103,7 @@ class ChatterboxBackend(AudioBackend):
         # snapshot keeps the load off the network. The five resolve through
         # the same refs/main, so they share one snapshot folder.
         self._model = ChatterboxTTS.from_local(Path(paths["ve.safetensors"]).parent, device)
+        self._stock_conds = getattr(self._model, "conds", None)
         logger.info("Chatterbox loaded on %s", device)
 
     def unload(self) -> None:
@@ -104,6 +113,7 @@ class ChatterboxBackend(AudioBackend):
 
         del self._model
         self._model = None
+        self._stock_conds = None
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         logger.info("Chatterbox unloaded")
@@ -126,7 +136,10 @@ class ChatterboxBackend(AudioBackend):
     def generate(self, **params: Any) -> GenerationResult:
         if self._model is None:
             raise RuntimeError("Chatterbox not loaded; call load() first")
+        with self._generate_lock:
+            return self._generate(**params)
 
+    def _generate(self, **params: Any) -> GenerationResult:
         text: str = params["text"]
         reference_clip = params.get("reference_clip_path")
         emotion = params.get("emotion")
@@ -138,6 +151,8 @@ class ChatterboxBackend(AudioBackend):
         if reference_clip:
             # The clone happens here, so consent is checked here as well as in
             # the backend proxy: any process on this machine can call the plugin.
+            # Checked once this request holds the model, so a request that
+            # waited behind another sees consent withdrawn in the meantime.
             reference_clip = voice_consent.require_consent(reference_clip)
 
         import torch
@@ -162,7 +177,13 @@ class ChatterboxBackend(AudioBackend):
         for knob in ("exaggeration", "cfg_weight", "temperature"):
             if params.get(knob) is not None:
                 gen_kwargs[knob] = float(params[knob])
-        if reference_clip:
+        # The clip is read once, before the first chunk, so every chunk speaks
+        # with the same conditionals and a clip deleted or withdrawn while this
+        # runs does not stop it. A build without prepare_conditionals reads it
+        # on every call instead.
+        model, stock_conds = self._model, self._stock_conds
+        prepare = getattr(model, "prepare_conditionals", None) if reference_clip else None
+        if reference_clip and prepare is None:
             gen_kwargs["audio_prompt_path"] = str(reference_clip)
         if seed is not None:
             torch.manual_seed(int(seed))
@@ -191,6 +212,10 @@ class ChatterboxBackend(AudioBackend):
         total_frames = 0
         t0 = time.monotonic()
         try:
+            if prepare is not None:
+                prepare(str(reference_clip))
+            elif stock_conds is not None:
+                model.conds = stock_conds
             with sf.SoundFile(
                 str(out_path), mode="w", samplerate=self._sample_rate,
                 channels=1, subtype="PCM_16",
@@ -211,6 +236,9 @@ class ChatterboxBackend(AudioBackend):
             # Cancel or failure: don't leak a partial WAV.
             out_path.unlink(missing_ok=True)
             raise
+        finally:
+            if stock_conds is not None:
+                model.conds = stock_conds
         gen_seconds = time.monotonic() - t0
 
         # Post-process: normalization + optional MP3. NOTE: post_process uses
