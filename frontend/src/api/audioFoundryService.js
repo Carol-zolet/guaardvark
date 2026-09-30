@@ -1,7 +1,7 @@
 import axios from "axios";
 
 /**
- * Audio Foundry calls for the Audio Studio's reference clips.
+ * Audio Foundry calls shared by the Audio Studio and the Cast page.
  *
  * A clip is addressed by its file name (`me.wav`), which stays unambiguous
  * when two clips share a name without the extension (`me.wav`, `me.mp3`);
@@ -16,6 +16,16 @@ const clipPath = (clip) =>
 
 /** URL an <audio> element plays the clip from. */
 export const voiceClipAudioUrl = (clip) => `${clipPath(clip)}/download`;
+
+/**
+ * The voice catalog: `{kokoro: {default, groups: [{label, voices: [{id, label, installed}]}]}}`.
+ * Answered from the checkout (with `plugin_running: false`) while Audio
+ * Foundry is stopped, so it lists the voices either way.
+ */
+export const getVoiceCatalog = async () => {
+  const response = await axios.get(`${API_BASE}/audio-foundry/voices`);
+  return response.data;
+};
 
 /** Record consent for a clip already imported. */
 export const confirmVoiceClipConsent = async (clip) => {

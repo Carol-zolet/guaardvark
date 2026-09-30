@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- **Cast: a character's voice is picked from a list.** The Overview's free-text "Voice ID" let a
+  typo become an id that renders drop. It is now a list of Audio Foundry's voices, grouped as in
+  the Audio Studio, with "Default voice" first; voices that are not installed say so and link to
+  Audio Studio → Manage models. A saved id that is not a voice is shown as invalid until another
+  is picked, and is never changed on its own. Cloned voices are not offered: a Cast member has no
+  reference clip to clone from. `GET /api/audio-foundry/voices` now answers while Audio Foundry is
+  stopped, from the catalog in the checkout, with `plugin_running: false`.
 - **Audio Studio: withdraw consent for a voice clip, or delete it.** "Manage imported clips" under
   the reference clip lists each clip and whether consent is recorded. *Withdraw consent* removes
   the record and keeps the clip, which is not cloned again until consent is confirmed; *Delete

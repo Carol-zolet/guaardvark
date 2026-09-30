@@ -215,8 +215,28 @@ def config():
 
 @audio_foundry_bp.route("/voices", methods=["GET"])
 def voices():
-    body, status_code = _proxy_get("/voices")
-    return body, status_code
+    """The voice catalog, from the plugin while it runs.
+
+    When it cannot be reached the Kokoro part is read here, from the same
+    catalog file and the same local Hugging Face cache check the plugin uses,
+    with ``plugin_running: false``: the Audio Studio and the Cast page's voice
+    pickers list the voices, and which are installed, with the plugin stopped.
+    """
+    try:
+        resp = requests.get(f"{AUDIO_FOUNDRY_URL}/voices", timeout=QUICK_TIMEOUT)
+        return jsonify(resp.json()), resp.status_code
+    except (requests.ConnectionError, requests.Timeout):
+        pass
+    except Exception as e:
+        logger.exception("Audio Foundry GET /voices failed")
+        return jsonify({"error": str(e)}), 500
+    try:
+        from backend.services.audio_foundry_models import kokoro_catalog, kokoro_voice_groups
+        kokoro = {"default": kokoro_catalog()["default"], "groups": kokoro_voice_groups()}
+    except Exception as e:  # noqa: BLE001 - the catalog ships in the checkout
+        logger.warning("Kokoro voice catalog unreadable: %s", e)
+        return _not_running("voice catalog unreadable")
+    return jsonify({"kokoro": kokoro, "plugin_running": False}), 200
 
 
 # ---------- Model catalog / install (plugin-offline safe) -------------------

@@ -4,11 +4,11 @@ Withdrawing consent removes the clip's consent record and keeps the clip, which
 is then refused for cloning until consent is confirmed again. Deleting removes
 the clip and its record, and only that clip. Deleting answers this machine or
 the API key, like the Cast Library's deletes; withdrawing stays as open as
-giving consent.
+giving consent. The voice list answers while Audio Foundry is stopped.
 
 Flask's test client against temporary upload folders, behind the real auth
-hook. Audio Foundry is never called: its generate proxy is a stand-in. No
-GPU, network or database.
+hook. Audio Foundry is never called: its generate proxy and GET /voices are
+stand-ins. No GPU, network or database.
 """
 
 from __future__ import annotations
@@ -19,6 +19,7 @@ from types import SimpleNamespace
 from urllib.parse import quote
 
 import pytest
+import requests
 from flask import Flask
 
 WAV = b"RIFF0000WAVEfmt voice"
@@ -231,3 +232,35 @@ def test_with_an_api_key_deleting_needs_it_on_this_machine_too(studio, monkeypat
     refused = studio.client.delete(f"{BASE}/me", json=CONFIRMED)
     assert refused.status_code == 401 and refused.get_json()["code"] == "api_key_required"
     assert studio.client.delete(f"{BASE}/me", json=CONFIRMED, headers={"X-API-Key": key}).status_code == 200
+
+
+# ---- the voice list ------------------------------------------------------------------
+def test_the_voice_list_is_read_from_the_checkout_while_the_plugin_is_stopped(studio, monkeypatch):
+    from backend.api import audio_foundry_api
+    from backend.services import audio_foundry_models
+
+    def down(*_a, **_k):
+        raise requests.ConnectionError("refused")
+
+    monkeypatch.setattr(audio_foundry_api.requests, "get", down)
+    monkeypatch.setattr(audio_foundry_models, "is_hub_cached",
+                        lambda repo, name: name.endswith("/af_heart.pt"))
+
+    res = studio.client.get("/api/audio-foundry/voices")
+    assert res.status_code == 200
+    body = res.get_json()
+    assert body["plugin_running"] is False and body["kokoro"]["default"] == "af_heart"
+    voices = [v for g in body["kokoro"]["groups"] for v in g["voices"]]
+    assert [v["id"] for v in voices] == audio_foundry_models.kokoro_voice_ids()
+    assert {v["id"] for v in voices if v["installed"]} == {"af_heart"}
+    assert all(v["label"] for v in voices)
+
+
+def test_the_voice_list_comes_from_the_plugin_while_it_runs(studio, monkeypatch):
+    from backend.api import audio_foundry_api
+
+    answer = {"kokoro": {"default": "af_heart", "groups": []}, "chatterbox": {"type": "reference_clip"}}
+    monkeypatch.setattr(audio_foundry_api.requests, "get",
+                        lambda url, timeout: SimpleNamespace(status_code=200, json=lambda: answer))
+    res = studio.client.get("/api/audio-foundry/voices")
+    assert res.status_code == 200 and res.get_json() == answer

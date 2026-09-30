@@ -208,6 +208,24 @@ def kokoro_voice_ids() -> List[str]:
     return [v["id"] for g in kokoro_catalog()["groups"] for v in g["voices"]]
 
 
+def kokoro_voice_groups() -> List[Dict[str, Any]]:
+    """The catalog's groups with each voice marked ``installed`` when its voice
+    pack is in the local Hugging Face cache: the Kokoro part of the plugin's
+    GET /voices, for when the plugin is not running."""
+    cat = kokoro_catalog()
+    return [
+        {
+            "label": group["label"],
+            "voices": [
+                {**voice,
+                 "installed": is_hub_cached(cat["hf_repo"], cat["voice_file"].format(voice=voice["id"]))}
+                for voice in group["voices"]
+            ],
+        }
+        for group in cat["groups"]
+    ]
+
+
 def kokoro_voice_choices(installed_only: bool = True) -> List[Dict[str, str]]:
     """The Kokoro voices as ``{id, label, group}``, for a caller choosing one.
 
