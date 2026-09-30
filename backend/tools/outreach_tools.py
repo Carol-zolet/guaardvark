@@ -407,20 +407,18 @@ class OutreachApproveDraftTool(BaseTool):
             return ToolResult(success=False, error="id must be an integer")
 
         try:
-            from backend.models import SocialOutreachLog, db
-            from backend.services.social_outreach.transitions import can_approve
-            row = SocialOutreachLog.query.get(event_id)
-            if row is None:
-                return ToolResult(success=False, error=f"draft {event_id} not found")
-            if not can_approve(row.status):
+            from backend.models import SocialOutreachLog
+            from backend.services.social_outreach import transitions
+            draft_text = kwargs.get("draft_text")
+            if not transitions.approve(event_id, None if draft_text is None else str(draft_text)):
+                status = transitions.current_status(event_id)
+                if status is None:
+                    return ToolResult(success=False, error=f"draft {event_id} not found")
                 return ToolResult(
                     success=False,
-                    error=f"cannot approve from status '{row.status}' (only from drafted)",
+                    error=f"cannot approve from status '{status}' (only from drafted)",
                 )
-            if "draft_text" in kwargs and kwargs["draft_text"] is not None:
-                row.draft_text = str(kwargs["draft_text"])
-            row.status = "approved"
-            db.session.commit()
+            row = SocialOutreachLog.query.get(event_id)
             return ToolResult(
                 success=True,
                 output=_row_summary(row),
@@ -439,7 +437,10 @@ class OutreachRejectDraftTool(BaseTool):
     # A rejected draft cannot be moved back to the queue.
     destructive = True
     description = (
-        "Reject an outreach draft by id. Marks the row 'rejected' so it won't post. "
+        "Reject an outreach draft by id so it will not post. Success means the row is "
+        "'rejected' and nothing will be published for it, even if it had already been "
+        "picked up for posting. Once a draft is being submitted or is posted it can no "
+        "longer be stopped: the call then fails and says so, and the row is left as it is. "
         "Use when the user says 'kill that one', 'don't post draft 42', etc."
     )
     parameters = {
@@ -448,6 +449,29 @@ class OutreachRejectDraftTool(BaseTool):
             description="SocialOutreachLog row id",
         ),
     }
+
+    @staticmethod
+    def _rejected(row, rejected_from: Optional[str]) -> ToolResult:
+        summary = _row_summary(row)
+        summary["rejected_from"] = rejected_from
+        if rejected_from == "processing":
+            summary["note"] = (
+                "This draft had been picked up for posting. It was stopped before it "
+                "was submitted and will not post."
+            )
+        return ToolResult(
+            success=True,
+            output=summary,
+            metadata={"id": summary["id"], "status": summary["status"], "rejected_from": rejected_from},
+        )
+
+    @staticmethod
+    def _not_rejected(event_id: int, status: Optional[str], refusal: str) -> ToolResult:
+        return ToolResult(
+            success=False,
+            error=f"Draft {event_id} was not rejected: {refusal}.",
+            metadata={"id": event_id, "status": status},
+        )
 
     def execute(self, **kwargs) -> ToolResult:
         try:
@@ -461,31 +485,23 @@ class OutreachRejectDraftTool(BaseTool):
             except BackendError as e:
                 if e.status == 404:
                     return ToolResult(success=False, error=f"draft {event_id} not found")
+                if e.status == 409:
+                    status = e.body.get("status") if isinstance(e.body, dict) else None
+                    return self._not_rejected(event_id, status, str(e))
                 return ToolResult(success=False, error=str(e))
-            return ToolResult(
-                success=True,
-                output=_row_summary(row),
-                metadata={"id": row.get("id"), "status": row.get("status")},
-            )
+            return self._rejected(row, row.get("rejected_from"))
 
         try:
-            from backend.models import SocialOutreachLog, db
-            from backend.services.social_outreach.transitions import can_reject
-            row = SocialOutreachLog.query.get(event_id)
-            if row is None:
+            from backend.models import SocialOutreachLog
+            from backend.services.social_outreach import transitions
+            outcome = transitions.reject(event_id)
+            if outcome.status is None:
                 return ToolResult(success=False, error=f"draft {event_id} not found")
-            if not can_reject(row.status):
-                return ToolResult(
-                    success=False,
-                    error=f"cannot reject from status '{row.status}'",
+            if not outcome.rejected:
+                return self._not_rejected(
+                    event_id, outcome.status, transitions.reject_refusal(outcome.status),
                 )
-            row.status = "rejected"
-            db.session.commit()
-            return ToolResult(
-                success=True,
-                output=_row_summary(row),
-                metadata={"id": row.id, "status": row.status},
-            )
+            return self._rejected(SocialOutreachLog.query.get(event_id), outcome.status)
         except Exception as e:
             logger.exception("outreach_reject_draft failed")
             return ToolResult(success=False, error=str(e))
