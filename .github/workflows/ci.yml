@@ -336,6 +336,7 @@ jobs:
             backend/tests/services/test_video_vram_wait.py \
             backend/tests/test_mcp_tool_jobs.py \
             backend/tests/api/test_batch_video_lifecycle.py \
+            backend/tests/services/test_edit_backend_refusals.py \
             backend/tests/services/test_edit_step_floor.py \
             backend/tests/services/test_offline_image_unload_hooks.py \
             backend/tests/services/test_offline_image_oom_ladder.py \

@@ -1835,7 +1835,8 @@ class VideoGeneratorTool(BaseTool):
 class EditImageTool(BaseTool):
     """Edit an EXISTING image from a natural-language instruction.
 
-    Prefers Qwen-Image-Edit when installed, else FLUX.1 Kontext, else img2img.
+    Prefers Qwen-Image-Edit when installed, else FLUX.1 Kontext; with neither it
+    refuses and names the pack to install. img2img runs only for a named image model.
     Use when the user SUPPLIES or ATTACHES an image and asks to add/remove/change
     something in it — e.g. 'put a cowboy hat on this character', 'make it night',
     'remove the sign'. Same canvas, same pose. For a brand-new scene of a face
@@ -1875,27 +1876,42 @@ class EditImageTool(BaseTool):
         "model": ToolParameter(
             name="model", type="string",
             description=(
-                "Image model/backend. Default follows /imagemodel (Settings). "
-                "'qwen-image-edit' or 'auto' uses Qwen-Image-Edit when installed; "
-                "'kontext' uses FLUX.1 Kontext; other downloaded models use img2img."
+                "Image model/backend. Default 'auto': Qwen-Image-Edit when installed, else FLUX.1 "
+                "Kontext; with neither installed the call is refused and names the pack to install. "
+                "In chat, 'auto' is replaced by the /imagemodel setting. 'qwen-image-edit' and "
+                "'kontext' name a pack; any other downloaded image model runs a light img2img pass "
+                "that keeps most of the picture."
             ),
             required=False, default="auto",
         ),
         "reference_image_2": ToolParameter(
             name="reference_image_2", type="string",
-            description="Optional second reference (another person or style), in the same forms as image. Qwen-Image-Edit only.",
+            description=("Optional second reference (another person or style), in the same forms as image. "
+                         "Qwen-Image-Edit only: the call is refused when the edit would run on another "
+                         "backend, or when the reference cannot be read."),
             required=False, default="",
         ),
         "reference_image_3": ToolParameter(
             name="reference_image_3", type="string",
-            description="Optional third reference, in the same forms as image. Qwen-Image-Edit only.",
+            description="Optional third reference; same rules as reference_image_2.",
             required=False, default="",
         ),
         "wait_for_result": _wait_for_result_param(),
     }
 
+    # The tool an edit runs for. inpaint_image borrows this class (``_edit_tool_for``)
+    # under its own name, which picks the refusal wording and the backends allowed.
+    for_tool = "edit_image"
+
     @staticmethod
-    def _pick_edit_backend(model: str) -> str:
+    def _pick_edit_backend(model: str) -> Optional[str]:
+        """'qwen', 'kontext' or 'img2img' for ``model``; None when it is 'auto' and
+        neither editing pack is installed.
+
+        img2img is only ever picked by naming an image model. At the strength an
+        edit uses it returns a near copy of the photo, so it is not what 'auto'
+        falls back to when a pack is missing.
+        """
         m = (model or "auto").strip().lower()
         if m in _QWEN_EDIT_MODEL_IDS:
             return "qwen"
@@ -1912,7 +1928,34 @@ class EditImageTool(BaseTool):
                 return "kontext"
         except Exception:
             pass
-        return "img2img"
+        return None
+
+    def _edit_backend(self, model: str, references: int = 0):
+        """The backend this edit runs on, or the ToolResult that refuses it.
+
+        Refused: 'auto' with no editing pack installed, and reference images on
+        a backend that edits one image. inpaint_image has no img2img form, so an
+        image model named for it (chat passes the /imagemodel setting) means 'auto'.
+        """
+        backend = self._pick_edit_backend(model)
+        if backend == "img2img" and self.for_tool != "edit_image":
+            backend = self._pick_edit_backend("auto")
+        if backend is None:
+            from backend.services.image_editing_packs import missing_message
+            return ToolResult(success=False, error=missing_message(self.for_tool))
+        if references and backend != "qwen":
+            runs_on = "FLUX.1 Kontext" if backend == "kontext" else f"img2img with '{model}'"
+            return ToolResult(success=False, error=(
+                f"Reference images are only used by Qwen-Image-Edit. This edit would run on {runs_on}, "
+                "which edits one image and would ignore them. Call again without reference_image_2 and "
+                "reference_image_3, or install Qwen-Image-Edit (Manage Image Models, Image editing) and "
+                "use model 'auto' or 'qwen-image-edit'."))
+        return backend
+
+    @staticmethod
+    def _effective_model(model: str) -> str:
+        from backend.utils.settings_utils import get_chat_image_model
+        return (model or "auto").strip() or get_chat_image_model()
 
     @staticmethod
     def _uses_kontext_backend(model: str) -> bool:
@@ -2030,6 +2073,10 @@ class EditImageTool(BaseTool):
         if isinstance(inputs, ToolResult):
             return inputs
         src, extra = inputs
+        # Refused here, with the inputs, so an MCP client hears it at once and not as a failed job.
+        backend = self._edit_backend(self._effective_model(model), len(extra))
+        if isinstance(backend, ToolResult):
+            return backend
         return _run_or_queue(self, lambda: self._edit(
             src, extra, instruction=instruction, steps=steps, model=model,
         ))
@@ -2044,11 +2091,13 @@ class EditImageTool(BaseTool):
             )
         extra = []
         for label, raw in (("reference_image_2", reference_image_2), ("reference_image_3", reference_image_3)):
+            if not str(raw or "").strip():
+                continue
             ref = self._resolve_image_ref(raw, label=label)
-            if ref.refused:
-                return ToolResult(success=False, error=ref.error)
-            if ref.path:
-                extra.append(ref.path)
+            if not ref.path:
+                # A reference that was given and cannot be read changes what the edit means.
+                return ToolResult(success=False, error=ref.error or f"{label} could not be read.")
+            extra.append(ref.path)
         return found.path, extra
 
     def _edit(self, src: str, extra: list, *, instruction: str, steps, model: str) -> ToolResult:
@@ -2056,14 +2105,17 @@ class EditImageTool(BaseTool):
         try:
             from backend.config import OUTPUT_DIR
             from backend.services.comfyui_image_generator import ComfyUIImageGenerator
-            from backend.utils.settings_utils import get_chat_image_model
 
-            effective_model = (model or "auto").strip() or get_chat_image_model()
+            effective_model = self._effective_model(model)
+            backend = self._edit_backend(effective_model, len(extra))
+            if isinstance(backend, ToolResult):
+                return backend
+            if backend != "img2img" and effective_model.lower() not in _QWEN_EDIT_MODEL_IDS | _KONTEXT_MODEL_IDS:
+                effective_model = "auto"  # an image model named for a pack-only tool did not run
             output_dir = os.path.join(OUTPUT_DIR, "generated_images")
             os.makedirs(output_dir, exist_ok=True)
             filename = f"edit_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}.png"
             output_path = os.path.join(output_dir, filename)
-            backend = self._pick_edit_backend(effective_model)
             gen = ComfyUIImageGenerator()
             gpu_wait = _chat_gpu_wait()
 
@@ -2215,9 +2267,11 @@ def _steps_lines(gen) -> list:
 
 
 def _edit_tool_for(caller: BaseTool) -> "EditImageTool":
-    """An EditImageTool that shares ``caller``'s context, so input rules see the same transport."""
+    """An EditImageTool that shares ``caller``'s context, so input rules see the same
+    transport, and that edits on ``caller``'s behalf (``for_tool``)."""
     tool = EditImageTool()
     tool.set_context(dict(getattr(caller, "_context", None) or {}))
+    tool.for_tool = caller.name
     return tool
 
 
@@ -2293,7 +2347,8 @@ class InpaintImageTool(BaseTool):
     description = (
         "Change or remove something in an attached photo from a natural-language "
         "instruction ('remove the coffee cup', 'replace the sky with sunset'). "
-        "Uses Qwen-Image-Edit when installed, else FLUX Kontext. For extending the "
+        "Uses Qwen-Image-Edit when installed, else FLUX Kontext; with neither installed it "
+        "refuses and names the pack to install. For extending the "
         "canvas use outpaint_image. For a brand-new scene of a person's face use "
         "generate_identity." + _TOOL_JOB_NOTE
     )
@@ -2328,6 +2383,9 @@ class InpaintImageTool(BaseTool):
         if isinstance(inputs, ToolResult):
             return inputs
         src, extra = inputs
+        backend = edit._edit_backend(edit._effective_model(model))
+        if isinstance(backend, ToolResult):
+            return backend
         return _run_or_queue(self, lambda: edit._edit(
             src, extra, instruction=instruction, steps=steps, model=model,
         ))
