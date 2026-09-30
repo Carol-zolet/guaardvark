@@ -102,6 +102,19 @@ def resources_root() -> str:
     return str(outputs_root())
 
 
+def _record_or_hidden(path: str, roots: list[str]) -> bool:
+    """True for a consent record (``*.consent``) or anything under a dot-name
+    below one of ``roots``: the same files the outputs provider never serves."""
+    real = Path(os.path.realpath(path))
+    for root in roots:
+        try:
+            rel = real.relative_to(os.path.realpath(root))
+        except ValueError:
+            continue
+        return any(part.startswith(".") for part in rel.parts) or rel.name.casefold().endswith(".consent")
+    return False
+
+
 def mcp_may_read(path: str) -> bool:
     """True when an MCP client may use ``path`` as an input: anything in uploads;
     in outputs, only a file the MCP resources provider serves."""
@@ -109,8 +122,9 @@ def mcp_may_read(path: str) -> bool:
     from backend.mcp.config import load_config
     from backend.mcp.resources_adapter import is_served
 
-    if is_within(path, mcp_upload_roots()):
-        return True
+    uploads = mcp_upload_roots()
+    if is_within(path, uploads):
+        return not _record_or_hidden(path, uploads)
     policy = load_config().resources
     roots = {os.path.realpath(config.OUTPUT_DIR), os.path.realpath(resources_root())}
     return any(is_served(path, root, policy) for root in roots)

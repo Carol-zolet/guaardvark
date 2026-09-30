@@ -119,6 +119,16 @@ def test_mcp_reaches_only_uploads_and_outputs(tree):
     assert escaped.refused and "may not leave" in escaped.error
 
 
+@pytest.mark.parametrize("rel", ["voice.wav.consent", ".cache/clip.wav", "Images/.tmp/a.png"])
+def test_mcp_refuses_consent_records_and_hidden_files_in_uploads(tree, rel):
+    target = tree.uploads / rel
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("{}")
+    found = mi.resolve_media_ref(str(target), mcp=True)
+    assert found.path is None and found.refused, rel
+    assert mi.resolve_media_ref(str(target), mcp=False).path == str(target)
+
+
 UNSERVED = ["chat-exports/session_1/index.json", "consent/likeness.json",
             "generated_images/.hidden.png", "generated_images/edit_1.png.consent"]
 
