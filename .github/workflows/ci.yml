@@ -342,6 +342,7 @@ jobs:
             backend/tests/services/test_image_resolution_limits.py \
             backend/tests/services/test_image_prompt_sanitize.py \
             backend/tests/services/test_media_model_registry.py \
+            backend/tests/test_vector_table_lookup.py \
             backend/tests/test_wordpress_tool_annotations.py \
             backend/tests/test_csv_quote_repair.py \
             backend/tests/test_generation_reply_validation.py \

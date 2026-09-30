@@ -36,20 +36,17 @@ _NOT_A_SUMMARY = (
 def _table() -> Tuple[Optional[str], Optional[str]]:
     """Return (qualified_table, error)."""
     try:
-        from backend.services.indexing_service import (
-            resolve_existing_vector_table, _vector_backend,
-        )
-        if _vector_backend() != "pgvector":
+        from backend.services.indexing_service import locate_vector_table
+        # The table search reads, or the reason there is none to read. These
+        # tools must show what search_knowledge_base can retrieve, so a table
+        # that is missing, or one of several that cannot be told apart while the
+        # embedding model is unreachable, is reported and not guessed at.
+        found = locate_vector_table(None)
+        if found.table:
+            return f"data_{found.table}", None
+        if found.reason == "not_pgvector":
             return None, "These tools require the pgvector backend."
-        # Discovery rather than derivation: deriving the name needs the embedding
-        # model's dimension, and the MCP server is a bare subprocess with no Flask
-        # context and no initialised index, so that probe returns nothing. These
-        # tools are read-only and the dimension is already in the table name.
-        t = resolve_existing_vector_table(None)
-        if not t:
-            return None, ("No knowledge index found. Index some documents first, "
-                          "or check that the pgvector table exists.")
-        return f"data_{t}", None
+        return None, found.detail
     except Exception as e:
         return None, f"Index unavailable: {e}"
 
