@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ipaddress
+import os
 import socket
 from urllib.parse import urlparse
 
@@ -114,9 +115,14 @@ def public_only_session():
     exactly the address that was checked, so a name that resolves differently
     between a check and the fetch (DNS rebinding) or a host that requests
     decodes differently from the checker (percent-encoding) cannot reach this
-    machine or its networks. TLS is still verified against the host name. A
-    configured HTTP proxy connects on its own and gets only the name check
-    private_address_reason makes.
+    machine or its networks. TLS is still verified against the host name.
+
+    The session ignores the environment's HTTP(S)_PROXY / ALL_PROXY settings and
+    ~/.netrc (or $NETRC): a proxy would open the connection itself, past the
+    address check, and .netrc would hand the user's saved logins to whatever
+    host is fetched (its ``default`` entry to every host). A proxy passed to a
+    request explicitly is refused for the same reason. A CA bundle named in
+    REQUESTS_CA_BUNDLE or CURL_CA_BUNDLE is still used.
     """
     import requests
     from requests.adapters import HTTPAdapter
@@ -161,7 +167,17 @@ def public_only_session():
             super().init_poolmanager(*args, **kwargs)
             self.poolmanager.pool_classes_by_scheme = {"http": _HTTPPool, "https": _HTTPSPool}
 
+        def proxy_manager_for(self, proxy, **proxy_kwargs):
+            raise requests.exceptions.ProxyError(
+                "public-only fetches do not go through a proxy")
+
     session = requests.Session()
+    # trust_env=False also turns off requests' own reading of REQUESTS_CA_BUNDLE
+    # and CURL_CA_BUNDLE, so that part is restored here.
+    session.trust_env = False
+    session.verify = (
+        os.environ.get("REQUESTS_CA_BUNDLE") or os.environ.get("CURL_CA_BUNDLE") or True
+    )
     session.mount("http://", _Adapter())
     session.mount("https://", _Adapter())
     return session
