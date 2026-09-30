@@ -8,7 +8,6 @@ the plugin was off. A finished job now names the file and its library
 document. No network, plugin or database: HTTP calls are faked.
 """
 
-import pytest
 from flask import Flask
 
 from backend.tools import image_tools

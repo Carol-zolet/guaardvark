@@ -8,6 +8,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import shutil
 from pathlib import Path
 
 from backend.services.agent_tools import BaseTool, ToolParameter, ToolResult
@@ -188,11 +189,102 @@ def _dispatch_first_stage(svc, row_id: int, agent: str):
     return True, None
 
 
+def _looks_like_audio(path: str) -> bool:
+    """True when the file starts like one of the formats _AUDIO_EXT names.
+
+    The extension alone is not enough: a file taken as a song lands in the
+    library, where the download route serves it.
+    """
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(12)
+    except OSError:
+        return False
+    return (
+        (head[:4] == b"RIFF" and head[8:12] == b"WAVE")
+        or head[:3] == b"ID3"                                  # MP3 with tags
+        or (len(head) > 1 and head[0] == 0xFF and (head[1] & 0xE0) == 0xE0)  # MPEG / ADTS frame
+        or head[:4] in (b"fLaC", b"OggS")
+        or head[4:8] == b"ftyp"                                # M4A / AAC in MP4
+    )
+
+
+def _same_bytes(a: Path, b: Path) -> bool:
+    import hashlib
+
+    if a.stat().st_size != b.stat().st_size:
+        return False
+
+    def digest(path: Path) -> str:
+        h = hashlib.sha256()
+        with open(path, "rb") as fh:
+            for chunk in iter(lambda: fh.read(1 << 20), b""):
+                h.update(chunk)
+        return h.hexdigest()
+
+    return digest(a) == digest(b)
+
+
+def _library_song(path: Path):
+    """(Document, None) for a local song file, stored the way the library
+    stores an upload, or (None, error).
+
+    Library rows keep their path relative to UPLOAD_DIR, the form the download
+    route, generate_video's reference_audio and the music-video resolvers read.
+    A song already in uploads gets that row in place, reusing one that exists
+    (and moving a row an earlier version wrote with the absolute path onto the
+    relative one). A song elsewhere (an outputs folder, or in chat the install
+    folder) is copied into uploads/Audio first, as the Studio's Music Video
+    upload puts a song in the library; the same bytes are copied once.
+    """
+    from backend import config
+    from backend.models import Document, db
+    from backend.services.output_registration import register_file
+    from backend.utils.filename_resolver import resolve_filesystem_filename
+
+    real = Path(os.path.realpath(path))
+    if real.suffix.lower() not in _AUDIO_EXT or not _looks_like_audio(str(real)):
+        return None, (f"song '{path.name}' is not an audio file; songs are "
+                      f"{', '.join(e.lstrip('.') for e in _AUDIO_EXT)}.")
+    uploads = Path(os.path.realpath(config.UPLOAD_DIR))
+    refs = uploads / "voice_references"
+    if real.is_relative_to(refs):
+        return None, "a voice reference clip is not a song; pass the song itself."
+
+    if real.is_relative_to(uploads):
+        rel = real.relative_to(uploads).as_posix()
+        existing = Document.query.filter_by(path=rel).first()
+        if existing:
+            return existing, None
+        legacy = Document.query.filter(Document.path.in_({str(path), str(real)})).first()
+        if legacy:
+            legacy.path = rel
+            db.session.commit()
+            return legacy, None
+        folder = real.parent.relative_to(uploads).as_posix()
+        doc = register_file(os.path.join(config.UPLOAD_DIR, rel), folder_name="" if folder == "." else folder)
+    else:
+        audio_dir = Path(config.UPLOAD_DIR) / "Audio"
+        audio_dir.mkdir(parents=True, exist_ok=True)
+        target = audio_dir / real.name
+        if not (target.is_file() and _same_bytes(real, target)):
+            target = audio_dir / resolve_filesystem_filename(audio_dir, real.name)
+            shutil.copy2(real, target)
+        existing = Document.query.filter_by(path=f"Audio/{target.name}").first()
+        if existing:
+            return existing, None
+        doc = register_file(str(target), folder_name="Audio")
+    if doc is None:
+        return None, f"song '{path.name}' could not be added to the library."
+    return doc, None
+
+
 def _document_from_song_ref(song: str, *, mcp: bool = False):
-    """Return (Document, None) or (None, error). Creates a row for a local file.
+    """Return (Document, None) or (None, error).
 
     A document id (or its /api/files/document/<id>/download link) names an
-    existing row; anything else is resolved under the shared media-input rules.
+    existing row; anything else is resolved under the shared media-input rules
+    and stored as a library song (_library_song).
     """
     from backend.models import Document, db
     from backend.utils.media_inputs import accepted_forms, document_id_from_ref, resolve_media_ref
@@ -212,21 +304,7 @@ def _document_from_song_ref(song: str, *, mcp: bool = False):
     )
     if not found.path:
         return None, found.error
-    path = Path(found.path)
-    resolved = str(path)
-    existing = Document.query.filter_by(path=resolved).first()
-    if existing:
-        return existing, None
-    doc = Document(
-        filename=path.name,
-        path=resolved,
-        type=(path.suffix.lstrip(".") or "audio")[:50],
-        size=path.stat().st_size,
-        index_status="STORED",
-    )
-    db.session.add(doc)
-    db.session.commit()
-    return doc, None
+    return _library_song(Path(found.path))
 
 
 class MusicVideoTool(BaseTool):
@@ -252,7 +330,8 @@ class MusicVideoTool(BaseTool):
                 "guaardvark://outputs/<path> resource URI, or a file path. Over MCP the file must be "
                 "in Guaardvark's uploads folder or in an outputs folder MCP resources serve (what "
                 "resources/list shows); in chat, anywhere in its uploads, outputs or install folder. "
-                "Files named like keys or credentials are refused everywhere."
+                "Files named like keys or credentials are refused everywhere. A song given by path "
+                "joins the library (one outside the uploads folder is copied into its Audio folder)."
             ),
             required=True,
         ),
