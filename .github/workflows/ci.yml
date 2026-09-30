@@ -360,4 +360,5 @@ jobs:
             backend/tests/test_knowledge_tools_no_section.py \
             backend/tests/test_generate_file_modify_guard.py \
             backend/tests/test_workstation_mcp_paths.py \
-            backend/tests/test_system_mapper_relative_excludes.py
+            backend/tests/test_system_mapper_relative_excludes.py \
+            backend/tests/test_map_codebase_background.py

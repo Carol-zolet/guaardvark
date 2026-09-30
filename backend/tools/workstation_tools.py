@@ -12,8 +12,10 @@ import logging
 import os
 import re
 import subprocess
+import threading
+import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote
 
 from backend.services.agent_tools import BaseTool, ToolParameter, ToolResult
@@ -97,6 +99,133 @@ def _load_snapshot(root: Path, refresh: bool) -> dict:
     return payload
 
 
+# How long map_codebase waits for a map being computed before answering with
+# what it has. Measured 2026-09-30 on one workstation: a clean checkout
+# (1,454 source files) maps in about 15 s, 7 s of it the tool-registry
+# subprocess; a checkout also holding ~26,000 files of ignored worktree
+# copies took 126 s before that subprocess. MCP clients are cut off at 120 s
+# by default. 60 s is four times the clean-checkout time and half that cutoff.
+_MAP_WAIT_SECONDS = 60.0
+
+
+def _map_wait_seconds(over_mcp: bool) -> float:
+    """_MAP_WAIT_SECONDS, or half the MCP call timeout when that is shorter,
+    so the answer always reaches an MCP client before it gives up."""
+    if not over_mcp:
+        return _MAP_WAIT_SECONDS
+    try:
+        from backend.mcp.config import load_config
+        return min(_MAP_WAIT_SECONDS, max(1.0, load_config().timeout_seconds / 2))
+    except Exception:
+        return _MAP_WAIT_SECONDS
+
+
+class _MapJob:
+    """One background map computation for one root."""
+
+    def __init__(self) -> None:
+        self.started = time.time()
+        self.done = threading.Event()
+        self.payload: Optional[dict] = None
+        self.error: Optional[str] = None
+
+
+_map_jobs: Dict[str, _MapJob] = {}
+_map_jobs_lock = threading.Lock()
+
+
+def _run_map_job(root: Path, job: _MapJob) -> None:
+    try:
+        from backend.api.system_map_api import compute_and_cache
+        job.payload = compute_and_cache(root)
+    except Exception as exc:
+        logger.exception("map_codebase: background map of %s failed", root)
+        job.error = str(exc) or type(exc).__name__
+    finally:
+        job.done.set()
+
+
+def _map_job(root: Path) -> _MapJob:
+    """The computation running for root, or a new one started in the
+    background. A root never has two at once, so a retry joins the first."""
+    key = str(root)
+    with _map_jobs_lock:
+        job = _map_jobs.get(key)
+        if job is not None and not job.done.is_set():
+            return job
+        job = _MapJob()
+        _map_jobs[key] = job
+    threading.Thread(target=_run_map_job, args=(root, job), name="map_codebase", daemon=True).start()
+    return job
+
+
+def _age_text(seconds: float) -> str:
+    seconds = int(seconds)
+    if seconds < 120:
+        return f"{seconds} s"
+    if seconds < 7200:
+        return f"{seconds // 60} min"
+    if seconds < 172800:
+        return f"{seconds // 3600} h"
+    return f"{seconds // 86400} days"
+
+
+def _map_snapshot(root: Path, refresh: bool, wait_seconds: float) -> Tuple[Optional[dict], Optional[str]]:
+    """(snapshot, note), never blocking longer than wait_seconds.
+
+    A map under the cache TTL is returned as is. Otherwise a background
+    computation is started, or the running one joined: an older map is
+    returned at once with its age, and when there is none, or refresh was
+    asked, the call first waits up to wait_seconds for the new one.
+    (None, note) means there is nothing to show yet.
+    """
+    from backend.api.system_map_api import CACHE_TTL_SECONDS, read_cached
+
+    cached, age = read_cached(root)
+    if cached is not None and age < CACHE_TTL_SECONDS and not refresh:
+        cached["_cache"] = {"hit": True, "age_seconds": int(age), "ttl_seconds": CACHE_TTL_SECONDS}
+        return cached, None
+
+    job = _map_job(root)
+    if cached is None or refresh:
+        job.done.wait(wait_seconds)
+
+    if job.done.is_set() and job.error is None and job.payload is not None:
+        return job.payload, None
+
+    if job.done.is_set():
+        if cached is None:
+            raise RuntimeError(f"system map failed for {root}: {job.error}")
+        cached["_cache"] = {
+            "hit": True, "stale": age >= CACHE_TTL_SECONDS, "age_seconds": int(age),
+            "ttl_seconds": CACHE_TTL_SECONDS, "refresh_error": job.error,
+        }
+        return cached, (
+            f"Computing a new map failed ({job.error}). This is the last map, "
+            f"{_age_text(age)} old."
+        )
+
+    running = int(time.time() - job.started)
+    if cached is not None:
+        cached["_cache"] = {
+            "hit": True, "stale": age >= CACHE_TTL_SECONDS, "age_seconds": int(age),
+            "ttl_seconds": CACHE_TTL_SECONDS, "refreshing": True,
+            "refresh_running_seconds": running,
+        }
+        return cached, (
+            f"This map is {_age_text(age)} old. A new one has been computing in the "
+            f"background for {running} s; call map_codebase again later to get it, or "
+            "with refresh=true to wait for it. Calling again never starts a second "
+            "computation."
+        )
+    return None, (
+        f"No map of this folder exists yet. It has been computing in the background "
+        f"for {running} s (seconds on a typical checkout, minutes on a very large "
+        "one). Call map_codebase again with the same root in a minute or two to get "
+        "it; calling again does not start a second computation."
+    )
+
+
 def _nvidia_smi() -> Dict[str, Any]:
     try:
         out = subprocess.run(
@@ -140,14 +269,18 @@ class MapCodebaseTool(BaseTool):
         "most severe first, each with id, kind (e.g. import-cycle, ghost-endpoint, dead-symbol, "
         "untested-module), severity, summary and up to 6 paths; dismissed findings are left out. "
         "Mostly static analysis of the files; mapping the whole checkout also loads its tool registry "
-        "in an offline subprocess. Needs no backend, network or GPU. Results are cached for 5 minutes; "
-        "refresh=true recomputes. For an uploaded Code Repository folder use get_repository_map or "
-        "get_dependency_graph; to find code by meaning, search_codebase."
+        "in an offline subprocess. Needs no backend, network or GPU. Never blocks for long: a map under "
+        "5 minutes old comes back as is; an older one comes back at once with its age (cache.age_seconds "
+        "and a note) while a new one is computed in the background, one per folder at a time. When no "
+        "map exists yet, or refresh=true, it waits up to 60 s for the new map; if that is not enough it "
+        "answers with status 'computing' (or the last map and a note), and calling again later returns "
+        "the result without starting a second computation. For an uploaded Code Repository folder use "
+        "get_repository_map or get_dependency_graph; to find code by meaning, search_codebase."
     )
     parameters = {
         "refresh": ToolParameter(
             name="refresh", type="bool", required=False, default=False,
-            description="true: recompute now, rescanning every source file under root. false (default): reuse a result under 5 minutes old.",
+            description="true: compute a new map now, rescanning every source file under root, and wait up to 60 s for it (otherwise the last map, or status 'computing', comes back and the new map lands in the background). false (default): return the last map, refreshing one older than 5 minutes in the background.",
         ),
         "root": ToolParameter(
             name="root", type="string", required=False, default="",
@@ -164,7 +297,13 @@ class MapCodebaseTool(BaseTool):
             root = _safe_root(kwargs.get("root") or None)
             refresh = bool(kwargs.get("refresh", False))
             limit = int(kwargs.get("limit") or 15)
-            snapshot = _load_snapshot(root, refresh)
+            snapshot, note = _map_snapshot(root, refresh, _map_wait_seconds(is_mcp_transport(self)))
+            if snapshot is None:
+                return ToolResult(
+                    success=True,
+                    output={"status": "computing", "root": str(root), "note": note},
+                    metadata={"root": str(root), "computing": True},
+                )
             from backend.services.system_mapper.actions import ranked_findings
 
             findings = ranked_findings(snapshot, root)
@@ -186,6 +325,7 @@ class MapCodebaseTool(BaseTool):
                 "finding_count": len(findings),
                 "findings": slim,
                 "cache": snapshot.get("_cache"),
+                "note": note,
                 # dispatch_map_finding needs a person's approval and is not offered over MCP.
                 "hint": (
                     "To hand a dispatchable finding to self-improvement, open the System Map page "
