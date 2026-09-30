@@ -11,11 +11,10 @@ it does come from one place.
 # tests/unit/test_web_search_sources.py watches which host the installed client
 # calls, so a release that searches elsewhere fails there instead of leaving
 # this label wrong.
+#
+# The engine is the only place a search query goes. When it finds nothing, or
+# cannot be asked, the search says so; the query is not sent anywhere else.
 SEARCH_ENGINE = "Bing"
-
-# When that gives no results, the query is sent to Jina AI's reader (r.jina.ai),
-# which fetches DuckDuckGo Lite's result page and returns it as text.
-FALLBACK_SEARCH_SOURCE = "DuckDuckGo Lite via r.jina.ai"
 
 # A question about the weather in a named place is answered by this service.
 WEATHER_SOURCE = "wttr.in"

@@ -83,7 +83,8 @@ def websearch_command():
                         f"   {result.get('snippet', 'No description')}\n"
                         f"   URL: {result.get('url', 'N/A')}"
                     )
-                response_text = "Search results:\n\n" + "\n\n".join(snippets)
+                source = result_data.get("source") or "the search engine"
+                response_text = f"Search results from {source}:\n\n" + "\n\n".join(snippets)
             else:
                 response_text = result_data.get("snippet", str(result_data))
 
@@ -95,6 +96,18 @@ def websearch_command():
                     "result_type": result_type
                 },
                 message="Web search completed successfully"
+            )
+        elif (search_results.get("data") or {}).get("type") == "no_results":
+            # The engine answered and found nothing: an answer, not a failure.
+            message = search_results["data"]["message"]
+            return success_response(
+                data={
+                    "query": query,
+                    "response": message,
+                    "raw_results": search_results,
+                    "result_type": "no_results",
+                },
+                message=message,
             )
         else:
             error = search_results.get("error", "Unknown error")

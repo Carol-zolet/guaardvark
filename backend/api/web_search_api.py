@@ -5,7 +5,7 @@ import re
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any, List
 import requests
-from urllib.parse import quote_plus, urlparse, parse_qs
+from urllib.parse import quote_plus
 from bs4 import BeautifulSoup
 
 from flask import Blueprint, current_app, jsonify, request
@@ -16,7 +16,7 @@ from backend.utils.hosts import no_netrc_session
 from backend.utils.text_focus import focus_window
 from backend.utils.web_fetch import FetchFailed, FetchRefused, decode_page, fetch_page
 from backend.utils.web_search_sources import (
-    DEFAULT_SEARCH_RESULTS, FALLBACK_SEARCH_SOURCE, MAX_SEARCH_RESULTS, SEARCH_ENGINE, WEATHER_SOURCE,
+    DEFAULT_SEARCH_RESULTS, MAX_SEARCH_RESULTS, SEARCH_ENGINE, WEATHER_SOURCE,
 )
 
 web_search_bp = Blueprint("web_search_api", __name__, url_prefix="/api/web-search")
@@ -225,31 +225,41 @@ def enhanced_web_search(query: str, public_only: bool = False,
             results["data"]["website_error"] = website_data["error"]
     
     logger.info(f"Performing web search for: {query}")
-    ddg_results = perform_duckduckgo_search(query, max_results=max_results)
+    search = perform_duckduckgo_search(query, max_results=max_results)
 
-    if ddg_results["success"]:
+    # strategy_used "duckduckgo_search" is named after the client package and
+    # is matched on by callers; data["source"] is what names the engine.
+    if search["success"]:
         results.update({
             "strategy_used": "duckduckgo_search",
             "success": True,
             "data": {
                 "type": "search_results",
-                "results": ddg_results["results"],
-                "snippet": ddg_results["snippet"],
-                "total_results": ddg_results["total_results"],
-                "source": ddg_results.get("source") or SEARCH_ENGINE
+                "results": search["results"],
+                "snippet": search["snippet"],
+                "total_results": search["total_results"],
+                "source": search.get("source") or SEARCH_ENGINE
             }
         })
         return results
-    
-    results["data"]["duckduckgo_error"] = ddg_results.get("error", "Unknown error")
+
+    # No results and a failed search both end here, with the engine's own
+    # answer as the message: "no_results" when it found nothing,
+    # "search_failed" when it could not be asked.
+    message = search.get("error") or f"The search could not be completed at {SEARCH_ENGINE}."
+    website_error = results["data"].get("website_error")
+    if website_error:
+        message = f"Could not read {url}: {str(website_error).rstrip('.')}. {message}"
     return {
         "query": query,
         "strategy_used": "failed",
         "success": False,
+        "error": message,
         "data": {
-            "type": "search_failed",
-            "message": f"Unable to find current information for: {query}",
-            "errors": results["data"],
+            "type": "no_results" if search.get("no_results") else "search_failed",
+            "message": message,
+            "source": SEARCH_ENGINE,
+            "errors": {**results["data"], "search_error": search.get("error")},
             "attempted_strategies": ["duckduckgo_search"] + (["direct_website"] if urls else [])
         }
     }
@@ -482,112 +492,115 @@ def search_result_count(value: Any) -> int:
     return max(1, min(count, MAX_SEARCH_RESULTS))
 
 
+# A search that fails or comes back empty is asked once more, with a new
+# client; one the engine refused is not. With the pinned client every attempt
+# goes to SEARCH_ENGINE (see backend/utils/web_search_sources.py).
+_SEARCH_ATTEMPTS = 2
+
+
+def _search_failure(exc: BaseException) -> tuple[str, bool]:
+    """Why asking the search engine failed, in words a person or a model can act
+    on, and whether the engine refused the search (so asking again at once is
+    pointless).
+
+    The client wraps the error of its last backend in a plain
+    DuckDuckGoSearchException, so the original exception is looked for in its
+    arguments.
+    """
+    inner = exc.args[0] if exc.args and isinstance(exc.args[0], BaseException) else exc
+    text = str(inner)
+    try:
+        from duckduckgo_search.exceptions import RatelimitException, TimeoutException
+    except ImportError:
+        RatelimitException = TimeoutException = ()
+    # The client reports every refusal status (403, 429 and a few others) as
+    # "<url> <status> Ratelimit".
+    refused = re.search(r"\b(\d{3}) Ratelimit\b", text)
+    if refused or isinstance(inner, RatelimitException):
+        status = f" (HTTP {refused.group(1)})" if refused else ""
+        return (f"{SEARCH_ENGINE} refused the search{status}; it limits automated searches. "
+                "Try again in a few minutes."), True
+    if isinstance(inner, TimeoutException):
+        return f"{SEARCH_ENGINE} did not answer in time.", False
+    if " return None." in text:
+        # Any other status that is not 200, a server error say; the client's
+        # message repeats the query and not the status, so it is not passed on.
+        return f"{SEARCH_ENGINE} answered the search with an error.", False
+    return f"The search could not be completed at {SEARCH_ENGINE}: {text[:300]}", False
+
+
 def perform_duckduckgo_search(query: str, max_results: int = DEFAULT_SEARCH_RESULTS) -> Dict[str, Any]:
-    """Search the web for ``query`` with the duckduckgo-search client, then, if
-    that gave nothing, through FALLBACK_SEARCH_SOURCE. ``source`` in the result
-    names the one the results came from."""
+    """Search SEARCH_ENGINE for ``query``. The name is the client package's
+    (duckduckgo-search), not the engine's; see web_search_sources.py.
+
+    ``success`` is True when the engine returned results. Otherwise ``error``
+    says why there are none: ``no_results`` is True when the engine answered
+    with nothing, and absent when it could not be asked (refused, timed out,
+    unreachable, or the client is not installed). The query goes nowhere else
+    either way. ``source`` names the engine.
+    """
     max_results = search_result_count(max_results)
     try:
         from duckduckgo_search import DDGS
+    except ImportError:
+        return {
+            "success": False,
+            "error": "Web search is not available: the duckduckgo-search package is not installed.",
+            "results": [],
+            "snippet": "",
+            "source": SEARCH_ENGINE,
+        }
 
-        results = []
-        search_snippets = []
-        last_error = None
-        source = SEARCH_ENGINE
-        for backend in ("lite", "html"):
-            try:
-                with DDGS() as ddgs:
-                    search_rows = ddgs.text(query, backend=backend, max_results=max_results)
+    results = []
+    search_snippets = []
+    answered_empty = False
+    failure = None
+    for _attempt in range(_SEARCH_ATTEMPTS):
+        try:
+            with DDGS() as ddgs:
+                search_rows = ddgs.text(query, max_results=max_results) or []
+        except Exception as search_error:
+            failure, refused = _search_failure(search_error)
+            logger.warning(f"Web search ({SEARCH_ENGINE}) failed: {search_error}")
+            if refused:
+                break
+            continue
 
-                for row in search_rows:
-                    title = (row.get("title") or "").strip()
-                    url = row.get("href", "")
-                    snippet = (row.get("body") or row.get("snippet") or "").strip()
+        for row in search_rows:
+            title = (row.get("title") or "").strip()
+            url = row.get("href", "")
+            snippet = (row.get("body") or row.get("snippet") or "").strip()
 
-                    if title and (url or snippet):
-                        results.append({
-                            "title": title,
-                            "url": url,
-                            "snippet": snippet[:300]
-                        })
-                        if snippet:
-                            search_snippets.append(f"{title}: {snippet[:200]}")
-
-                if results:
-                    break
-            except Exception as backend_error:
-                last_error = str(backend_error)
-                logger.warning(f"Web search ({SEARCH_ENGINE}, asked as {backend}) failed: {backend_error}")
-                continue
-
-        if not results:
-            try:
-                source = FALLBACK_SEARCH_SOURCE
-                proxy_url = f"https://r.jina.ai/http://lite.duckduckgo.com/lite/?q={quote_plus(query)}"
-                headers = {"User-Agent": "guaardvark-web-search/1.0"}
-                with no_netrc_session() as session:
-                    resp = session.get(proxy_url, headers=headers, timeout=10)
-                resp.raise_for_status()
-
-                lines = resp.text.splitlines()
-                for idx, line in enumerate(lines):
-                    match = re.match(r"\d+\.\[(.+?)\]\((.+?)\)", line.strip())
-                    if not match:
-                        continue
-
-                    title = match.group(1).strip()
-                    url = match.group(2).strip()
-
-                    parsed = urlparse(url)
-                    query_params = parse_qs(parsed.query)
-                    uddg_target = query_params.get("uddg", [])
-                    if uddg_target:
-                        url = uddg_target[0]
-
-                    snippet = ""
-                    if idx + 1 < len(lines):
-                        candidate = lines[idx + 1].strip()
-                        if candidate and not candidate.startswith("Markdown Content"):
-                            snippet = candidate[:300]
-
-                    results.append({
-                        "title": title,
-                        "url": url,
-                        "snippet": snippet
-                    })
-                    if snippet:
-                        search_snippets.append(f"{title}: {snippet}")
-                    if len(results) >= 5:
-                        break
-            except Exception as proxy_error:
-                last_error = last_error or str(proxy_error)
-                logger.warning(f"Web search fallback ({FALLBACK_SEARCH_SOURCE}) failed: {proxy_error}")
+            if title and (url or snippet):
+                results.append({
+                    "title": title,
+                    "url": url,
+                    "snippet": snippet[:300]
+                })
+                if snippet:
+                    search_snippets.append(f"{title}: {snippet[:200]}")
 
         if results:
-            combined_snippet = "\n\n".join(search_snippets[:3]) if search_snippets else ""
-            return {
-                "success": True,
-                "results": results,
-                "snippet": f"Search results for '{query}':\n\n{combined_snippet}",
-                "total_results": len(results),
-                "source": source,
-            }
+            break
+        answered_empty = True
 
+    if results:
+        combined_snippet = "\n\n".join(search_snippets[:3]) if search_snippets else ""
         return {
-            "success": False,
-            "error": last_error or "No search results found",
-            "results": [],
-            "snippet": ""
+            "success": True,
+            "results": results,
+            "snippet": f"Search results for '{query}':\n\n{combined_snippet}",
+            "total_results": len(results),
+            "source": SEARCH_ENGINE,
         }
 
-    except Exception as e:
-        logger.error(f"Web search failed: {e}")
-        return {
-            "success": False,
-            "error": f"Web search error: {str(e)}",
-            "results": [],
-            "snippet": ""
-        }
+    outcome = {"success": False, "results": [], "snippet": "", "source": SEARCH_ENGINE}
+    if answered_empty:
+        outcome["no_results"] = True
+        outcome["error"] = f"{SEARCH_ENGINE} returned no results for this query."
+    else:
+        outcome["error"] = failure or f"The search could not be completed at {SEARCH_ENGINE}."
+    return outcome
 
 @web_search_bp.route("/quick-search", methods=["POST"])
 def quick_search():
@@ -672,8 +685,10 @@ def search_status():
         web_enabled = get_web_access()
 
         # Probe the REAL building blocks — import + callable only, NO network I/O
-        # (a status poll must never hammer DuckDuckGo / weather APIs; see SSRF/DOS
-        # trap). Each of these is a module-level function in this file.
+        # (a status poll must never hammer the search engine or the weather
+        # service; see SSRF/DOS trap). Each of these is a module-level function
+        # in this file. The "duckduckgo_search" keys are named after the client
+        # package and kept for callers that read them.
         probes = {
             "website_scraping": callable(globals().get("extract_website_content")),
             "duckduckgo_search": callable(globals().get("perform_duckduckgo_search")),
@@ -717,8 +732,9 @@ def search_status():
             "reliability_notes": {
                 "direct_website": "Reliable for specific URLs",
                 "duckduckgo_search": (
-                    f"General search: {SEARCH_ENGINE} through the duckduckgo-search client, "
-                    f"then {FALLBACK_SEARCH_SOURCE} when that returns nothing"
+                    f"General search: {SEARCH_ENGINE} through the duckduckgo-search client. "
+                    "When it finds nothing or cannot be reached the search says so; "
+                    "the query is not sent anywhere else"
                 )
             }
         })
