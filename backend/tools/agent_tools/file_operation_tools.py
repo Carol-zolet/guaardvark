@@ -257,7 +257,9 @@ class ProcessFileTool(BaseTool):
         "elements, tags dropped. CSV, .txt, .md, .rst, .json, .yaml, .toml, .ini, .log and .html: the "
         "file as-is (UTF-8, up to 10 MB). Excel (.xlsx, .xlsm): a workbook summary, then for each sheet "
         "with data its size, column names and first 20 rows (up to 50 sheets and 10,000 rows a sheet "
-        "are read); .xls and .xlsb need the xlrd or pyxlsb package, which a stock install lacks. "
+        "are read); .xls needs the xlrd package and .xlsb the pyxlsb package, which a stock install "
+        "lacks. A file that is password-protected, damaged or in an old format fails with an error "
+        "that says which. "
         "Image text (.jpg, .jpeg, .png, .gif, .bmp, .webp) is read by a vision model in the local "
         "Ollama, and fails with an error when none is available. For documents already indexed use "
         "search_knowledge_base or read_document_section; for source code, read_code."
@@ -272,10 +274,12 @@ class ProcessFileTool(BaseTool):
                 "'data/uploads/report.pdf'), else relative to its uploads folder (e.g. "
                 "'reports/q3.pdf'), or an absolute path inside Guaardvark's uploads, outputs or install "
                 "folder. Files named like keys or credentials (.env*, *.pem, *.key, id_rsa*, "
-                "credentials*, .netrc and similar) are refused everywhere; inside the install folder so "
-                "are git-ignored data (other than uploads and outputs) and .git, venv, logs and similar "
-                "folders. In Guaardvark's own chat an absolute path elsewhere also works, except system "
-                "folders and anything under a hidden folder or named with a leading '.', and not with "
+                "credentials*, .netrc and similar) are refused everywhere. Inside the install folder, "
+                "uploads and outputs included, anything under a .git, venv, node_modules, dist, logs "
+                "or similar folder is refused, and so is git-ignored data other than uploads and "
+                "outputs. A relative and an absolute path to the same file get the same answer. In "
+                "Guaardvark's own chat an absolute path elsewhere also works, except system folders "
+                "and anything under a hidden folder or named with a leading '.', and not with "
                 "Settings > Project folder only on; over MCP it is refused."
             ),
         )
@@ -292,12 +296,18 @@ class ProcessFileTool(BaseTool):
 
         if is_sensitive(str(path)):
             return "credential, key and .env files are not read"
-        if path.is_relative_to(uploads) or path.is_relative_to(outputs):
-            return None
+        internal = "files under .git, venv, node_modules, dist, logs and similar folders are not read"
+        for base in (uploads, outputs):
+            if path.is_relative_to(base):
+                # Uploads and outputs are read although git ignores them. A
+                # repository's own folders are still not documents, wherever the
+                # repository was uploaded to.
+                rel = path.relative_to(base).as_posix()
+                return internal if rel not in ("", ".") and forbidden_path_reason(rel) else None
         if path.is_relative_to(root):
             rel = path.relative_to(root).as_posix()
             if forbidden_path_reason(rel):
-                return "files under .git, venv, node_modules, dist, logs and similar folders are not read"
+                return internal
             if private_path_reason(rel, root):
                 return "git-ignored local data is not read"
             return None
@@ -330,7 +340,12 @@ class ProcessFileTool(BaseTool):
         except RuntimeError as e:  # ~user with no such user
             return None, f"'{file_path}' is not a valid path: {e}"
         # A relative path is tried in the Guaardvark folder, then in its uploads.
+        # A name the first place refuses ('server.log', which the install's
+        # .gitignore covers) may still be a file in uploads, so a refusal there
+        # is kept and given only if uploads has no such file either. That way a
+        # relative and an absolute path to the same upload get the same answer.
         options = [(candidate, None)] if candidate.is_absolute() else [(root / candidate, root), (uploads / candidate, uploads)]
+        refusal = None
         for option, base in options:
             try:
                 path = option.resolve()
@@ -340,12 +355,15 @@ class ProcessFileTool(BaseTool):
                 return None, f"'{file_path}' was refused: a relative path may not leave the Guaardvark folder"
             reason = self._refusal(path, root, uploads, outputs)
             if reason:
-                return None, f"'{file_path}' was refused: {reason}"
+                refusal = refusal or reason
+                continue
             try:
                 if path.is_file():
                     return path, None
             except OSError as e:
                 return None, f"'{file_path}' could not be read: {e}"
+        if refusal:
+            return None, f"'{file_path}' was refused: {refusal}"
         where = "" if candidate.is_absolute() else " (a relative path is looked up in the Guaardvark folder, then in its uploads)"
         return None, f"File not found: {file_path}{where}"
 
@@ -359,9 +377,9 @@ class ProcessFileTool(BaseTool):
         shown = path.relative_to(root).as_posix() if path.is_relative_to(root) else str(path)
 
         if path.suffix.lower() in PLAIN_TEXT_SUFFIXES:
-            if path.stat().st_size > MAX_PLAIN_TEXT_BYTES:
-                return ToolResult(success=False, error=f"{shown} is over 10 MB")
             try:
+                if path.stat().st_size > MAX_PLAIN_TEXT_BYTES:
+                    return ToolResult(success=False, error=f"{shown} is over 10 MB")
                 text = path.read_text(encoding="utf-8")
             except UnicodeDecodeError:
                 return ToolResult(success=False, error=f"{shown} is not UTF-8 text")
@@ -375,19 +393,27 @@ class ProcessFileTool(BaseTool):
             )
 
         try:
-            from backend.utils.enhanced_file_processor import create_file_processor
-            result = create_file_processor().process_file(str(path))
+            from backend.utils.enhanced_file_processor import FileProcessingError, create_file_processor
         except ImportError as e:
             logger.error(f"Enhanced file processor not available: {e}")
             return ToolResult(success=False, error="File processing system not available")
+        def reason_text(reason) -> str:
+            # A reader's message may spell out the file's full path.
+            return str(reason).replace(str(path), shown)
+
+        try:
+            result = create_file_processor().process_file(str(path), raise_errors=True)
+        except FileProcessingError as e:
+            return ToolResult(success=False, error=f"Could not read {shown}: {reason_text(e)}")
         except Exception as e:
             logger.error(f"Error processing file {file_path}: {e}", exc_info=True)
-            return ToolResult(success=False, error=f"Failed to process {shown}: {e}")
+            return ToolResult(success=False, error=f"Failed to process {shown}: {reason_text(e)}")
 
         if not result:
+            kind = f"'{path.suffix.lower()}' files" if path.suffix else "files without an extension"
             return ToolResult(
                 success=False,
-                error=f"Failed to process {shown}: unsupported type or the file could not be parsed",
+                error=f"Cannot read {shown}: {kind} are not a type this tool reads",
             )
 
         meta = result.metadata
@@ -397,7 +423,7 @@ class ProcessFileTool(BaseTool):
             extraction = result.extraction_results or {}
             if not extraction.get("success"):
                 reason = extraction.get("error") or "the workbook could not be read"
-                return ToolResult(success=False, error=f"Could not read {shown}: {reason}")
+                return ToolResult(success=False, error=f"Could not read {shown}: {reason_text(reason)}")
         if fmt in ("jpg", "jpeg", "png", "gif", "bmp", "webp", "svg"):
             extraction = result.extraction_results or {}
             if not extraction.get("success"):

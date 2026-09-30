@@ -10,8 +10,24 @@ import re
 from urllib.parse import urlparse
 
 from backend.services.agent_tools import BaseTool, ToolParameter, ToolResult
+from backend.utils.web_fetch import (
+    DEADLINE_SECONDS, IDLE_SECONDS, MAX_PAGE_BYTES, MAX_REDIRECTS, megabytes,
+)
+from backend.utils.web_search_sources import (
+    DEFAULT_SEARCH_RESULTS, FALLBACK_SEARCH_SOURCE, MAX_SEARCH_RESULTS, SEARCH_ENGINE, WEATHER_SOURCE,
+)
 
 logger = logging.getLogger(__name__)
+
+# What fetch_url and analyze_website tell a caller about the limits of a fetch;
+# the numbers live in backend/utils/web_fetch.py.
+_FETCH_LIMITS = (
+    f"Up to {MAX_REDIRECTS} redirects are followed; each hop must be a public address. The fetch "
+    f"gives up when the server is silent for {IDLE_SECONDS} s or the whole fetch passes "
+    f"{DEADLINE_SECONDS} s. Only the first {megabytes(MAX_PAGE_BYTES)} of a page are read; a page "
+    "that was cut short comes back with a page_cut field saying so. A URL that is not a page (a "
+    "PDF, an image, a download) is refused."
+)
 
 
 def extract_facts_from_search_results(search_output: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -172,7 +188,7 @@ class WebAnalysisTool(BaseTool):
         "description, a 500-character preview; a metadata block (on by default) checking title and "
         "meta-description lengths against 30-60 and 120-160 characters; and, by analysis_type, an seo "
         "block (word count of the page's main text, reading time, content density, https), a structure "
-        "block (domain, path, scheme, subdomain) "
+        "block (host name, path, scheme) "
         "and an insights block (sentence stats, readability and keyword hints for article, product or "
         "landing page, from the ~2000-character extract). Use it to audit a page's title and "
         "description; to read the page use fetch_url, to find pages web_search. Needs web access on "
@@ -185,14 +201,17 @@ class WebAnalysisTool(BaseTool):
             name="url",
             type="string",
             required=True,
-            description="Page URL or bare domain, e.g. 'https://example.com/about' or 'example.com' (https:// is added). Up to 5 redirects are followed; each hop must be a public address. The fetch gives up if the server does not answer for 15 s."
+            description=(
+                "Page URL or bare domain, e.g. 'https://example.com/about' or 'example.com' "
+                "(https:// is added). " + _FETCH_LIMITS
+            ),
         ),
         "analysis_type": ToolParameter(
             name="analysis_type",
             type="string",
             required=False,
             enum=["full", "seo", "structure", "content"],
-            description="Which blocks to add: 'seo' (word_count and estimated_reading_time at 200 words a minute for the page's main text, content_density, has_https, title/description present), 'structure' (domain, path, scheme, has_subdomain, is_secure), 'content' (sentence_count, average_sentence_length, readability, content_type_hints), or 'full' (default) for all three.",
+            description="Which blocks to add: 'seo' (word_count and estimated_reading_time at 200 words a minute for the page's main text, content_density, has_https, title/description present), 'structure' (domain: the host name without port or login, path, scheme, is_secure), 'content' (sentence_count, average_sentence_length, readability, content_type_hints), or 'full' (default) for all three.",
             default="full"
         ),
         "include_metadata": ToolParameter(
@@ -260,6 +279,8 @@ class WebAnalysisTool(BaseTool):
                 "content_preview": content_result.get("content", "")[:500] + "..." if len(content_result.get("content", "")) > 500 else content_result.get("content", ""),
                 "content_length": content_result.get("content_length", 0),
             }
+            if content_result.get("page_cut"):
+                analysis["page_cut"] = content_result["page_cut"]
 
             # Add metadata analysis if requested
             if include_metadata:
@@ -330,12 +351,15 @@ class WebAnalysisTool(BaseTool):
     def _analyze_structure(self, url: str, content_result: Dict[str, Any]) -> Dict[str, Any]:
         """Analyze website structure"""
         parsed_url = urlparse(url)
-        
+
+        # The host name only: netloc would repeat a login or port from the URL.
+        # Whether the host has a subdomain is not reported: telling
+        # "news.example.com" from "example.co.uk" needs the public-suffix list,
+        # which is not bundled.
         return {
-            "domain": parsed_url.netloc,
+            "domain": parsed_url.hostname or "",
             "path": parsed_url.path,
             "scheme": parsed_url.scheme,
-            "has_subdomain": len(parsed_url.netloc.split(".")) > 2,
             "is_secure": parsed_url.scheme == "https"
         }
 
@@ -395,7 +419,7 @@ class FetchUrlTool(BaseTool):
     """
     Fetch a specific URL and return its text content. Single-purpose primitive —
     use this whenever the user asks about a specific webpage or domain. Distinct
-    from web_search (which runs a DuckDuckGo query) and from analyze_website
+    from web_search (which runs a search query) and from analyze_website
     (which produces a structured SEO/metadata report).
     """
 
@@ -420,8 +444,7 @@ class FetchUrlTool(BaseTool):
             required=True,
             description=(
                 "Page URL or bare domain, e.g. 'https://example.com/pricing' or 'example.com' "
-                "(https:// is added). Up to 5 redirects are followed; each hop must be a public "
-                "address. The fetch gives up if the server does not answer for 15 s."
+                "(https:// is added). " + _FETCH_LIMITS
             ),
         ),
         "query": ToolParameter(
@@ -470,17 +493,17 @@ class FetchUrlTool(BaseTool):
 
             # Return a flat, LLM-friendly shape. No SEO layers, no nested metadata —
             # the single-purpose framing is the whole point of this tool.
-            return ToolResult(
-                success=True,
-                output={
-                    "url": result.get("url", url),
-                    "final_url": result.get("final_url", result.get("url", url)),
-                    "title": result.get("title", ""),
-                    "description": result.get("description", ""),
-                    "content": result.get("content", ""),
-                    "content_length": result.get("content_length", 0),
-                },
-            )
+            output = {
+                "url": result.get("url", url),
+                "final_url": result.get("final_url", result.get("url", url)),
+                "title": result.get("title", ""),
+                "description": result.get("description", ""),
+                "content": result.get("content", ""),
+                "content_length": result.get("content_length", 0),
+            }
+            if result.get("page_cut"):
+                output["page_cut"] = result["page_cut"]
+            return ToolResult(success=True, output=output)
         except Exception as e:
             logger.error(f"fetch_url failed for {url}: {e}", exc_info=True)
             return ToolResult(
@@ -499,11 +522,15 @@ class WebSearchTool(BaseTool):
     name = "web_search"
     read_only = True
     description = (
-        "Search the web via DuckDuckGo — returns a ranked list of titles, "
-        "snippets, and URLs for a query. Use this for open-ended research or "
-        "when you need to discover pages about a topic. For fetching a SPECIFIC "
-        "URL or domain the user already named, use fetch_url instead (it's a "
-        "direct fetch, no search ranking in between)."
+        "Search the web: returns a ranked list of titles, snippets and URLs for a query, and a "
+        "source field naming the service that answered. Use this for open-ended research or when "
+        "you need to discover pages about a topic. For fetching a SPECIFIC URL or domain the user "
+        "already named, use fetch_url instead (it's a direct fetch, no search ranking in between). "
+        f"The query is sent to {SEARCH_ENGINE} (through the duckduckgo-search client); when that "
+        f"returns nothing it is sent to {FALLBACK_SEARCH_SOURCE} (Jina AI's reader). A question "
+        f"about the weather in a named place goes to {WEATHER_SOURCE} instead; the current time and "
+        "plain arithmetic are answered on this machine; a URL in the query is fetched directly. "
+        "Needs web access on in Settings (off by default)."
     )
 
     parameters = {
@@ -517,8 +544,14 @@ class WebSearchTool(BaseTool):
             name="max_results",
             type="int",
             required=False,
-            description="Maximum number of results to return",
-            default=5
+            description=(
+                f"How many results to ask for, 1 to {MAX_SEARCH_RESULTS} (default "
+                f"{DEFAULT_SEARCH_RESULTS}). Fewer come back when the search finds fewer; the "
+                f"{FALLBACK_SEARCH_SOURCE} fallback returns at most 5."
+            ),
+            default=DEFAULT_SEARCH_RESULTS,
+            minimum=1,
+            maximum=MAX_SEARCH_RESULTS,
         )
     }
 
@@ -535,7 +568,6 @@ class WebSearchTool(BaseTool):
             )
 
         query = kwargs.get("query", "").strip()
-        max_results = kwargs.get("max_results", 5)
 
         if not query:
             return ToolResult(
@@ -544,12 +576,16 @@ class WebSearchTool(BaseTool):
             )
 
         try:
-            from backend.api.web_search_api import enhanced_web_search
+            from backend.api.web_search_api import enhanced_web_search, search_result_count
             from backend.utils.backend_http import is_mcp_transport
 
+            # Chat callers are not held to the schema's bounds, so the number
+            # is brought into range here.
+            max_results = search_result_count(kwargs.get("max_results", DEFAULT_SEARCH_RESULTS))
             # A URL in the query is fetched directly; over MCP only a public
             # address may be, as with fetch_url.
-            search_results = enhanced_web_search(query, public_only=is_mcp_transport(self))
+            search_results = enhanced_web_search(
+                query, public_only=is_mcp_transport(self), max_results=max_results)
 
             if not search_results or not search_results.get("success"):
                 error_msg = search_results.get("error") if search_results else "Web search failed"
@@ -582,6 +618,8 @@ class WebSearchTool(BaseTool):
                     "url": data.get("url", ""),
                     "snippet": data.get("snippet", "")
                 }]
+                if data.get("page_cut"):
+                    formatted_results["page_cut"] = data["page_cut"]
             elif data.get("snippet"):
                 # Single result format
                 formatted_results["results"] = [{

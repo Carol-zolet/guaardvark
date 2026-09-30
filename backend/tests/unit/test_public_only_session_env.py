@@ -110,8 +110,8 @@ def test_an_explicit_login_is_still_dropped_when_a_redirect_changes_host():
 
 
 def test_a_chat_fetch_sends_no_netrc_login_on_any_redirect_hop(hostile_env, monkeypatch):
-    """extract_website_content without public_only, through requests' own
-    redirect handling; the transport is faked, nothing is sent."""
+    """extract_website_content without public_only, following a redirect to
+    another host; the transport is faked, nothing is sent."""
     from requests.adapters import HTTPAdapter
 
     from backend.api import web_search_api
