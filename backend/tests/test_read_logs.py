@@ -12,8 +12,12 @@ from pathlib import Path
 
 import pytest
 
-from backend.mcp.tools_adapter import _tool_input_schema
-from backend.tools import workstation_tools as wt
+from backend.tests._mcp_sdk import use_mcp_sdk
+
+use_mcp_sdk()  # the adapter imports mcp.types; see backend/tests/_mcp_sdk.py
+
+from backend.mcp.tools_adapter import _tool_input_schema  # noqa: E402
+from backend.tools import workstation_tools as wt  # noqa: E402
 
 REPO = Path(wt.__file__).resolve().parents[2]
 

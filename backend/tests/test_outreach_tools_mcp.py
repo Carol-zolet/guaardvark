@@ -9,10 +9,14 @@ from __future__ import annotations
 
 import pytest
 
-from backend.mcp.tools_adapter import _tool_input_schema
-from backend.services.social_outreach import kill_switch, transitions
-from backend.tools import outreach_tools as ot
-from backend.utils.backend_http import BackendError, BackendResponse
+from backend.tests._mcp_sdk import use_mcp_sdk
+
+use_mcp_sdk()  # the adapter imports mcp.types; see backend/tests/_mcp_sdk.py
+
+from backend.mcp.tools_adapter import _tool_input_schema  # noqa: E402
+from backend.services.social_outreach import kill_switch, transitions  # noqa: E402
+from backend.tools import outreach_tools as ot  # noqa: E402
+from backend.utils.backend_http import BackendError, BackendResponse  # noqa: E402
 
 
 def _mcp(tool):
