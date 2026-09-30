@@ -93,6 +93,13 @@ AUDIO_FOUNDRY_MODELS: List[Dict[str, Any]] = [
         "group": "music",
         "hf_repo": "ACE-Step/ACE-Step-v1-3.5B",
         "probe_file": "ace_step_transformer/config.json",
+        # What ACEStepPipeline.load_checkpoint reads: its four model folders
+        # (config and weights each, plus the umt5 tokenizer), listed in the
+        # plugin file the ACE-Step daemon checks too. From the snapshot a full
+        # Install left in the cache (revision 82cd0d7b, read 2026-09-30); the
+        # other repo files are the README, .gitattributes and a root config
+        # the loader never opens. Install stays a full snapshot_download.
+        "required_files_catalog": "backends/acestep_files.json",
         "size_gb": 8.3,
         "gated": False,
     },
@@ -160,7 +167,8 @@ def is_hub_cached(repo_id: str, probe_file: str) -> bool:
 
 
 def load_voice_catalog(relpath: str) -> Dict[str, Any]:
-    """A voice list shipped with the plugin (e.g. backends/kokoro_voices.json)."""
+    """A JSON list shipped with the plugin (e.g. backends/kokoro_voices.json,
+    backends/acestep_files.json)."""
     with (PLUGIN_SOURCE_DIR / relpath).open("r", encoding="utf-8") as fh:
         return json.load(fh)
 
@@ -220,6 +228,8 @@ def kokoro_voice_choices(installed_only: bool = True) -> List[Dict[str, str]]:
 
 def required_hub_files(entry: Dict[str, Any]) -> List[str]:
     """Every file of ``entry['hf_repo']`` that generation reads."""
+    if entry.get("required_files_catalog"):
+        return list(load_voice_catalog(entry["required_files_catalog"])["files"])
     if entry.get("voice_catalog"):
         cat = load_voice_catalog(entry["voice_catalog"])
         voices = [v["id"] for g in cat["groups"] for v in g["voices"]]
