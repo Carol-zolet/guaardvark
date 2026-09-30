@@ -13,8 +13,18 @@ import warnings
 from typing import Any, Optional
 
 from backend.services.agent_tools import BaseTool, ToolParameter, ToolResult
+from backend.tools.generation_tools import FileGeneratorTool
 
 logger = logging.getLogger(__name__)
+
+# Largest input file the code tools read: the ceiling read_repo_file puts on a
+# checkout file, applied to uploads as well.
+MAX_INPUT_BYTES = 10 * 1024 * 1024
+# Characters per token assumed when sizing a prompt against the model's context
+# window. Measured with the cl100k_base tokenizer on this repository's twelve
+# largest source files: 3.6 to 5.3. 3.5 keeps the estimate on the high side, so
+# a file that passes the check fits.
+PROMPT_CHARS_PER_TOKEN = 3.5
 
 # A Markdown fence line: up to three spaces, three or more backticks or tildes,
 # then an optional info string such as "python". Only a bare one closes a block.
@@ -127,6 +137,24 @@ def _extract_code(reply: str, filename: str) -> str:
     return (parsed[0] if parsed else candidates[0]).strip("\n")
 
 
+def _estimated_tokens(text: str) -> int:
+    return int(len(text) / PROMPT_CHARS_PER_TOKEN) + 1
+
+
+def _context_window(llm) -> int:
+    """The context window, in tokens, the model call will run with (Ollama's
+    num_ctx); 0 when the client does not say."""
+    try:
+        from backend.utils.ollama_resource_manager import refresh_context_window
+        return int(refresh_context_window(llm) or 0)
+    except Exception:
+        return 0
+
+
+def _too_large(filepath: str) -> str:
+    return f"'{filepath}' is larger than {MAX_INPUT_BYTES // (1024 * 1024)} MB, which is more than the code tools read"
+
+
 def _confine_candidates(paths):
     """With Settings → Agents → "Project folder only" on, keep only input files
     inside the project, upload/data folders and GUAARDVARK_ALLOWED_PATHS, and
@@ -177,6 +205,8 @@ def _read_code_input(tool: BaseTool, filepath: str) -> tuple[Optional[str], Opti
         if candidate and os.path.isfile(candidate):
             if is_sensitive(candidate):
                 return None, f"'{filepath}' was refused: credential and key files are not read by the code tools", None
+            if os.path.getsize(candidate) > MAX_INPUT_BYTES:
+                return None, _too_large(filepath), None
             try:
                 with open(candidate, 'r', encoding='utf-8') as f:
                     return f.read(), None, os.path.realpath(candidate)
@@ -194,8 +224,12 @@ def _read_code_input(tool: BaseTool, filepath: str) -> tuple[Optional[str], Opti
                 if on_disk and not is_within(on_disk, [upload_dir]):
                     uploaded = None
                 elif content is not None:
+                    if len(content) > MAX_INPUT_BYTES:
+                        return None, _too_large(filepath), None
                     return content, None, on_disk
                 elif on_disk and not is_sensitive(on_disk):
+                    if os.path.getsize(on_disk) > MAX_INPUT_BYTES:
+                        return None, _too_large(filepath), None
                     with open(on_disk, 'r', encoding='utf-8') as f:
                         return f.read(), None, os.path.realpath(on_disk)
         except Exception as e:
@@ -245,9 +279,11 @@ class CodeGeneratorTool(BaseTool):
         "Ask Guaardvark's local LLM (Ollama) for a complete version of a code file and save its reply "
         "as data/outputs/code/<output_filename>, replacing any file of that name there; input_file is "
         "only read and can never be the output. With input_file the prompt holds that file's full text "
-        "(a file longer than the model's context window is cut by Ollama) plus your instructions; "
-        "without it the model writes a new file from the instructions alone, and the call is refused "
-        "if the instructions name a file that exists in the checkout or the uploads. Only the code is saved: "
+        "plus your instructions; the prompt and a reply of the same length must fit the active model's "
+        "context window, and a longer file (or one over 10 MB) is refused before the model runs. "
+        "Without it the model writes a new file from the instructions alone, and the call is refused "
+        "if the instructions ask to improve, refactor, rewrite or update a file that exists in the checkout "
+        "or the uploads (a new file that only shares an existing name, such as README.md, is fine). Only the code is saved: "
         "a Markdown fence and any sentences the model puts around it are dropped, and a reply with no code is an error "
         "and writes nothing. Returns output_path, filename, language, line and character counts, syntax_ok "
         "(true or false for Python and JSON output, which is parsed but never run; null for other languages) and "
@@ -341,23 +377,49 @@ class CodeGeneratorTool(BaseTool):
     def _read_input_file(self, filepath: str) -> tuple[Optional[str], Optional[str], Optional[str]]:
         return _read_code_input(self, filepath)
 
-    def _referenced_existing_file(self, instructions: str) -> Optional[str]:
-        """If the instructions name a file that already exists (uploaded or in
-        repo) but no input_file was supplied, return that name so we can refuse
-        rather than fabricate a "version" of a file we never read."""
-        for cand in re.findall(r"[\w./-]+\.[A-Za-z0-9]+", instructions or ""):
-            cand = cand.strip()
-            if not cand:
-                continue
-            # Looked up exactly as input_file would be (checkout, then uploads), so a
-            # refused path (outside the checkout over MCP, git-ignored, credentials)
-            # reads as absent and the answer never reveals whether it exists.
-            try:
-                _content, _error, found = _read_code_input(self, cand)
-            except Exception:
-                continue
-            if found:
-                return cand
+    # What counts as a request to change an existing file is generate_file's
+    # rule, shared so the two tools refuse the same wording: a modify verb or an
+    # existing-file reference aimed at a file, not a name that merely exists.
+    _MODIFY_VERBS = FileGeneratorTool._MODIFY_VERBS
+    _EXISTING_REFERENCES = FileGeneratorTool._EXISTING_REFERENCES
+    _TARGET_WINDOW_WORDS = FileGeneratorTool._TARGET_WINDOW_WORDS
+    _PRONOUN_TARGET = FileGeneratorTool._PRONOUN_TARGET
+    _targets = FileGeneratorTool._targets
+    _verb_on_pronoun = FileGeneratorTool._verb_on_pronoun
+    _detect_modify_existing = FileGeneratorTool._detect_modify_existing
+
+    def _resolves(self, name: str) -> bool:
+        """True when name is a file input_file could read. It is looked up exactly
+        as input_file would be (checkout, then uploads), so a refused path (outside
+        the checkout over MCP, git-ignored, credentials) reads as absent and the
+        answer never reveals whether it exists."""
+        try:
+            _content, _error, found = _read_code_input(self, name)
+        except Exception:
+            return False
+        return bool(found)
+
+    def _referenced_existing_file(self, instructions: str, output_filename: str = "") -> Optional[str]:
+        """The file a request without input_file is asking to change, or None
+        for a new-file request.
+
+        Every install has a README.md and a start.sh, and a new file of that
+        name goes to the outputs folder, so a name that exists is not enough:
+        the instructions must aim a modify verb or an existing-file reference
+        at it ("refactor backend/app.py", "improve it")."""
+        output_name = str(output_filename or "").strip().replace("\\", "/")
+        referenced = self._detect_modify_existing(output_name, instructions)
+        if referenced:
+            return referenced
+        # The shared rule looks the output file up by its base name. codegen
+        # names its output by path, so "refactor it" with output
+        # 'backend/app.py' is aimed at that path.
+        if "/" in output_name:
+            text = (instructions or "").lower()
+            base = os.path.basename(output_name)
+            aimed = self._targets(text, base) or self._verb_on_pronoun(text)
+            if aimed and self._resolves(output_name):
+                return output_name
         return None
 
     def execute(self, **kwargs) -> ToolResult:
@@ -400,15 +462,21 @@ class CodeGeneratorTool(BaseTool):
             # the instructions name an existing file, require input_file rather
             # than inventing a "version" of a file we never saw.
             if not input_content:
-                referenced = self._referenced_existing_file(instructions)
+                referenced = self._referenced_existing_file(instructions, output_filename)
                 if referenced:
+                    how = (
+                        f"call again with input_file='{referenced}'"
+                        if self._resolves(referenced)
+                        else "call again with input_file set to that file's path"
+                    )
                     return ToolResult(
                         success=False,
                         error=(
-                            f"codegen received no readable input_file, but the instructions "
-                            f"reference '{referenced}', which exists. Generating without reading "
-                            f"it would fabricate. Re-call with input_file='{referenced}' so the "
-                            f"real content is read and preserved."
+                            f"codegen received no input_file, but the instructions ask to change "
+                            f"an existing file ('{referenced}'). Without reading it the result "
+                            f"would be invented. To change it, {how}. If you want a new file "
+                            f"written from scratch, say what it should contain without asking to "
+                            f"improve, refactor, rewrite or update an existing one."
                         ),
                     )
 
@@ -471,6 +539,28 @@ QUALITY STANDARDS:
 - Ensure the file is immediately usable
 
 OUTPUT THE COMPLETE FILE NOW (no explanations, no markdown fences, just code):"""
+
+            # The prompt and the reply share the context window, and the reply
+            # is a whole file about as long as the input. An input that does not
+            # leave room would be cut and saved as a complete file.
+            window = _context_window(llm)
+            if input_content and window:
+                needed = _estimated_tokens(prompt) + _estimated_tokens(input_content)
+                if needed > window:
+                    overhead = _estimated_tokens(prompt) - _estimated_tokens(input_content)
+                    fits = max(int((window - overhead) / 2 * PROMPT_CHARS_PER_TOKEN), 0)
+                    return ToolResult(
+                        success=False,
+                        error=(
+                            f"input_file '{input_file}' is too long to rewrite in one call: it is "
+                            f"{len(input_content):,} characters, and the prompt plus a reply of the "
+                            f"same length need about {needed:,} tokens against the {window:,}-token "
+                            f"context window of the active model ({getattr(llm, 'model', 'unknown')}). "
+                            f"The file would be cut and saved incomplete, so nothing was written. "
+                            f"About {fits:,} characters fit: rewrite a smaller file, or switch to a "
+                            f"model with a larger context window in Settings."
+                        ),
+                    )
 
             from backend.utils.llm_service import ChatMessage, MessageRole
             messages = [ChatMessage(role=MessageRole.USER, content=prompt)]
