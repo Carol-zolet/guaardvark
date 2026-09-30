@@ -636,23 +636,16 @@ class CodeAnalysisTool(BaseTool):
     """
 
     name = "analyze_code"
-    # It writes nothing, but every call is a local model run of up to 180 s.
-    # Declared not read-only so MCP callers are offered an idempotency_key and a
-    # timed-out call is not described as safe to repeat, which would queue a
-    # second run behind the first.
-    read_only = False
-    destructive = False
+    read_only = True
     description = (
         "Review one text file with Guaardvark's local LLM (Ollama) and return its written findings; "
-        "no file is changed or written, and an empty reply is an error. The model is told to cite a line number for each finding, "
+        "nothing is changed or written, and an empty reply is an error. The model is told to cite a line number for each finding, "
         "which is not checked. analysis_type picks the focus. A file over 48,000 characters is not "
         "sent whole: the model gets its first 28,800 and last 14,400 characters plus an outline of "
         "imports, classes and function lines, and the result has truncated=true. Returns file, "
         "language, analysis_type, analysis, line_count, char_count, truncated and visible_lines. The "
         "model call stops after 180 s; over MCP a call that outlasts its timeout (120 s by default) "
-        "returns an error while the review keeps running, and its answer is then only reachable by "
-        "repeating the call with the same idempotency_key, which waits for that run instead of "
-        "starting another. To read the file yourself use read_code (for an upload, 'data/uploads/<path>'); "
+        "returns an error. To read the file yourself use read_code (for an upload, 'data/uploads/<path>'); "
         "for a changed copy, codegen."
     )
 

@@ -238,11 +238,10 @@ def test_each_call_uses_the_model_that_is_active_now(llm, tmp_path):
     assert len(first.prompts) == 2 and len(second.prompts) == 2
 
 
-def test_the_tools_that_run_the_model_are_not_declared_read_only():
-    """The MCP adapter offers an idempotency_key only to tools that are not
-    read_only, and tells the caller of a timed-out read_only tool that calling
-    again is safe. Neither fits a call that runs the model for minutes
-    (backend/mcp/tests/test_tools_adapter_contract.py covers the adapter)."""
+def test_declared_hints_say_what_each_tool_changes():
+    """MCP clients read these as readOnlyHint and destructiveHint: analyze_code
+    writes nothing, however long the model runs; codegen replaces a file of the
+    same name in the outputs folder."""
     reviewer, generator = ct.CodeAnalysisTool(), ct.CodeGeneratorTool()
-    assert (reviewer.read_only, reviewer.destructive) == (False, False)
+    assert reviewer.read_only is True
     assert (generator.read_only, generator.destructive) == (False, True)
