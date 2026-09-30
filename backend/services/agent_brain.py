@@ -1007,6 +1007,7 @@ class AgentBrain:
             try:
                 import time as _sc_time
                 from backend.tools.agent_control_tools import SCREENSHOTS_DIR, _prune_old_screenshots
+                from backend.utils.screenshot_urls import screenshot_url
                 from backend.utils.vision_analyzer import VisionAnalyzer
 
                 screenshot, cursor_pos = screen.capture()
@@ -1014,7 +1015,7 @@ class AgentBrain:
                 filename = f"agent_capture_{int(_sc_time.time() * 1000)}.webp"
                 filepath = os.path.join(SCREENSHOTS_DIR, filename)
                 screenshot.save(filepath, format="WEBP", quality=80)
-                image_url = f"/api/tools/screenshots/{filename}"
+                image_url = screenshot_url(filename)
                 _prune_old_screenshots(SCREENSHOTS_DIR)
 
                 emit_fn("chat:image", {

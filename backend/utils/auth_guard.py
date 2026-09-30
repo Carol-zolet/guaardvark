@@ -7,6 +7,9 @@ included. When unset, requests from this machine pass and other hosts are
 refused. The web UI keeps the key in the browser (Settings → API key) and
 sends it on every request to this backend; /api/auth/ reports the state and
 manages the key.
+
+Agent screen captures (/api/tools/screenshots/) also answer a link signed by
+backend/utils/screenshot_urls.py, which is what chat's <img> tags carry.
 """
 
 import os
@@ -64,6 +67,7 @@ TOOL_ENDPOINT_PATHS = (
 # api_key_required: this install has a key and the caller did not send it.
 LOCAL_ONLY_CODE = "local_only"
 API_KEY_CODE = "api_key_required"
+SCREENSHOT_LINK_CODE = "screenshot_link_invalid"
 LOCAL_ONLY_MESSAGE = (
     "This action works only on the Guaardvark machine itself, because this "
     "install has no API key yet. To use it from another device, create a key "
@@ -75,6 +79,12 @@ API_KEY_MESSAGE = (
     "Settings → API key; command-line and API clients send it in the "
     "X-API-Key header (GUAARDVARK_API_KEY)."
 )
+# Says nothing about whether the file exists.
+SCREENSHOT_LINK_MESSAGE = (
+    "This screenshot link is not valid for this install. Open the screenshot "
+    "from the chat it appeared in."
+)
+SCREENSHOT_PREFIX = "/api/tools/screenshots/"
 
 
 def tool_endpoints_protected() -> bool:
@@ -301,6 +311,13 @@ def caller_is_authorized() -> bool:
     return request_is_from_this_machine()
 
 
+def _screenshot_link_is_signed() -> bool:
+    from backend.utils.screenshot_urls import SIGNATURE_PARAM, signature_valid
+
+    rel_path = request.path[len(SCREENSHOT_PREFIX):]
+    return signature_valid(rel_path, request.args.get(SIGNATURE_PARAM))
+
+
 def protected_summary() -> list[str]:
     """What needs this machine or the key, in words for the Settings page."""
     items = []
@@ -332,10 +349,21 @@ def check_endpoint_auth():
     """Flask before_request hook: enforce auth on dangerous endpoints.
 
     Logic:
+    - Agent screen captures: a link signed for that path passes, then the rule below
     - If endpoint is not protected → allow
     - If GUAARDVARK_API_KEY is set → require X-API-Key header (any host)
     - If GUAARDVARK_API_KEY is NOT set → allow localhost, block remote
     """
+    if request.path.startswith(SCREENSHOT_PREFIX):
+        if _screenshot_link_is_signed() or caller_is_authorized():
+            return None
+        logger.warning(
+            f"[AUTH] Refused unsigned screenshot link {request.path} from {_effective_client_ip()}"
+        )
+        # Refused before the route runs, so the answer is the same whether or
+        # not the file exists.
+        return _refusal(SCREENSHOT_LINK_MESSAGE, SCREENSHOT_LINK_CODE, 403)
+
     if not _is_protected():
         return None
 

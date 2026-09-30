@@ -475,9 +475,13 @@ def get_history(session_id):
             .all()
         )
 
+        from backend.utils.screenshot_urls import sign_screenshot_urls
+
+        # Screenshot links are signed as they go out, so messages saved before
+        # a secret change (or before links were signed) still show them.
         return jsonify({
             "success": True,
-            "messages": [m.to_dict() for m in messages],
+            "messages": sign_screenshot_urls([m.to_dict() for m in messages]),
             "session_id": session_id,
         })
     except Exception as e:
