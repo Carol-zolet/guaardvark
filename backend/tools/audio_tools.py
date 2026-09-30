@@ -46,9 +46,24 @@ def _kokoro_voice_ids() -> list[str]:
     return kokoro_voice_ids()
 
 
+def plugin_stopped(error) -> bool:
+    """True when the backend answered that the Audio Foundry service itself
+    is not running (its proxy's 503), as opposed to a 503 the running plugin
+    sent (a model that cannot run on this machine), which carries FastAPI's
+    ``detail`` and is reported in its own words."""
+    if getattr(error, "kind", None) != "plugin_offline":
+        return False
+    body = error.body if isinstance(getattr(error, "body", None), dict) else {}
+    return body.get("plugin_running") is False or "detail" not in body
+
+
 def _backend_error_text(error) -> str:
-    if error.kind == "plugin_offline":
+    if plugin_stopped(error):
         return AUDIO_FOUNDRY_NOT_RUNNING
+    body = error.body if isinstance(getattr(error, "body", None), dict) else {}
+    if error.kind in ("plugin_offline", "auth", "http") and body.get("detail"):
+        # The plugin's own words; backend_http's hints are about the backend.
+        return str(body["detail"])
     return str(error)
 
 

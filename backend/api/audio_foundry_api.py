@@ -87,12 +87,20 @@ QUICK_TIMEOUT = 10        # /health, /status, /config — return fast or fail fa
 GENERATION_TIMEOUT = 600  # /generate/* — songs up to 4 minutes plus model load
 
 
+def _not_running(why: str = ""):
+    """The service itself is down. ``plugin_running: false`` tells callers
+    this apart from a 503 the running service sends (a model that cannot run
+    on this machine), which comes back verbatim with FastAPI's ``detail``."""
+    message = "Audio Foundry service not running" + (f" ({why})" if why else "")
+    return jsonify({"error": message, "plugin_running": False}), 503
+
+
 def _proxy_get(path: str, timeout: int = QUICK_TIMEOUT):
     try:
         resp = requests.get(f"{AUDIO_FOUNDRY_URL}{path}", timeout=timeout)
         return jsonify(resp.json()), resp.status_code
     except requests.ConnectionError:
-        return jsonify({"error": "Audio Foundry service not running"}), 503
+        return _not_running()
     except Exception as e:
         logger.exception("Audio Foundry GET %s failed", path)
         return jsonify({"error": str(e)}), 500
@@ -103,7 +111,7 @@ def _proxy_post(path: str, json_data: dict, timeout: int):
         resp = requests.post(f"{AUDIO_FOUNDRY_URL}{path}", json=json_data, timeout=timeout)
         return jsonify(resp.json()), resp.status_code
     except requests.ConnectionError:
-        return jsonify({"error": "Audio Foundry service not running"}), 503
+        return _not_running()
     except requests.Timeout:
         return jsonify({"error": f"Audio Foundry request timed out after {timeout}s"}), 504
     except Exception as e:
@@ -128,7 +136,7 @@ def _proxy_generate(path: str, json_data: dict):
     if job_service_start_enabled():
         ok, why = start_for_job("audio", "generating", is_up=_audio_foundry_up)
         if not ok:
-            return jsonify({"error": f"Audio Foundry service not running ({why})"}), 503
+            return _not_running(why)
     return _proxy_post(path, json_data, GENERATION_TIMEOUT)
 
 
@@ -137,7 +145,7 @@ def _proxy_delete(path: str, timeout: int = QUICK_TIMEOUT):
         resp = requests.delete(f"{AUDIO_FOUNDRY_URL}{path}", timeout=timeout)
         return jsonify(resp.json()), resp.status_code
     except requests.ConnectionError:
-        return jsonify({"error": "Audio Foundry service not running"}), 503
+        return _not_running()
     except Exception as e:
         logger.exception("Audio Foundry DELETE %s failed", path)
         return jsonify({"error": str(e)}), 500
