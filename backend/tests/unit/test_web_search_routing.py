@@ -57,7 +57,7 @@ def routes(monkeypatch):
         return {"success": True, "location": location, "temperature_celsius": "18",
                 "temperature_fahrenheit": "64", "description": "Clear", "humidity": "50"}
 
-    def search(query):
+    def search(query, max_results=5):
         seen["search"].append(query)
         return {"success": True, "results": [{"title": "t", "url": "https://example.org/", "snippet": "s"}],
                 "snippet": "s", "total_results": 1}

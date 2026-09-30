@@ -795,6 +795,17 @@ class OfflineImageGenerator:
             return "sdxl"
         return "sd"
 
+    def supports_img2img(self, model_key: str) -> bool:
+        """True when catalog key ``model_key`` can run generate_image_from_image
+        (a family ``_build_img2img_pipeline`` builds)."""
+        model_id = self.available_models.get(model_key or "")
+        if not model_id or model_key in self.comfy_only_models:
+            return False
+        family = self._model_family(model_id)
+        if family == "zimage":
+            return ZImageImg2ImgPipeline is not None
+        return family in ("sdxl", "sd")
+
     def _build_img2img_pipeline(self, family: str):
         """Share weights from the loaded txt2img pipeline for img2img edits."""
         if family == 'krea2':
@@ -3067,6 +3078,11 @@ Negative Prompt: {negative_prompt}""",
             except Exception:
                 pass
             name = f"cast_{i}"
+            from backend.services.zimage_lora_check import lora_file_problem, plain_load_error
+
+            problem = lora_file_problem(p)
+            if problem:
+                raise RuntimeError(f"Can't use LoRA {p.name}. {problem}")
             try:
                 # Prefer an in-memory remapped dict so PEFT-prefixed saves
                 # (transformer.base_model.model.*) from early peft_zimage trains
@@ -3086,7 +3102,9 @@ Negative Prompt: {negative_prompt}""",
                     )
                 self._pipeline.load_lora_weights(remapped, adapter_name=name)
             except Exception as e:
-                raise RuntimeError(f"Failed to load Z-Image LoRA {p}: {e}") from e
+                raise RuntimeError(
+                    f"Failed to load Z-Image LoRA {p.name}: {plain_load_error(e)}"
+                ) from e
             adapters.append(name)
             weights.append(float(scale))
 

@@ -247,7 +247,7 @@ async function handleImageModel(args, { addMessage }) {
     await saveImageModelChoice("auto");
     addMessage({
       role: "system",
-      content: "Image model switched to **auto** (Qwen-Image-Edit for edits when installed, else Kontext, else img2img).",
+      content: "Image model switched to **auto** (edits use Qwen-Image-Edit when installed, else Kontext; with neither, editing asks you to install one).",
       tempId: `imgmodel-${Date.now()}`,
       type: "command",
     });

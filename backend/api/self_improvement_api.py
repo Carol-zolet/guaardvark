@@ -37,6 +37,23 @@ def get_status():
     })
 
 
+@self_improvement_bp.route("/precheck", methods=["GET"])
+def get_precheck():
+    """Whether a directed run could start now: {"ok": bool, "reason": str}.
+
+    The same check a dispatch makes (codebase lock, enabled flag, a run in
+    progress), answered by the backend because only it has the database and
+    the running service. The MCP self_improvement_status tool reads it here.
+    """
+    from backend.services.self_improvement_service import get_self_improvement_service
+    try:
+        pre = get_self_improvement_service().dispatch_precheck()
+    except Exception as exc:
+        logger.warning("self-improvement precheck failed: %s", exc)
+        return error_response(f"self-improvement precheck failed: {exc}", 500)
+    return success_response(data=pre)
+
+
 @self_improvement_bp.route("/toggle", methods=["POST"])
 def toggle_self_improvement():
     """Enable or disable self-improvement."""

@@ -1206,6 +1206,14 @@ Generate the CSV row now:"""
                 response_clean = '\n'.join(csv_lines)
                 logger.info(f"Extracted {len(csv_lines)} CSV line(s) from response (stripped preamble)")
 
+            # A reply the strict parser accepts is correctly escaped CSV and its
+            # fields are taken as written. One it rejects is still read, leniently.
+            try:
+                list(csv.reader(StringIO(response_clean), strict=True))
+                well_formed = True
+            except csv.Error:
+                well_formed = False
+
             # Parse CSV with flexible field handling
             reader = csv.reader(StringIO(response_clean))
             fields = next(reader)
@@ -1227,14 +1235,22 @@ Generate the CSV row now:"""
                 if index >= len(fields):
                     return default
                 value = fields[index].strip()
-                # Models often wrap short fields in extra quotes (""Support Planning"").
-                # Strip them only when the field starts and ends with quotes and no
-                # quote is left inside, so '"Best" Tips and "Tricks"' keeps its
-                # quotations. The HTML content (index 2) is left alone.
+                if index == 2:
+                    # The HTML content is left alone: quotes are everywhere in it.
+                    return value
+                # Models often wrap short fields in extra quotes. Written with
+                # escaping ("""Support Planning""") the field arrives as
+                # '"Support Planning"': strip the pair only when no quote is left
+                # inside, so '"Best" Tips and "Tricks"' keeps its quotations.
                 core = value.strip('"').strip()
-                if (index != 2 and len(value) >= 2 and value[0] == '"' and value[-1] == '"'
-                        and '"' not in core):
-                    value = core
+                if len(value) >= 2 and value[0] == '"' and value[-1] == '"' and '"' not in core:
+                    return core
+                # Written raw (""Support Planning""), which is not valid CSV, the
+                # lenient parser drops the opening pair and keeps the closing one:
+                # 'Support Planning""'. Take it off when the reply holds that form.
+                if (not well_formed and value.endswith('""') and not value.startswith('"')
+                        and '""' + value in response_clean):
+                    return value[:-2].rstrip()
                 return value
 
             # Generate missing fields if needed

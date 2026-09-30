@@ -271,7 +271,7 @@ Guaardvark speaks Model Context Protocol — both as a server (exposing its tool
 - **Stdio + streamable HTTP transports** — `python -m backend.mcp` (stdio, what clients spawn) or `python -m backend.mcp http` (loopback-only by default; no auth yet)
 - **One-command client setup** — `python -m backend.mcp install` writes the server entry into the configs of detected clients (Claude Code, Codex, Cursor, Grok, Antigravity, opencode, Claude Desktop, Zed, Gemini); any other client can launch `guaardvark mcp serve`; `python -m backend.mcp doctor` self-tests the server and flags stale client configs
 - **Native tools exposed under the default-deny policy** — RAG, code intelligence, file management, image/video/music-video generation, songs and speech (`generate_music`, `generate_speech`), memory, web; `python -m backend.mcp list-tools` prints the live list and how many of the registered tools it exposes
-- **Read-only output resources** — generated files under `data/outputs/` served as `guaardvark://outputs/...` (listing capped at 500 entries)
+- **Read-only output resources** — generated media and documents under `data/outputs/` served as `guaardvark://outputs/...` (paged listing; chat exports, screenshots, consent records and training work are not served)
 - **Verified end-to-end** — smoke tests drive a real initialize/tools-list handshake over stdio
 
 ### MCP Client

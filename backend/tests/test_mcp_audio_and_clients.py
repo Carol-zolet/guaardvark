@@ -118,9 +118,12 @@ def test_status_reports_a_finished_song(monkeypatch):
 
 # ---- installer ---------------------------------------------------------------------------
 @pytest.mark.parametrize("client,argv0", [("codex", "codex"), ("antigravity", "agy")])
-def test_cli_clients_are_configured_through_their_own_mcp_add(client, argv0):
+def test_cli_clients_are_configured_through_their_own_mcp_add(client, argv0, monkeypatch, tmp_path):
     from backend.mcp import installer
 
+    # The installer reads the client's config to see what is already there.
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("CODEX_HOME", raising=False)
     detail = installer._INSTALLERS[client](dry_run=True)
     assert detail.startswith(f"would run: {argv0} mcp add guaardvark -- sh -c")
 

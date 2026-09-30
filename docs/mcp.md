@@ -53,6 +53,14 @@ define a server. Other settings (`backend/config.py`): `GUAARDVARK_MCP_ENABLED`,
 `GUAARDVARK_MCP_MAX_OUTPUT_CHARS` (how much tool output reaches the model,
 default 16000), `GUAARDVARK_MCP_AUTOCONNECT`, `GUAARDVARK_MCP_CONFIG_FILE`.
 
+These are the client's settings. Guaardvark's own MCP server
+(`python -m backend.mcp`, the one other agents connect to) loads the same
+`.env` and has its own names: `GUAARDVARK_MCP_SERVER_ENABLED` switches it off,
+and `GUAARDVARK_MCP_SERVER_TIMEOUT` is its per-call ceiling (default 120 s).
+`GUAARDVARK_MCP_ENABLED=false` does not stop the server. The server does read
+`GUAARDVARK_MCP_TIMEOUT` when `GUAARDVARK_MCP_SERVER_TIMEOUT` is unset, so set
+both when the two should differ.
+
 **Secrets.** Put secrets in `env`, preferably as `${VAR}` references, never in
 `args`: the MCP Servers page and `GET /api/automation/mcp/servers/<name>` show
 `args` and never show `env` values.

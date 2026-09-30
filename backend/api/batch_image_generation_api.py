@@ -398,6 +398,34 @@ def _as_bool(value: Any, default: bool) -> bool:
     return str(value).strip().lower() not in _FALSE_STRINGS
 
 
+class UnknownImageModel(ValueError):
+    """The request names an image model the catalog does not have."""
+
+
+def unknown_image_model_message(model: Any) -> Optional[str]:
+    """The refusal for a model name the image catalog does not have, else None.
+
+    The catalog is offline_image_generator.available_models (user-added models
+    included). 'auto', or no name, is the router's pick and always allowed.
+    When the catalog cannot be read the name is left for the generator to judge.
+    """
+    name = str(model or "").strip()
+    if not name or name == "auto":
+        return None
+    try:
+        from backend.services.offline_image_generator import get_image_generator
+        generator = get_image_generator()
+        catalog = generator.available_models
+        hidden = set(getattr(generator, "hidden_models", None) or ())
+    except Exception as e:  # noqa: BLE001 — no catalog to check against
+        logger.warning("image model catalog unavailable, '%s' not checked: %s", name, e)
+        return None
+    if name in catalog:
+        return None
+    known = ", ".join(sorted(k for k in catalog if k not in hidden))
+    return f"Unknown image model '{name}'. Known: auto, {known}."
+
+
 def _parse_generation_params(data: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """
     Parse and validate generation parameters.
@@ -421,16 +449,12 @@ def _parse_generation_params(data: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict
     if 'ui_config' in data:
         params['ui_config'] = data['ui_config']
 
-    # Model selection — validate against the canonical catalog (single source of
-    # truth) so this can never drift from offline_image_generator.available_models.
-    # 'auto' is allowed: the generator's router picks the best downloaded model.
-    try:
-        from backend.services.offline_image_generator import get_image_generator
-        valid_models = set(get_image_generator().available_models.keys()) | {'auto'}
-    except Exception:
-        valid_models = {'auto'}
-    model = data.get('model', 'auto')
-    params['model'] = model if model in valid_models else 'auto'
+    # Model selection — a name the catalog does not have is refused, never swapped
+    # for 'auto': the reply would name a model that is not the one rendering.
+    refusal = unknown_image_model_message(data.get('model'))
+    if refusal:
+        raise UnknownImageModel(refusal)
+    params['model'] = str(data.get('model') or 'auto').strip() or 'auto'
 
     # Default image parameters — family-aware (stills_defaults), not SD-era 512/20/7.5
     from backend.services.stills_defaults import resolve_stills_defaults
@@ -1041,6 +1065,18 @@ def add_user_image_model():
         has_model_index = bool(inspected.get("has_model_index"))
     else:
         return error_response("Paste a Hugging Face URL or org/repo.", 400)
+    # Z-Image LoRAs load through Diffusers, which takes plain LoRA files only. Read
+    # the file's header now so a LoKr file or a full checkpoint is turned away with a
+    # reason before its download starts.
+    if (data.get("role") or "").strip() == "lora" and (data.get("family") or "").strip() == "zimage":
+        from backend.services.zimage_lora_check import hf_lora_problem
+        srcs = [f.get("src") if isinstance(f, dict) else f for f in files]
+        if len(srcs) == 1 and srcs[0]:
+            problem = hf_lora_problem(hf_repo, srcs[0], revision)
+            if problem:
+                return error_response(
+                    f"{Path(srcs[0]).name} can't be added as a Z-Image LoRA. {problem}", 400
+                )
     generator = get_batch_image_generator()
     if not generator.image_generator:
         return error_response("Image generator not initialized", 503)
@@ -1441,6 +1477,8 @@ def generate_from_csv():
 
         return success_response(response_data, status_code=201)
 
+    except UnknownImageModel as e:
+        return error_response(str(e), 400)
     except ValueError as e:
         logger.warning(f"Invalid CSV data: {e}")
         return error_response(f"Invalid CSV: {str(e)}", 400)

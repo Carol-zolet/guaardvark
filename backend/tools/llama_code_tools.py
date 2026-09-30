@@ -17,9 +17,14 @@ import hashlib
 import os
 import logging
 import subprocess
+import time
 from pathlib import Path
 from typing import List, Optional
 import re
+
+# The third-party engine runs search_code's caller-supplied patterns: unlike re
+# it takes a per-call timeout and can release the GIL while it matches.
+import regex
 
 from backend.services.guarded_code_service import (
     GuardedCodeError,
@@ -147,6 +152,18 @@ SKIP_DIR_NAMES = {
 MAX_SEARCH_HITS = 100
 MAX_MATCH_LINE_CHARS = 300
 MAX_LISTED_ENTRIES = 1500
+DEFAULT_SEARCH_GLOB = "**/*.{py,jsx,js,tsx,ts}"
+
+# Budgets for search_code's caller-supplied pattern. A pattern with nested
+# repeats such as '(\w+\s*)+' backtracks exponentially on lines it does not
+# match, and stdlib re offers no way to stop it. Ordinary patterns take about a
+# microsecond per line: the default glob over this checkout (~1,900 files,
+# ~550,000 lines) scans in about half a second. So one line past
+# LINE_MATCH_TIMEOUT_S, or a scan past SEARCH_DEADLINE_S, means the pattern is
+# the problem. The deadline sits well under the MCP server's 120 s call
+# timeout so the caller gets this reason rather than a generic timeout.
+LINE_MATCH_TIMEOUT_S = 1.0
+SEARCH_DEADLINE_S = 20.0
 
 
 def _source_files(subdir: str = "") -> List[str]:
@@ -246,37 +263,74 @@ def _glob_regex(pattern: str) -> "re.Pattern":
     return re.compile(out + r"\Z")
 
 
-def search_code(pattern: str, file_glob: str = "**/*.{py,jsx,js,tsx,ts}") -> str:
+def _effective_glob(glob: str) -> str:
+    """The glob a file_glob stands for. A wildcard-free name of a folder in the
+    checkout means every file under it ('backend/utils' -> 'backend/utils/**')."""
+    folder = glob.rstrip("/")
+    if folder and not any(c in glob for c in "*?[{") and (PROJECT_ROOT / folder).is_dir():
+        return folder + "/**"
+    return glob
+
+
+def _anchored_globs(glob: str) -> List[str]:
+    """The expanded globs to match against repo-relative paths. One with no '/'
+    names files in any folder, as ripgrep's -g and gitignore patterns do:
+    '*.py' matches backend/app.py as well as setup.py."""
+    return [g if "/" in g else "**/" + g for g in _expand_braces(glob)]
+
+
+def _too_expensive(pattern: str, why: str) -> str:
+    return (
+        f"ERROR: the pattern '{pattern}' is too expensive to run: {why}. Patterns with nested "
+        "repeats such as '(\\w+\\s*)+' backtrack exponentially on lines they do not match. "
+        "Write it without the nested repeat (for example '\\w+\\s*\\(' instead of "
+        "'(\\w+\\s*)+\\('), or narrow file_glob."
+    )
+
+
+def search_code(pattern: str, file_glob: str = DEFAULT_SEARCH_GLOB, max_hits: int = MAX_SEARCH_HITS) -> str:
     """
     Search the checkout's source files for a case-insensitive regex, line by line.
 
     Args:
         pattern: Python regular expression (e.g., "Snibbly Nips", "Button.*onClick")
-        file_glob: Glob relative to the checkout root; {a,b} groups are expanded
+        file_glob: Glob relative to the checkout root; {a,b} groups are expanded, a
+            glob with no '/' matches file names in any folder, and a folder name
+            searches every file under it
+        max_hits: How many hits to list; the total is always reported
 
     Returns:
-        Up to MAX_SEARCH_HITS "path:line" hits with the line text, or an ERROR string
+        Up to max_hits "path:line" hits with the line text, or an ERROR string.
+        A pattern that runs past LINE_MATCH_TIMEOUT_S on one line or
+        SEARCH_DEADLINE_S in all is an ERROR, not a partial result.
 
     Example:
         results = search_code("Snibbly Nips")
         results = search_code("Button", "frontend/**/*.jsx")
     """
     try:
-        regex = re.compile(pattern, re.IGNORECASE)
-    except re.error as e:
+        # re decides what is valid, so the accepted syntax and its error
+        # messages stay Python's; the regex engine, compiled as VERSION0 (its
+        # re-compatible mode, simple case folding), does the matching.
+        re.compile(pattern, re.IGNORECASE)
+        line_re = regex.compile(pattern, regex.IGNORECASE | regex.VERSION0)
+    except (re.error, regex.error) as e:
         return f"ERROR: '{pattern}' is not a valid regular expression: {e}"
-    glob = (file_glob or "**/*.{py,jsx,js,tsx,ts}").strip()
+    glob = (file_glob or DEFAULT_SEARCH_GLOB).strip()
     while glob.startswith("./"):
         glob = glob[2:]
     if glob.startswith(("/", "~")) or ".." in glob.split("/"):
         return f"ERROR: file_glob '{file_glob}' must be relative to the checkout root, without '..'"
+    max_hits = max(1, int(max_hits))
 
     try:
-        matchers = [_glob_regex(g) for g in _expand_braces(glob)]
-        files = [p for p in _source_files(_literal_prefix(glob)) if any(m.match(p) for m in matchers)]
+        effective = _effective_glob(glob)
+        matchers = [_glob_regex(g) for g in _anchored_globs(effective)]
+        files = [p for p in _source_files(_literal_prefix(effective)) if any(m.match(p) for m in matchers)]
 
+        deadline = time.monotonic() + SEARCH_DEADLINE_S
         matches = []
-        for rel in files:
+        for scanned, rel in enumerate(files):
             path = PROJECT_ROOT / rel
             try:
                 with open(path, 'rb') as f:
@@ -284,7 +338,22 @@ def search_code(pattern: str, file_glob: str = "**/*.{py,jsx,js,tsx,ts}") -> str
                         continue  # binary file
                 with open(path, 'r', encoding='utf-8', errors='ignore') as f:
                     for line_num, line in enumerate(f, start=1):
-                        if regex.search(line):
+                        timeout = min(LINE_MATCH_TIMEOUT_S, deadline - time.monotonic())
+                        try:
+                            if timeout <= 0:
+                                raise TimeoutError
+                            # concurrent=True releases the GIL while matching, so the
+                            # MCP server's event loop and its call timeout keep running.
+                            hit = line_re.search(line, timeout=timeout, concurrent=True)
+                        except TimeoutError:
+                            if timeout < LINE_MATCH_TIMEOUT_S:
+                                why = (f"the search had not finished after {SEARCH_DEADLINE_S:g} s "
+                                       f"(stopped at {rel}:{line_num}, file {scanned + 1} of {len(files)})")
+                            else:
+                                why = (f"matching one line ({rel}:{line_num}) took longer than "
+                                       f"{LINE_MATCH_TIMEOUT_S:g} s")
+                            return _too_expensive(pattern, why)
+                        if hit:
                             text = line.rstrip()
                             if len(text) > MAX_MATCH_LINE_CHARS:
                                 text = text[:MAX_MATCH_LINE_CHARS] + " …"
@@ -293,13 +362,19 @@ def search_code(pattern: str, file_glob: str = "**/*.{py,jsx,js,tsx,ts}") -> str
                 logger.debug(f"Skipping {rel}: {e}")
 
         if not matches:
-            return f"No matches found for pattern '{pattern}' in {file_glob}"
+            if effective != glob:
+                note = f" (every file under {effective[:-3]})"
+            elif any("/" not in g for g in _expand_braces(effective)):
+                note = " (file names in any folder)"
+            else:
+                note = ""
+            return f"No matches found for pattern '{pattern}' in {file_glob}{note}"
 
         result = f"✓ Found {len(matches)} matches for '{pattern}':\n\n"
-        for i, (rel, line_num, text) in enumerate(matches[:MAX_SEARCH_HITS], 1):
+        for i, (rel, line_num, text) in enumerate(matches[:max_hits], 1):
             result += f"{i}. {rel}:{line_num}\n   {text}\n\n"
-        if len(matches) > MAX_SEARCH_HITS:
-            result += f"... and {len(matches) - MAX_SEARCH_HITS} more matches (showing first {MAX_SEARCH_HITS})\n"
+        if len(matches) > max_hits:
+            result += f"... and {len(matches) - max_hits} more matches (showing first {max_hits})\n"
 
         logger.info(f"Search for '{pattern}' found {len(matches)} matches")
         return result
@@ -410,15 +485,18 @@ def list_files(directory: str = "frontend/src/pages", max_depth: int = 5) -> str
         full_path = (PROJECT_ROOT / (directory or ".")).resolve()
         if not full_path.is_relative_to(PROJECT_ROOT):
             return f"ERROR: Path '{directory}' is outside project root"
-        if not full_path.exists():
-            return f"ERROR: Path '{directory}' does not exist"
-        if not full_path.is_dir():
-            return f"ERROR: '{directory}' is a file, not a folder; open it with read_code"
 
+        # Decided from the path alone, before the folder is looked at: the same
+        # answer for a private folder that exists and one that does not.
         rel_dir = full_path.relative_to(PROJECT_ROOT).as_posix()
         prefix = "" if rel_dir == "." else rel_dir + "/"
         if prefix and private_relative_paths([prefix], PROJECT_ROOT):
             return f"ERROR: '{directory}' is git-ignored local data, not source code"
+
+        if not full_path.exists():
+            return f"ERROR: Path '{directory}' does not exist"
+        if not full_path.is_dir():
+            return f"ERROR: '{directory}' is a file, not a folder; open it with read_code"
 
         # Build the tree from the source inventory, so ignored data never shows.
         tree: dict = {}

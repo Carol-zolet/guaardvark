@@ -12,13 +12,15 @@ from flask import Blueprint, current_app, jsonify, request
 from backend.utils.response_utils import success_response, error_response
 from backend.utils.settings_utils import get_web_access
 from backend.utils.safe_math import evaluate_arithmetic
+from backend.utils.hosts import no_netrc_session
 from backend.utils.text_focus import focus_window
+from backend.utils.web_fetch import FetchFailed, FetchRefused, decode_page, fetch_page
+from backend.utils.web_search_sources import (
+    DEFAULT_SEARCH_RESULTS, FALLBACK_SEARCH_SOURCE, MAX_SEARCH_RESULTS, SEARCH_ENGINE, WEATHER_SOURCE,
+)
 
 web_search_bp = Blueprint("web_search_api", __name__, url_prefix="/api/web-search")
 logger = logging.getLogger(__name__)
-
-MAX_REDIRECTS = 5
-
 
 def extract_website_content(url: str, query: Optional[str] = None, public_only: bool = False) -> Dict[str, Any]:
     """Fetch a page and return its title, description and up to 2,000 characters of its text.
@@ -26,6 +28,10 @@ def extract_website_content(url: str, query: Optional[str] = None, public_only: 
     ``public_only`` refuses any address that is not globally routable, on every
     redirect hop (the fetch_url and analyze_website tools ask for it). Logins
     saved in ~/.netrc are never sent, with or without it.
+
+    The fetch is bounded in size and time (:mod:`backend.utils.web_fetch`). A
+    page that was read only in part is still returned, with ``page_cut`` saying
+    what was left out; the key is absent for a page read in full.
 
     With ``query`` the text is the stretch of the page about the query
     (:func:`backend.utils.text_focus.focus_window`); without it, the head of the page.
@@ -44,46 +50,15 @@ def extract_website_content(url: str, query: Optional[str] = None, public_only: 
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
         }
 
-        current = url
-        if public_only:
-            # Redirects are followed one hop at a time so every hop is checked: a
-            # public page must not be able to bounce the fetch onto this machine.
-            from urllib.parse import urljoin
-            from backend.utils.hosts import (
-                PrivateAddressError, private_address_reason, public_only_session,
-            )
-            with public_only_session() as session:
-                for _hop in range(MAX_REDIRECTS + 1):
-                    refused = private_address_reason(current)
-                    if refused:
-                        return {"success": False, "url": url, "error": f"Refused to fetch {current}: {refused}"}
-                    try:
-                        response = session.get(current, headers=headers, timeout=15, allow_redirects=False)
-                    except requests.exceptions.ConnectionError as e:
-                        # The connect-time check: the name resolved differently from
-                        # the check above, or requests decoded the host differently.
-                        reason = getattr(e.args[0], "reason", None) if e.args else None
-                        if isinstance(reason, PrivateAddressError):
-                            return {"success": False, "url": url,
-                                    "error": f"Refused to fetch {current}: {reason.host_name} resolves "
-                                             f"to a private or local address ({reason.address})"}
-                        raise
-                    location = session.get_redirect_target(response)
-                    if location:
-                        current = urljoin(current, location)
-                        continue
-                    break
-                else:
-                    return {"success": False, "url": url, "error": f"Too many redirects (more than {MAX_REDIRECTS})"}
-        else:
-            from backend.utils.hosts import no_netrc_session
-            with no_netrc_session() as session:
-                response = session.get(url, headers=headers, timeout=15, allow_redirects=True)
-            current = response.url
-        response.raise_for_status()
-        
-        soup = BeautifulSoup(response.content, 'html.parser', from_encoding='utf-8')
-        
+        try:
+            page = fetch_page(url, headers=headers, public_only=public_only)
+        except (FetchRefused, FetchFailed) as e:
+            return {"success": False, "url": url, "error": str(e)}
+        current = page.url
+
+        text, _encoding = decode_page(page.body, page.charset, complete=page.cut is None)
+        soup = BeautifulSoup(text, 'html.parser')
+
         for script in soup(["script", "style", "nav", "footer", "aside"]):
             script.decompose()
         
@@ -113,7 +88,7 @@ def extract_website_content(url: str, query: Optional[str] = None, public_only: 
         page_word_count = len(content_text.split())
         content_text = focus_window(content_text, query, 2000) if query else content_text[:2000]
         
-        return {
+        result = {
             "success": True,
             "url": url,
             "final_url": current,
@@ -123,7 +98,10 @@ def extract_website_content(url: str, query: Optional[str] = None, public_only: 
             "content_length": len(content_text),
             "page_word_count": page_word_count,
         }
-        
+        if page.cut:
+            result["page_cut"] = page.cut
+        return result
+
     except requests.RequestException as e:
         logger.error(f"Website scraping failed for {url}: {e}")
         return {
@@ -149,8 +127,9 @@ def get_weather_info(location: str) -> Dict[str, Any]:
         for api_url in weather_apis:
             try:
                 headers = {'User-Agent': 'Guaardvark-Weather/1.0'}
-                response = requests.get(api_url, headers=headers, timeout=10)
-                
+                with no_netrc_session() as session:
+                    response = session.get(api_url, headers=headers, timeout=10)
+
                 if response.ok:
                     data = response.json()
                     
@@ -168,7 +147,7 @@ def get_weather_info(location: str) -> Dict[str, Any]:
                             "temperature_fahrenheit": temp_f,
                             "description": weather_desc,
                             "humidity": humidity,
-                            "source": "wttr.in"
+                            "source": WEATHER_SOURCE
                         }
                         
             except Exception as e:
@@ -189,10 +168,13 @@ def get_weather_info(location: str) -> Dict[str, Any]:
             "error": f"Weather service error: {str(e)}"
         }
 
-def enhanced_web_search(query: str, public_only: bool = False) -> Dict[str, Any]:
+def enhanced_web_search(query: str, public_only: bool = False,
+                        max_results: int = DEFAULT_SEARCH_RESULTS) -> Dict[str, Any]:
     """Answer ``query`` from the web. A URL in the query is fetched directly;
     ``public_only`` refuses that fetch for addresses that are not globally
-    routable, as fetch_url does."""
+    routable, as fetch_url does. ``max_results`` is how many search results to
+    ask for (1 to ``MAX_SEARCH_RESULTS``). ``data["source"]`` names the service
+    that answered."""
 
     results = {
         "query": query,
@@ -214,9 +196,11 @@ def enhanced_web_search(query: str, public_only: bool = False) -> Dict[str, Any]
             
         logger.info(f"Direct website access for: {url}")
         website_data = extract_website_content(url, public_only=public_only)
-        if not website_data["success"] and str(website_data.get("error", "")).startswith("Refused"):
-            # A refused address ends the call: searching the web for the URL's text
-            # would answer a question nobody asked.
+        if not website_data["success"] and str(website_data.get("error", "")).startswith(
+                ("Refused", "Not a web page")):
+            # A refused address, or a URL that serves a file instead of a page,
+            # ends the call: searching the web for the URL's text would answer a
+            # question nobody asked, and would send the query to the search engine.
             results["error"] = website_data["error"]
             results["data"] = {"message": website_data["error"]}
             return results
@@ -234,13 +218,15 @@ def enhanced_web_search(query: str, public_only: bool = False) -> Dict[str, Any]
                     "snippet": f"Website: {website_data['title']}\n\nDescription: {website_data['description']}\n\nContent: {website_data['content'][:500]}..."
                 }
             })
+            if website_data.get("page_cut"):
+                results["data"]["page_cut"] = website_data["page_cut"]
             return results
         else:
             results["data"]["website_error"] = website_data["error"]
     
-    logger.info(f"Performing DuckDuckGo search for: {query}")
-    ddg_results = perform_duckduckgo_search(query)
-    
+    logger.info(f"Performing web search for: {query}")
+    ddg_results = perform_duckduckgo_search(query, max_results=max_results)
+
     if ddg_results["success"]:
         results.update({
             "strategy_used": "duckduckgo_search",
@@ -250,7 +236,7 @@ def enhanced_web_search(query: str, public_only: bool = False) -> Dict[str, Any]
                 "results": ddg_results["results"],
                 "snippet": ddg_results["snippet"],
                 "total_results": ddg_results["total_results"],
-                "source": "DuckDuckGo"
+                "source": ddg_results.get("source") or SEARCH_ENGINE
             }
         })
         return results
@@ -454,7 +440,7 @@ def handle_special_queries(query: str) -> Dict[str, Any]:
                         "description": description,
                         "humidity": humidity,
                         "snippet": snippet,
-                        "source": "Weather API"
+                        "source": weather_result.get("source") or WEATHER_SOURCE
                     }
                 }
             logger.warning(f"Weather lookup failed for {location}: {weather_result.get('error', 'Unknown error')}")
@@ -487,17 +473,31 @@ def handle_special_queries(query: str) -> Dict[str, Any]:
     }
 
 
-def perform_duckduckgo_search(query: str) -> Dict[str, Any]:
+def search_result_count(value: Any) -> int:
+    """``value`` as a number of results to ask for, within 1..MAX_SEARCH_RESULTS."""
+    try:
+        count = int(value)
+    except (TypeError, ValueError):
+        return DEFAULT_SEARCH_RESULTS
+    return max(1, min(count, MAX_SEARCH_RESULTS))
+
+
+def perform_duckduckgo_search(query: str, max_results: int = DEFAULT_SEARCH_RESULTS) -> Dict[str, Any]:
+    """Search the web for ``query`` with the duckduckgo-search client, then, if
+    that gave nothing, through FALLBACK_SEARCH_SOURCE. ``source`` in the result
+    names the one the results came from."""
+    max_results = search_result_count(max_results)
     try:
         from duckduckgo_search import DDGS
 
         results = []
         search_snippets = []
         last_error = None
+        source = SEARCH_ENGINE
         for backend in ("lite", "html"):
             try:
                 with DDGS() as ddgs:
-                    search_rows = ddgs.text(query, backend=backend, max_results=5)
+                    search_rows = ddgs.text(query, backend=backend, max_results=max_results)
 
                 for row in search_rows:
                     title = (row.get("title") or "").strip()
@@ -517,14 +517,16 @@ def perform_duckduckgo_search(query: str) -> Dict[str, Any]:
                     break
             except Exception as backend_error:
                 last_error = str(backend_error)
-                logger.warning(f"DuckDuckGo {backend} backend failed: {backend_error}")
+                logger.warning(f"Web search ({SEARCH_ENGINE}, asked as {backend}) failed: {backend_error}")
                 continue
 
         if not results:
             try:
+                source = FALLBACK_SEARCH_SOURCE
                 proxy_url = f"https://r.jina.ai/http://lite.duckduckgo.com/lite/?q={quote_plus(query)}"
                 headers = {"User-Agent": "guaardvark-web-search/1.0"}
-                resp = requests.get(proxy_url, headers=headers, timeout=10)
+                with no_netrc_session() as session:
+                    resp = session.get(proxy_url, headers=headers, timeout=10)
                 resp.raise_for_status()
 
                 lines = resp.text.splitlines()
@@ -559,7 +561,7 @@ def perform_duckduckgo_search(query: str) -> Dict[str, Any]:
                         break
             except Exception as proxy_error:
                 last_error = last_error or str(proxy_error)
-                logger.warning(f"DuckDuckGo proxy fallback failed: {proxy_error}")
+                logger.warning(f"Web search fallback ({FALLBACK_SEARCH_SOURCE}) failed: {proxy_error}")
 
         if results:
             combined_snippet = "\n\n".join(search_snippets[:3]) if search_snippets else ""
@@ -567,7 +569,8 @@ def perform_duckduckgo_search(query: str) -> Dict[str, Any]:
                 "success": True,
                 "results": results,
                 "snippet": f"Search results for '{query}':\n\n{combined_snippet}",
-                "total_results": len(results)
+                "total_results": len(results),
+                "source": source,
             }
 
         return {
@@ -578,10 +581,10 @@ def perform_duckduckgo_search(query: str) -> Dict[str, Any]:
         }
 
     except Exception as e:
-        logger.error(f"DuckDuckGo search failed: {e}")
+        logger.error(f"Web search failed: {e}")
         return {
             "success": False,
-            "error": f"DuckDuckGo search error: {str(e)}",
+            "error": f"Web search error: {str(e)}",
             "results": [],
             "snippet": ""
         }
@@ -713,7 +716,10 @@ def search_status():
             ],
             "reliability_notes": {
                 "direct_website": "Reliable for specific URLs",
-                "duckduckgo_search": "Primary general search provider"
+                "duckduckgo_search": (
+                    f"General search: {SEARCH_ENGINE} through the duckduckgo-search client, "
+                    f"then {FALLBACK_SEARCH_SOURCE} when that returns nothing"
+                )
             }
         })
         
