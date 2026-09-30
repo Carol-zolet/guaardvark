@@ -132,7 +132,11 @@ class WordPressContentTool(BaseTool):
     """
 
     name = "generate_wordpress_content"
-    read_only = True
+    # Writes nothing, but a call is minutes of local LLM time and is not safe to
+    # repeat blindly. Not read-only, so an MCP client is offered an
+    # idempotency_key and a retry waits for the first run instead of stacking one.
+    read_only = False
+    destructive = False
     description = (
         "Compose one WordPress page with Guaardvark's local LLM and return it as a single CSV row of "
         "text, six double-quoted columns with no header: ID, title, HTML content, meta description, "
@@ -142,7 +146,8 @@ class WordPressContentTool(BaseTool):
         "generate_bulk_csv. The ID column is always row_id; a reply without six fields, a title and "
         "HTML content, or with HTML or line breaks outside the content column, after one retry is an "
         "error. Each model call is cut off after 180 s, and over MCP a call still running at the "
-        "timeout (120 s by default) returns an error."
+        "timeout (120 s by default) returns an error while the run carries on: send an "
+        "idempotency_key and repeat the call with the same key to wait for that run, not start another."
     )
 
     parameters = {
@@ -271,7 +276,9 @@ class EnhancedWordPressContentTool(BaseTool):
     """
 
     name = "generate_enhanced_wordpress_content"
-    read_only = True
+    # Same reasoning as generate_wordpress_content: no writes, but not repeatable for free.
+    read_only = False
+    destructive = False
     description = (
         "Compose one WordPress page grounded in the user's own indexed documents: it searches the whole "
         "knowledge base for the client, topic and services, gives Guaardvark's local LLM up to 6 "
@@ -285,7 +292,9 @@ class EnhancedWordPressContentTool(BaseTool):
         "without seven fields, a title and HTML content, or with HTML or line breaks outside the "
         "content column, after one retry is an error, and so is a knowledge base that cannot be "
         "searched or has fallen back to an empty index. Each model call is cut off after 180 s, and "
-        "over MCP a call still running at the timeout (120 s by default) returns an error. "
+        "over MCP a call still running at the timeout (120 s by default) returns an error while the "
+        "run carries on: send an idempotency_key and repeat the call with the same key to wait for "
+        "that run, not start another. "
         "Without grounding or service limits use generate_wordpress_content; for many pages in one "
         "import file, generate_bulk_csv."
     )
