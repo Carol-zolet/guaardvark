@@ -2,8 +2,11 @@
 """Lightweight endpoint protection for dangerous operations.
 
 When GUAARDVARK_API_KEY is set in the environment, protected endpoints
-require the key in the X-API-Key header. When unset, localhost requests
-pass freely but remote hosts are blocked from sensitive endpoints.
+require the key in the X-API-Key header from every host, this machine
+included. When unset, requests from this machine pass and other hosts are
+refused. The web UI keeps the key in the browser (Settings → API key) and
+sends it on every request to this backend; /api/auth/ reports the state and
+manages the key.
 """
 
 import os
@@ -14,8 +17,13 @@ from flask import request, jsonify
 
 logger = logging.getLogger(__name__)
 
+API_KEY_ENV = "GUAARDVARK_API_KEY"
+API_KEY_HEADER = "X-API-Key"
+
 # Endpoints that always require protection (any method)
 PROTECTED_PREFIXES = (
+    # Creating, replacing and removing the API key itself.
+    '/api/auth/key',
     '/api/code-execution/',
     '/api/backups/restore',
     '/api/backups/create',
@@ -34,8 +42,8 @@ PROTECTED_PREFIXES = (
 # commands and reach internal networks, and a call to /api/tools/execute skips
 # the confirmation prompts chat would show. Tool jobs hold the results of those
 # calls. These routes answer only this machine, or a caller that sends the API
-# key. The web UI sends no key, so from another device the Tools page cannot
-# run a tool and the MCP Servers page does not load.
+# key; a browser on another device sends it once it is entered in Settings →
+# API key.
 # GUAARDVARK_PROTECT_TOOL_ENDPOINTS=false (or 0, no, off) opens them to every
 # host that can reach the backend; any other value, or none, keeps them closed.
 # It is read per request, like GUAARDVARK_API_KEY.
@@ -49,16 +57,23 @@ TOOL_ENDPOINT_PATHS = (
     '/api/tools/execute',
 )
 
-# The two refusals. The web UI and the CLI show them as they are, so each says
-# what the action needs: another host with no API key configured, and any
-# caller without the key once one is configured.
+# The refusals. Each carries a code the web UI recognises (it then words the
+# advice for the page it is on and links to Settings → API key); the CLI shows
+# the text as it is, so the text says what to do in both places.
+# local_only: this install has no key and the caller is another host.
+# api_key_required: this install has a key and the caller did not send it.
+LOCAL_ONLY_CODE = "local_only"
+API_KEY_CODE = "api_key_required"
 LOCAL_ONLY_MESSAGE = (
-    "This action is only available on the Guaardvark machine itself, or to a "
-    "command-line or API client that sends the API key."
+    "This action works only on the Guaardvark machine itself, because this "
+    "install has no API key yet. To use it from another device, create a key "
+    "in Settings → API key on the Guaardvark machine, then enter it on that "
+    "device; command-line and API clients send it in the X-API-Key header."
 )
 API_KEY_MESSAGE = (
-    "This action needs this install's API key (GUAARDVARK_API_KEY), sent in "
-    "the X-API-Key header."
+    "This action needs this install's API key. In the web UI, enter it in "
+    "Settings → API key; command-line and API clients send it in the "
+    "X-API-Key header (GUAARDVARK_API_KEY)."
 )
 
 
@@ -254,6 +269,65 @@ def _is_protected():
     return False
 
 
+def configured_api_key() -> str:
+    """This install's API key as the running process has it, or ""."""
+    return (os.environ.get(API_KEY_ENV) or "").strip()
+
+
+def request_carries_valid_key() -> bool:
+    """True when a key is configured and the request sent that key."""
+    api_key = configured_api_key()
+    provided = request.headers.get(API_KEY_HEADER, "")
+    if not api_key or not provided:
+        return False
+    # Bytes, so a header with non-ASCII characters compares unequal instead of
+    # raising.
+    return hmac.compare_digest(provided.encode("utf-8"), api_key.encode("utf-8"))
+
+
+def request_is_from_this_machine() -> bool:
+    """True for the Guaardvark machine itself, through the local proxy or not."""
+    # The effective client IP, so a LAN device proxied through the local Vite
+    # preview is still treated as remote (the proxy makes request.remote_addr
+    # loopback otherwise).
+    return _is_localhost(_effective_client_ip())
+
+
+def caller_is_authorized() -> bool:
+    """The rule every protected route applies: the key once one is configured,
+    this machine until then."""
+    if configured_api_key():
+        return request_carries_valid_key()
+    return request_is_from_this_machine()
+
+
+def protected_summary() -> list[str]:
+    """What needs this machine or the key, in words for the Settings page."""
+    items = []
+    if tool_endpoints_protected():
+        items += [
+            "Running tools directly (Tools page) and their jobs",
+            "Automation and MCP servers",
+        ]
+    else:
+        items.append("Changing the MCP server list")
+    items += [
+        "Code execution",
+        "Creating, restoring and deleting backups",
+        "Editing files and browsing the server's folders",
+        "Reading Guaardvark's own source (self-code)",
+        "Social outreach",
+        "Changing tasks, jobs, schedules, memory and GPU state",
+        "Raw file downloads under /outputs/",
+        "Managing this API key",
+    ]
+    return items
+
+
+def _refusal(message: str, code: str, status: int):
+    return jsonify({"error": message, "code": code}), status
+
+
 def check_endpoint_auth():
     """Flask before_request hook: enforce auth on dangerous endpoints.
 
@@ -265,26 +339,18 @@ def check_endpoint_auth():
     if not _is_protected():
         return None
 
-    api_key = os.environ.get('GUAARDVARK_API_KEY')
-
-    if not api_key:
-        # No key configured — localhost-only access. Use the effective client IP
-        # so a LAN device proxied through the local Vite preview is still treated
-        # as remote (the proxy makes request.remote_addr loopback otherwise).
-        client_ip = _effective_client_ip()
-        if _is_localhost(client_ip):
+    if not configured_api_key():
+        if request_is_from_this_machine():
             return None
         logger.warning(
-            f"[AUTH] Blocked remote access to {request.path} from {client_ip}"
+            f"[AUTH] Blocked remote access to {request.path} from {_effective_client_ip()}"
         )
-        return jsonify({"error": LOCAL_ONLY_MESSAGE}), 403
+        return _refusal(LOCAL_ONLY_MESSAGE, LOCAL_ONLY_CODE, 403)
 
-    # API key is configured — require it
-    provided_key = request.headers.get('X-API-Key', '')
-    if provided_key and hmac.compare_digest(provided_key, api_key):
+    if request_carries_valid_key():
         return None
 
     logger.warning(
         f"[AUTH] Invalid/missing API key for {request.path} from {request.remote_addr}"
     )
-    return jsonify({"error": API_KEY_MESSAGE}), 401
+    return _refusal(API_KEY_MESSAGE, API_KEY_CODE, 401)

@@ -105,6 +105,13 @@ def test_with_an_api_key_set_every_host_needs_it(client, monkeypatch):
     assert _execute(client, LOCAL, headers={"X-API-Key": "k-test"}).status_code == 200
 
 
+def test_refusals_carry_the_code_the_web_ui_reads(client, monkeypatch):
+    # The web UI turns these codes into "Settings → API key" advice.
+    assert _execute(client, REMOTE).get_json()["code"] == auth_guard.LOCAL_ONLY_CODE
+    monkeypatch.setenv("GUAARDVARK_API_KEY", "k-test")
+    assert _execute(client, REMOTE).get_json()["code"] == auth_guard.API_KEY_CODE
+
+
 @pytest.mark.parametrize("value", ["false", "0", "no", "off", "FALSE", " Off "])
 def test_the_opt_out_opens_the_routes_to_other_hosts(client, app, monkeypatch, value):
     monkeypatch.setenv(auth_guard.TOOL_ENDPOINTS_ENV, value)
