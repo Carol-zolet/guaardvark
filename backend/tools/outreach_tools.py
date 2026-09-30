@@ -17,7 +17,9 @@ gates still apply downstream — none of these tools bypass them.
 
 from __future__ import annotations
 
+import json
 import logging
+import re
 from typing import Any, Dict, List, Optional
 
 from backend.services.agent_tools import BaseTool, ToolParameter, ToolResult
@@ -32,6 +34,41 @@ _KNOWN_PLATFORMS = ("reddit", "discord", "facebook", "twitter", "youtube")
 _KNOWN_RUN_PLATFORMS = (
     "reddit", "self_share", "recon", "draft", "youtube", "youtube_recon",
 )
+# Platforms a mode='share' draft can be posted to. The posting tick's share
+# branch (tick_process_approved_drafts) submits a link post to the subreddit
+# named in the row's target_url and knows no other destination, so a share
+# draft for any other platform would be approved and then aborted.
+_SHARE_PLATFORMS = ("reddit",)
+
+# A share_target is "r/SideProject", "/r/SideProject", "SideProject", or a
+# reddit.com/r/SideProject URL.
+_SUBREDDIT_SHORT_RE = re.compile(r"^/?(?:r/)?(?P<name>[A-Za-z0-9_]{2,21})/?$", re.IGNORECASE)
+_SUBREDDIT_URL_RE = re.compile(
+    r"^https?://(?:[a-z]+\.)?reddit\.com/r/(?P<name>[A-Za-z0-9_]{2,21})(?:[/?#].*)?$",
+    re.IGNORECASE,
+)
+
+
+def _subreddit_name(share_target: str) -> Optional[str]:
+    """The subreddit a share_target names, or None if it names none."""
+    target = (share_target or "").strip()
+    match = _SUBREDDIT_SHORT_RE.match(target) or _SUBREDDIT_URL_RE.match(target)
+    return match.group("name") if match else None
+
+
+def _share_title(draft_text: str) -> str:
+    """The title the posting tick will submit for a share row's draft_text.
+
+    Mirrors the share branch of tick_process_approved_drafts: a JSON draft
+    carries "title"; anything else is used whole.
+    """
+    try:
+        payload = json.loads(draft_text or "{}")
+    except json.JSONDecodeError:
+        return (draft_text or "").strip()
+    if not isinstance(payload, dict):
+        return (draft_text or "").strip()
+    return (payload.get("title") or "").strip()
 
 
 def _row_summary(row) -> Dict[str, Any]:
@@ -170,8 +207,9 @@ class OutreachDraftPostTool(BaseTool):
         "Platforms: reddit, discord, facebook, twitter, youtube. "
         "For mode='comment' you must supply either thread_context (the OP/comment/video "
         "description) or target_url (we'll scout it — for YouTube URLs, scrapes the video "
-        "title + description). For mode='share' supply share_target (e.g. 'r/SideProject') "
-        "and optionally share_link (defaults to guaardvark.com). "
+        "title + description). mode='share' drafts a Reddit link post: platform must be "
+        "reddit, share_target is the subreddit (e.g. 'r/SideProject') and share_link is "
+        "optional (defaults to guaardvark.com). "
         "The draft lands in the queue at status='drafted' for human approval — nothing "
         "posts until the user approves it in the OutreachPage UI."
     )
@@ -190,11 +228,14 @@ class OutreachDraftPostTool(BaseTool):
         ),
         "target_url": ToolParameter(
             name="target_url", type="string", required=False,
-            description="URL of the thread; if thread_context is missing we scout it",
+            description=(
+                "Comment mode: URL of the thread; if thread_context is missing we scout it. "
+                "Ignored in share mode, where the destination is share_target."
+            ),
         ),
         "share_target": ToolParameter(
             name="share_target", type="string", required=False,
-            description="Where the share post goes, e.g. 'r/SideProject' (share mode)",
+            description="Share mode: the subreddit the link post goes to, e.g. 'r/SideProject'",
         ),
         "share_link": ToolParameter(
             name="share_link", type="string", required=False,
@@ -234,14 +275,37 @@ class OutreachDraftPostTool(BaseTool):
 
         # Build context dict for persona.draft_outreach_text
         if mode == "share":
+            if platform not in _SHARE_PLATFORMS:
+                return ToolResult(
+                    success=False,
+                    error=(
+                        f"mode='share' can only be posted on {', '.join(_SHARE_PLATFORMS)} "
+                        f"(a link post to a subreddit). For {platform}, draft a comment on a "
+                        "thread with mode='comment'."
+                    ),
+                )
             share_target = (kwargs.get("share_target") or "").strip()
             if not share_target:
                 return ToolResult(
                     success=False,
                     error="share mode requires share_target (e.g. 'r/SideProject')",
                 )
+            subreddit = _subreddit_name(share_target)
+            if not subreddit:
+                return ToolResult(
+                    success=False,
+                    error=(
+                        f"share_target '{share_target}' is not a subreddit. "
+                        "Use the form 'r/SideProject'."
+                    ),
+                )
+            # The posting tick reads the subreddit from the row's target_url,
+            # so a share row points at the subreddit, whatever target_url the
+            # caller sent.
+            from backend.services.social_outreach.reddit_outreach import REDDIT_BASE
+            target_url = f"{REDDIT_BASE}/r/{subreddit}"
             context = {
-                "target": share_target,
+                "target": f"r/{subreddit}",
                 "link_url": (kwargs.get("share_link") or persona.SITE_URL),
             }
         else:
@@ -312,6 +376,17 @@ class OutreachDraftPostTool(BaseTool):
         grade = float(result.get("grade") or 0.0)
         reason = result.get("reason") or ""
 
+        if mode == "share" and not _share_title(draft_text):
+            return ToolResult(
+                success=False,
+                error=(
+                    "The persona returned a share draft with no title. A Reddit link post "
+                    "needs one, so nothing was queued."
+                ),
+                output={"platform": platform, "mode": mode, "draft": draft_text,
+                        "grade": grade, "reason": reason},
+            )
+
         if is_mcp_transport(self):
             return self._queue_via_backend(
                 platform, mode, target_url, target_thread_id, draft_text, grade, reason,
@@ -337,6 +412,7 @@ class OutreachDraftPostTool(BaseTool):
                 "audit_id": audit_id,
                 "platform": platform,
                 "mode": mode,
+                "target_url": target_url,
                 "draft": draft_text,
                 "grade": grade,
                 "reason": reason,
@@ -353,6 +429,7 @@ class OutreachDraftPostTool(BaseTool):
         draft = {
             "platform": platform,
             "mode": mode,
+            "target_url": target_url,
             "draft": draft_text,
             "grade": grade,
             "reason": reason,
