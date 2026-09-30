@@ -14,7 +14,7 @@ anthropic>=1.7.0
 python-dotenv==1.2.3
 
 # Background Tasks & Caching
-celery==5.4.0
+celery==5.6.3
 redis==5.0.4
 eventlet==0.41.2
 
