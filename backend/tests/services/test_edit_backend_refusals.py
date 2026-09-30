@@ -7,8 +7,6 @@ renderers are stand-ins: no GPU, network or database.
 """
 from __future__ import annotations
 
-import contextlib
-
 import pytest
 
 from backend import config
