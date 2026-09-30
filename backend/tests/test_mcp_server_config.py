@@ -6,6 +6,7 @@ arguments and waits of a call."""
 import asyncio
 import json
 import logging
+import time
 from pathlib import Path
 
 import mcp.types as mcp_types
@@ -206,12 +207,12 @@ class _Echo(BaseTool):
         return ToolResult(success=True, output="ok")
 
 
-def _call(monkeypatch, tool, arguments):
+def _call(monkeypatch, tool, arguments, config=None):
     published = mcp_types.Tool(
         name=tool.name, description=tool.description,
         input_schema=tools_adapter._tool_input_schema(tool), annotations=tools_adapter._annotations(tool))
     monkeypatch.setattr(tools_adapter, "collect_exposed_tools", lambda _cfg: [(tool, published)])
-    _on_list, on_call, _count = tools_adapter.build_tool_handlers(MCPConfig())
+    _on_list, on_call, _count = tools_adapter.build_tool_handlers(config or MCPConfig())
     return asyncio.run(on_call(None, mcp_types.CallToolRequestParams(name=tool.name, arguments=arguments)))
 
 
@@ -231,3 +232,52 @@ def test_an_underscore_key_the_tool_publishes_is_kept():
     dropped = tools_adapter._drop_internal_arguments(arguments, {"properties": {"_mode": {"type": "string"}}})
 
     assert dropped == ["_agent_context"] and arguments == {"_mode": "a"}
+
+
+# ---- a waiting call outlasts the tool's own wait ----------------------------------------------
+class _Waits(BaseTool):
+    """Like generate_video: work first, then its own bounded wait, then the
+    answer that carries the batch id."""
+    name, description, read_only = "waits", "waits for a render", False
+    parameters = {"wait_for_result": ToolParameter(name="wait_for_result", type="bool", required=False)}
+    MAX_WAIT_S = 0.2
+    BEFORE_THE_WAIT_S = 0.15
+
+    def execute(self, **_kwargs):
+        time.sleep(self.BEFORE_THE_WAIT_S + self.MAX_WAIT_S)
+        return ToolResult(success=True, output="still running (batch b-123)")
+
+
+def test_the_wait_ceiling_stays_above_a_tools_own_wait():
+    cfg = MCPConfig()
+    waiting = {"wait_for_result": True}
+
+    class Long(BaseTool):
+        name, description, MAX_WAIT_S = "long", "waits long", 5000
+
+    assert tools_adapter._call_timeout(cfg, waiting, Long()) == 5000 + mcp_config.WAIT_HEADROOM_SECONDS
+    assert tools_adapter._call_timeout(cfg, waiting, _Waits()) == mcp_config.WAIT_TIMEOUT_SECONDS
+    assert tools_adapter._call_timeout(cfg, waiting) == mcp_config.WAIT_TIMEOUT_SECONDS
+    assert tools_adapter._call_timeout(cfg, {}, Long()) == cfg.timeout_seconds
+
+
+def test_generate_video_and_generate_image_answer_before_the_adapter_does():
+    from backend.tools.image_tools import ImageGeneratorTool, VideoGeneratorTool
+    from backend.utils import backend_http
+
+    cfg = MCPConfig()
+    waiting = {"wait_for_result": True}
+    # generate_video forwards to the backend with its wait plus 60 s as the read timeout.
+    assert tools_adapter._call_timeout(cfg, waiting, VideoGeneratorTool) > VideoGeneratorTool.MAX_WAIT_S + 60
+    assert (tools_adapter._call_timeout(cfg, waiting, ImageGeneratorTool)
+            > ImageGeneratorTool.MAX_WAIT_S + backend_http.DEFAULT_READ_TIMEOUT)
+
+
+def test_a_tools_own_still_running_answer_reaches_the_client(monkeypatch):
+    # Scaled down: the tool's wait equals the wait ceiling, as generate_video's does.
+    monkeypatch.setattr(tools_adapter, "WAIT_TIMEOUT_SECONDS", _Waits.MAX_WAIT_S)
+    monkeypatch.setattr(tools_adapter, "WAIT_HEADROOM_SECONDS", 1.0)
+
+    result = _call(monkeypatch, _Waits(), {"wait_for_result": True}, MCPConfig(timeout_seconds=0.05))
+
+    assert not result.is_error and "b-123" in result.content[0].text

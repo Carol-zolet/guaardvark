@@ -120,12 +120,25 @@ class MCPConfig:
     # an error that says so. Generation tools queue by default (see
     # ``ToolPolicy.argument_defaults``), so this only has to cover synchronous
     # work such as file processing and retrieval. A call whose arguments carry
-    # ``wait_for_result=true`` is allowed ``WAIT_TIMEOUT_SECONDS`` instead.
+    # ``wait_for_result=true`` gets the longer ceiling ``tools_adapter._call_timeout``
+    # works out from the two constants below.
     timeout_seconds: int = 120
 
 
-# Ceiling for calls that asked to wait for a render (``wait_for_result=true``).
+# Ceiling for calls that asked to wait for a render (``wait_for_result=true``),
+# unless the tool's own wait plus ``WAIT_HEADROOM_SECONDS`` is longer.
 WAIT_TIMEOUT_SECONDS = 30 * 60
+
+# What the tools adapter allows on top of a tool's own wait (the tool's
+# ``MAX_WAIT_S``). A tool that waits answers for itself when its wait runs out
+# ("still running (batch X)"), and that answer carries the id the client polls
+# with. The tool's clock starts later than the adapter's: the hop to the
+# backend, model preflight and queueing come first, and generate_video forwards
+# with its wait plus 60 s as the HTTP read timeout. Without a margin the
+# adapter's timeout fires first and the id is lost. 120 s covers that 60 s and
+# the same again for the connection and the last poll; it is derived from the
+# code path, not from a timed render.
+WAIT_HEADROOM_SECONDS = 120
 
 
 def _merge(base: dict, override: dict) -> dict:

@@ -28,7 +28,13 @@ from jsonschema import Draft202012Validator
 from jsonschema.exceptions import best_match
 
 from backend.mcp.audit import audit_call
-from backend.mcp.config import SERVER_TIMEOUT_ENV, WAIT_TIMEOUT_SECONDS, MCPConfig, tool_is_exposed
+from backend.mcp.config import (
+    SERVER_TIMEOUT_ENV,
+    WAIT_HEADROOM_SECONDS,
+    WAIT_TIMEOUT_SECONDS,
+    MCPConfig,
+    tool_is_exposed,
+)
 from backend.services.agent_tools import BaseTool, get_tool_registry
 from backend.services.tool_execution_guard import ToolExecutionGuard
 
@@ -197,16 +203,25 @@ def _content_blocks_from_result(result: Any) -> list[mcp_types.ContentBlock]:
     return [mcp_types.TextContent(type="text", text=str(result))]
 
 
-def _call_timeout(config: MCPConfig, arguments: dict[str, Any]) -> float:
+def _call_timeout(config: MCPConfig, arguments: dict[str, Any], tool: Any = None) -> float:
     """The per-call ceiling: the configured timeout, or the wait ceiling when
     the caller asked a generation tool to block until the render finishes.
+
+    This is the one place that decides how long a waiting call may take. A
+    tool that gives up on its own declares how long it waits as ``MAX_WAIT_S``
+    next to its definition, and the ceiling stays ``WAIT_HEADROOM_SECONDS``
+    above that, so the tool's "still running (batch X)" answer reaches the
+    client instead of this adapter's timeout.
 
     Tools that run as tool jobs (backend/services/tool_jobs.py) wait at most
     half the configured timeout even with wait_for_result, so this ceiling
     never cuts them off first."""
     wait = arguments.get("wait_for_result")
     if str(wait).lower() in ("1", "true", "yes"):
-        return float(max(config.timeout_seconds, WAIT_TIMEOUT_SECONDS))
+        own_wait = getattr(tool, "MAX_WAIT_S", None)
+        if isinstance(own_wait, bool) or not isinstance(own_wait, (int, float)):
+            own_wait = 0
+        return float(max(config.timeout_seconds, WAIT_TIMEOUT_SECONDS, own_wait + WAIT_HEADROOM_SECONDS))
     return float(config.timeout_seconds)
 
 
@@ -445,7 +460,7 @@ def build_tool_handlers(config: MCPConfig) -> tuple[Any, Any, int]:
 
             state = _state_for(ctx)
             keyed_state = _state_for(ctx, per_connection=True)
-            timeout = _call_timeout(config, arguments)
+            timeout = _call_timeout(config, arguments, base_tool)
             args_hash = ToolExecutionGuard._hash_call(name, arguments)
 
             if key is not None:
