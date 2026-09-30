@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 import ipaddress
 import os
 import socket
@@ -108,6 +109,46 @@ def is_public_address(address: str) -> bool:
     )
 
 
+@functools.lru_cache(maxsize=None)
+def _no_netrc_session_class():
+    import requests
+    from requests.auth import AuthBase
+
+    class _NoAuth(AuthBase):
+        def __call__(self, r):
+            return r
+
+    class NoNetrcSession(requests.Session):
+        def __init__(self):
+            super().__init__()
+            # A session-level auth stops prepare_request from looking up .netrc.
+            self.auth = _NoAuth()
+
+        def rebuild_auth(self, prepared_request, response):
+            # requests' own version also reads .netrc for every redirect target,
+            # whatever auth was set; keep only its removal of the Authorization
+            # header when a redirect leaves the original host.
+            headers = prepared_request.headers
+            if "Authorization" in headers and self.should_strip_auth(
+                response.request.url, prepared_request.url
+            ):
+                del headers["Authorization"]
+
+    return NoNetrcSession
+
+
+def no_netrc_session():
+    """A requests Session that never sends logins from ~/.netrc (or $NETRC).
+
+    requests reads .netrc on every request and every redirect hop, and a
+    ``default`` entry there matches any host, so a fetch of a URL someone else
+    chose would carry the user's saved login to it. Proxy settings and CA
+    bundles from the environment still apply; an auth passed to a request
+    explicitly is still sent.
+    """
+    return _no_netrc_session_class()()
+
+
 def public_only_session():
     """A requests Session that connects only to globally routable addresses.
 
@@ -171,7 +212,7 @@ def public_only_session():
             raise requests.exceptions.ProxyError(
                 "public-only fetches do not go through a proxy")
 
-    session = requests.Session()
+    session = no_netrc_session()
     # trust_env=False also turns off requests' own reading of REQUESTS_CA_BUNDLE
     # and CURL_CA_BUNDLE, so that part is restored here.
     session.trust_env = False

@@ -2,6 +2,8 @@
 whole query asks for that; everything else reaches the search engine. A URL in
 the query is fetched as written."""
 
+from datetime import datetime
+
 import pytest
 
 from backend.api import web_search_api
@@ -89,6 +91,12 @@ def test_a_long_query_is_always_searched(routes):
     query = "weather in " + "x" * 300
     assert web_search_api.enhanced_web_search(query)["strategy_used"] == "duckduckgo_search"
     assert routes["weather"] == []
+
+
+def test_the_clock_names_its_zone(routes):
+    info = web_search_api.enhanced_web_search("what time is it")["data"]["time_info"]
+    assert datetime.fromisoformat(info["timestamp"]).tzinfo is not None
+    assert "  on " not in info["local_time"]
 
 
 def test_the_weather_shortcut_is_given_the_place_only(routes):

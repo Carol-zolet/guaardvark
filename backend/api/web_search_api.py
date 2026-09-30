@@ -24,7 +24,8 @@ def extract_website_content(url: str, query: Optional[str] = None, public_only: 
     """Fetch a page and return its title, description and up to 2,000 characters of its text.
 
     ``public_only`` refuses any address that is not globally routable, on every
-    redirect hop (the fetch_url and analyze_website tools ask for it).
+    redirect hop (the fetch_url and analyze_website tools ask for it). Logins
+    saved in ~/.netrc are never sent, with or without it.
 
     With ``query`` the text is the stretch of the page about the query
     (:func:`backend.utils.text_focus.focus_window`); without it, the head of the page.
@@ -75,7 +76,9 @@ def extract_website_content(url: str, query: Optional[str] = None, public_only: 
                 else:
                     return {"success": False, "url": url, "error": f"Too many redirects (more than {MAX_REDIRECTS})"}
         else:
-            response = requests.get(url, headers=headers, timeout=15, allow_redirects=True)
+            from backend.utils.hosts import no_netrc_session
+            with no_netrc_session() as session:
+                response = session.get(url, headers=headers, timeout=15, allow_redirects=True)
             current = response.url
         response.raise_for_status()
         
@@ -399,7 +402,8 @@ def handle_special_queries(query: str) -> Dict[str, Any]:
             from datetime import datetime
             import pytz
             
-            current_time = datetime.now()
+            # Aware local time, so %Z names the zone.
+            current_time = datetime.now().astimezone()
             utc_time = datetime.now(pytz.UTC)
             
             time_info = {
