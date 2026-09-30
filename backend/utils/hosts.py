@@ -57,6 +57,8 @@ def private_address_reason(url: str | None) -> str | None:
     that resolves to any address that is not globally routable: loopback,
     private and CGNAT/Tailscale ranges, link-local, site-local, multicast,
     reserved. So a fetch tool cannot be pointed at this machine or its networks.
+    An internationalized name is compared and looked up in its encoded
+    ("xn--") form, the one the request is sent to.
     """
     if "\\" in (url or ""):
         return "URLs containing a backslash are refused"
@@ -74,10 +76,17 @@ def private_address_reason(url: str | None) -> str | None:
         sent_to = (parse_url(url).host or "").strip("[]").lower()
     except Exception:
         return "the URL could not be parsed"
-    if sent_to != host.lower():
-        return "the URL's host is ambiguous"
     try:
-        infos = socket.getaddrinfo(host, None)
+        expected = _wire_host(host)
+    except (UnicodeError, ImportError):
+        return "the URL's host is not a valid internationalized domain name"
+    if sent_to != expected:
+        return "the URL's host is ambiguous"
+    # The lookup uses the name the connection will use. Python's own codec
+    # would turn a Unicode name into a different one for some letters
+    # (IDNA 2003 reads "straße" as "strasse").
+    try:
+        infos = socket.getaddrinfo(sent_to, None)
     except (socket.gaierror, UnicodeError) as e:
         return f"could not resolve {host}: {e}"
     for info in infos:
@@ -86,13 +95,31 @@ def private_address_reason(url: str | None) -> str | None:
     return None
 
 
-_NAT64 = (ipaddress.ip_network("64:ff9b::/96"), ipaddress.ip_network("64:ff9b:1::/48"))
-_IPV4_COMPATIBLE = ipaddress.ip_network("::/96")
+def _wire_host(host: str) -> str:
+    """``host`` as requests puts it on the wire: lower-cased, each non-ASCII
+    label IDNA-encoded ("münchen.de" -> "xn--mnchen-3ya.de") with the rules
+    urllib3 applies, so the two can be compared. Raises UnicodeError for a
+    label that has no such form."""
+    host = host.lower()
+    if host.isascii():
+        return host
+    import idna
+    return ".".join(
+        label if label.isascii() else idna.encode(label, strict=True, std3_rules=True).decode("ascii")
+        for label in host.split(".")
+    )
+
+
+# IPv6 ranges whose last 32 bits are an IPv4 address: IPv4-compatible,
+# IPv4-translated (SIIT, ::ffff:0:a.b.c.d) and NAT64.
+_IPV4_IN_LOW_BITS = tuple(ipaddress.ip_network(net) for net in (
+    "::/96", "::ffff:0:0:0/96", "64:ff9b::/96", "64:ff9b:1::/48",
+))
 
 
 def is_public_address(address: str) -> bool:
     """True when ``address`` is globally routable, including the IPv4 address an
-    IPv6 form carries (mapped, IPv4-compatible, NAT64, 6to4, Teredo)."""
+    IPv6 form carries (mapped, translated, IPv4-compatible, NAT64, 6to4, Teredo)."""
     try:
         ip = ipaddress.ip_address(str(address).split("%")[0])
     except ValueError:
@@ -100,7 +127,7 @@ def is_public_address(address: str) -> bool:
     candidates = [ip]
     if ip.version == 6:
         embedded = [ip.ipv4_mapped, ip.sixtofour, ip.teredo[1] if ip.teredo else None]
-        if ip in _IPV4_COMPATIBLE or any(ip in net for net in _NAT64):
+        if any(ip in net for net in _IPV4_IN_LOW_BITS):
             embedded.append(ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF))
         candidates += [e for e in embedded if e is not None]
     return all(

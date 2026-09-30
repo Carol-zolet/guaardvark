@@ -348,6 +348,7 @@ jobs:
             backend/tests/services/test_video_model_preflight.py \
             backend/tests/services/test_job_service_start.py \
             backend/tests/services/test_model_capabilities.py \
+            backend/tests/unit/test_url_guard_idn_and_ipv4_forms.py \
             backend/tests/utils/test_inline_reasoning.py \
             backend/tests/test_thinking_channel.py \
             backend/tests/test_mcp_chat_approval_e2e.py \
