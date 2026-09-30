@@ -10,9 +10,11 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import subprocess
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from urllib.parse import quote
 
 from backend.services.agent_tools import BaseTool, ToolParameter, ToolResult
 from backend.utils.backend_http import BackendError, is_mcp_transport, request_json
@@ -23,6 +25,11 @@ _SWARM_OFFLINE_ERROR = (
     "Swarm plugin is not running (port 8210). Start it from /plugins or say so — "
     "do not pretend a swarm launched."
 )
+
+# Swarm ids look like "swarm-20260930-120000-a1b2c3" (generate_swarm_id in
+# plugins/swarm/service/models.py). The id becomes a URL path segment, so
+# anything else, such as "../../gpu/status", is refused rather than sent.
+_SWARM_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 _LOG_ALLOWLIST = frozenset({
     "backend.log",
@@ -389,12 +396,22 @@ class SwarmStatusTool(BaseTool):
     parameters = {
         "swarm_id": ToolParameter(
             name="swarm_id", type="string", required=False, default="",
-            description="Optional swarm id for a single swarm.",
+            description="Optional id of one swarm, as the launch returned it, e.g. 'swarm-20260930-120000-a1b2c3' (letters, digits, '-' and '_' only).",
         ),
     }
 
     def execute(self, **kwargs) -> ToolResult:
         swarm_id = (kwargs.get("swarm_id") or "").strip()
+        if swarm_id and not _SWARM_ID_RE.match(swarm_id):
+            return ToolResult(
+                success=False,
+                error=(
+                    "swarm_id must be a swarm id such as 'swarm-20260930-120000-a1b2c3': "
+                    "letters, digits, '-' and '_', at most 64 characters. Leave it empty "
+                    "to list every swarm."
+                ),
+            )
+        swarm_id = quote(swarm_id, safe="")
         if is_mcp_transport(self):
             return self._status_via_backend(swarm_id)
 
@@ -483,19 +500,20 @@ class SelfImprovementStatusTool(BaseTool):
     description = (
         "Report whether self-improvement can run (codebase lock, enabled flag, "
         "already running) plus recent runs and PendingFix rows. Use when the user "
-        "asks if SI is on, why a fix didn't apply, or what pending fixes exist."
+        "asks if SI is on, why a fix didn't apply, or what pending fixes exist. "
+        "Over MCP every part comes from the running Guaardvark backend; when it is "
+        "not answering, the call fails and says so."
     )
     parameters: Dict[str, ToolParameter] = {}
 
     def execute(self, **kwargs) -> ToolResult:
+        if is_mcp_transport(self):
+            return self._status_via_backend()
         try:
             from backend.services.self_improvement_service import get_self_improvement_service
             svc = get_self_improvement_service()
             pre = svc.dispatch_precheck()
             payload: Dict[str, Any] = {"precheck": pre, "runs": [], "pending_fixes": []}
-            if is_mcp_transport(self):
-                payload.update(self._history_via_backend())
-                return ToolResult(success=True, output=payload)
             try:
                 from backend.models import PendingFix, SelfImprovementRun, db
                 runs = (
@@ -534,6 +552,28 @@ class SelfImprovementStatusTool(BaseTool):
         except Exception as e:
             logger.exception("self_improvement_status failed")
             return ToolResult(success=False, error=str(e))
+
+    def _status_via_backend(self) -> ToolResult:
+        """The whole answer from the backend.
+
+        The precheck reads the database and the running service's state, and
+        this process has neither: computed here it could only ever say
+        "disabled". A backend that is not answering is reported as that.
+        """
+        try:
+            pre = request_json("GET", "/api/self-improvement/precheck").data
+        except BackendError as e:
+            if e.kind in ("unreachable", "timeout", "auth"):
+                return ToolResult(success=False, error=str(e), metadata={"backend_error": e.kind})
+            pre = {
+                "ok": None,
+                "reason": f"The backend did not report whether self-improvement can run: {e}",
+            }
+        if not isinstance(pre, dict) or "ok" not in pre:
+            pre = {"ok": None, "reason": "The backend's precheck answer had no 'ok' field."}
+        payload: Dict[str, Any] = {"precheck": pre, "runs": [], "pending_fixes": []}
+        payload.update(self._history_via_backend())
+        return ToolResult(success=True, output=payload)
 
     @staticmethod
     def _history_via_backend() -> Dict[str, Any]:
