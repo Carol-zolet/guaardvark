@@ -69,6 +69,16 @@ def _query(sql: str, params: tuple) -> Tuple[Optional[List[tuple]], Optional[str
         return None, str(e)[:200]
 
 
+# The outline's label for passages that carry neither a heading nor a page, and
+# the heading_path value read_document_section accepts for exactly those rows.
+NO_SECTION = "(no section)"
+
+
+def _section_label(heading: Optional[str], page: Optional[str]) -> str:
+    """How the outline names a passage's place; read_document_section accepts it back."""
+    return heading or (f"page {page}" if page else NO_SECTION)
+
+
 def _meta(raw) -> Dict[str, Any]:
     if isinstance(raw, dict):
         return raw
@@ -181,8 +191,10 @@ class DocumentOutlineTool(BaseTool):
         "Show the structure of one indexed document: its sections (heading paths such as 'Setup > "
         "Install') and pages in the order they appear, each with a passage count, under a header with "
         "the document's total. Use it after list_documents and before read_document_section, which "
-        "takes a heading path or page label from this outline. An unknown filename returns a short "
-        "notice, not an error. To find a topic across documents use search_knowledge_base."
+        "takes a heading path, a page label or '(no section)' exactly as this outline prints them "
+        "('(no section)' covers passages with neither a heading nor a page, as in a plain .txt file). "
+        "An unknown filename returns a short notice, not an error. To find a topic across documents "
+        "use search_knowledge_base."
     )
     parameters = {
         "source_filename": ToolParameter(
@@ -216,7 +228,7 @@ class DocumentOutlineTool(BaseTool):
 
         lines = [f"OUTLINE — {source_filename} ({sum(r[2] for r in rows)} passages)"]
         for heading, page, count in rows:
-            label = heading or (f"page {page}" if page else "(no section)")
+            label = _section_label(heading, page)
             loc = f" p.{page}" if page and heading else ""
             lines.append(f"  {label}{loc} — {count} passage(s)")
         return ToolResult(success=True, output="\n".join(lines),
@@ -229,14 +241,16 @@ class ReadDocumentSectionTool(BaseTool):
     name = "read_document_section"
     read_only = True
     description = (
-        "Read the stored text of one section or page of an indexed document, without searching, in "
-        "document order. Pass source_filename plus heading_path or page_label from "
-        "get_document_outline; at least one is required, and giving both narrows to that section on "
-        "that page. heading_path matches every section whose path contains the text "
-        "(case-insensitive), so a short value can return several sections. Returns up to 25 passages "
-        "per call, each cut at 1,200 characters and labelled with its section or page; the header "
-        "gives the total and the offset for the next call. To locate a topic first use "
-        "search_knowledge_base; for a file that is not indexed, process_file."
+        "Read the stored text of an indexed document, without searching, in document order. Pass "
+        "source_filename plus heading_path or page_label from get_document_outline to read one "
+        "section or page; giving both narrows to that section on that page. heading_path "
+        "'(no section)' reads the passages the outline lists under that label (no heading and no "
+        "page, e.g. a plain .txt file); any other heading_path matches every section whose path "
+        "contains the text (case-insensitive), so a short value can return several sections. With "
+        "neither, it reads the whole document from the start. Returns up to 25 passages per call, "
+        "each cut at 1,200 characters and labelled with its section or page as the outline names "
+        "it; the header gives the total and the offset for the next call. To locate a topic first "
+        "use search_knowledge_base; for a file that is not indexed, process_file."
     )
     parameters = {
         "source_filename": ToolParameter(
@@ -245,11 +259,11 @@ class ReadDocumentSectionTool(BaseTool):
         ),
         "heading_path": ToolParameter(
             name="heading_path", type="string", required=False,
-            description="Section path as get_document_outline shows it, e.g. 'Installation > Requirements'; any section whose path contains this text matches. Required unless page_label is given.",
+            description="Section path as get_document_outline shows it, e.g. 'Installation > Requirements'; any section whose path contains this text matches. '(no section)' reads the passages that have neither a heading nor a page. Leave out together with page_label to read the whole document.",
         ),
         "page_label": ToolParameter(
             name="page_label", type="string", required=False,
-            description="Page label as get_document_outline shows it, e.g. '12' (exact match). Required unless heading_path is given.",
+            description="Page label as get_document_outline shows it, e.g. '12' for the line 'page 12' (exact match).",
         ),
         "offset": ToolParameter(
             name="offset", type="int", required=False, default=0, minimum=0,
@@ -262,18 +276,24 @@ class ReadDocumentSectionTool(BaseTool):
         table, err = _table()
         if err:
             return ToolResult(success=False, error=err)
-        if not heading_path and not page_label:
-            return ToolResult(success=False,
-                              error="Provide heading_path or page_label (see get_document_outline).")
+        heading_path = (heading_path or "").strip()
+        page_label = str(page_label).strip() if page_label is not None else ""
+        no_section = heading_path.lower() == NO_SECTION
 
         clauses = ["metadata_->>'source_filename' = %s"]
         params: List[Any] = [source_filename]
-        if heading_path:
+        if no_section:
+            # The outline's '(no section)' group: ILIKE never matches a NULL
+            # heading, so these rows are selected by their missing metadata.
+            clauses.append("coalesce(metadata_->>'heading_path', '') = ''")
+            if not page_label:
+                clauses.append("coalesce(metadata_->>'page_label', '') = ''")
+        elif heading_path:
             clauses.append("metadata_->>'heading_path' ILIKE %s")
             params.append(f"%{heading_path}%")
         if page_label:
             clauses.append("metadata_->>'page_label' = %s")
-            params.append(str(page_label))
+            params.append(page_label)
 
         offset = max(0, int(offset or 0))
         where = " AND ".join(clauses)
@@ -288,13 +308,22 @@ class ReadDocumentSectionTool(BaseTool):
         if not rows:
             if offset and total:
                 return ToolResult(success=True, output=f"No passages at offset {offset}; {total} match in all.")
+            if not heading_path and not page_label:
+                return ToolResult(
+                    success=True,
+                    output=f"No indexed content for '{source_filename}'. Use list_documents to see available names.",
+                )
             return ToolResult(success=True, output="No passages match that section or page.")
 
         head = f"{source_filename}"
-        if heading_path:
+        if no_section:
+            head += f" · {NO_SECTION}"
+        elif heading_path:
             head += f" · section ~ {heading_path}"
         if page_label:
             head += f" · page {page_label}"
+        if not heading_path and not page_label:
+            head += " · whole document"
         span = f"passages {offset + 1}-{offset + len(rows)}" + (f" of {total}" if total is not None else "")
         lines = [f"{head} — {span}"]
         if total is not None and offset + len(rows) < total:
@@ -305,7 +334,8 @@ class ReadDocumentSectionTool(BaseTool):
             body = (m.get("original_text") or text or "").strip()
             if len(body) > _MAX_TEXT:
                 body = body[:_MAX_TEXT].rstrip() + "…"
-            lines.append(f"\n[{i}] {m.get('heading_path') or m.get('page_label') or ''}\n{body}")
+            label = _section_label(m.get("heading_path"), m.get("page_label"))
+            lines.append(f"\n[{i}] {label}\n{body}")
         return ToolResult(success=True, output="\n".join(lines), metadata={"passages": len(rows)})
 
 
