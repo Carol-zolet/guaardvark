@@ -25,7 +25,7 @@ class _Clock:
 
 
 @pytest.fixture
-def backend(monkeypatch):
+def fake_backend(monkeypatch):
     """Answers per (method, path); a list is served one item per call."""
     from backend.utils import backend_http
 
@@ -56,8 +56,8 @@ DONE = {"id": JOB, "intent": "voice", "status": "done", "progress": {"current": 
                    "meta": {"backend": "kokoro", "voice": "bm_george"}}}
 
 
-def test_every_call_asks_for_a_job(backend):
-    answers, calls = backend
+def test_every_call_asks_for_a_job(fake_backend):
+    answers, calls = fake_backend
     answers[SUBMIT] = {"mode": "async", "job_id": JOB, "status": "queued", "estimate_s": 0.4}
     answers[POLL] = DONE
     res = GenerateSpeechTool().execute(text="Hello there.", voice="bm_george")
@@ -71,8 +71,8 @@ def test_every_call_asks_for_a_job(backend):
     assert "/srv/x" not in str(out)
 
 
-def test_a_long_read_answers_with_the_job_id_to_poll(backend):
-    answers, calls = backend
+def test_a_long_read_answers_with_the_job_id_to_poll(fake_backend):
+    answers, calls = fake_backend
     answers[SUBMIT] = {"mode": "async", "job_id": JOB, "status": "queued", "estimate_s": 98.0}
     answers[POLL] = {"id": JOB, "intent": "voice", "status": "running",
                      "progress": {"current": 4, "total": 14, "stage": "synthesizing"}}
@@ -86,8 +86,8 @@ def test_a_long_read_answers_with_the_job_id_to_poll(backend):
     assert len(polls) == int(60 / audio_tools.SPEECH_POLL_S)
 
 
-def test_a_failed_job_is_reported_with_its_reason(backend):
-    answers, _ = backend
+def test_a_failed_job_is_reported_with_its_reason(fake_backend):
+    answers, _ = fake_backend
     answers[SUBMIT] = {"job_id": JOB, "status": "queued"}
     answers[POLL] = [{"status": "running"},
                      {"status": "error", "error": "WeightsNotInstalled: Kokoro voice 'bm_george' is not on this machine."}]
@@ -96,18 +96,18 @@ def test_a_failed_job_is_reported_with_its_reason(backend):
     assert JOB in res.error and "not on this machine" in res.error
 
 
-def test_a_lost_poll_still_hands_back_the_job(backend):
+def test_a_lost_poll_still_hands_back_the_job(fake_backend):
     from backend.utils.backend_http import BackendError
 
-    answers, _ = backend
+    answers, _ = fake_backend
     answers[SUBMIT] = {"job_id": JOB, "status": "queued"}
     answers[POLL] = BackendError("timeout", "The Guaardvark backend did not answer")
     res = GenerateSpeechTool().execute(text="Hi.")
     assert res.success and res.output["job_id"] == JOB and res.output["status"] == "queued"
 
 
-def test_an_inline_answer_from_an_older_plugin_still_completes(backend):
-    answers, calls = backend
+def test_an_inline_answer_from_an_older_plugin_still_completes(fake_backend):
+    answers, calls = fake_backend
     answers[SUBMIT] = DONE["result"]
     res = GenerateSpeechTool().execute(text="Hi.")
     assert res.success and res.output["status"] == "complete" and res.output["document_id"] == 41
