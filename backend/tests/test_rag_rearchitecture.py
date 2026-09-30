@@ -119,6 +119,29 @@ def test_mmr_falls_back_to_retrieval_score_without_rerank():
 
 
 # --------------------------------------------------------------------------
+# Dedup removes copies, not related passages
+# --------------------------------------------------------------------------
+def test_dedup_threshold_uses_the_measured_entry(monkeypatch):
+    monkeypatch.delenv("GUAARDVARK_CHUNK_SIMILARITY_THRESHOLD", raising=False)
+    from backend.config import CHUNK_SIMILARITY_THRESHOLD, get_dedup_threshold
+
+    assert get_dedup_threshold("nomic-embed-text:latest") == 0.96
+    assert get_dedup_threshold("embeddinggemma:latest") == 0.92
+    assert get_dedup_threshold("qwen3-embedding:4b-q4_K_M") == 0.92
+    # An unmeasured size or family gets the fallback, not a neighbour's value.
+    assert get_dedup_threshold("qwen3-embedding:8b") == CHUNK_SIMILARITY_THRESHOLD
+    assert get_dedup_threshold("bge-m3") == CHUNK_SIMILARITY_THRESHOLD
+
+
+def test_dedup_threshold_set_in_the_environment_wins(monkeypatch):
+    monkeypatch.setenv("GUAARDVARK_CHUNK_SIMILARITY_THRESHOLD", "0.9")
+    from backend.config import get_dedup_threshold
+
+    assert get_dedup_threshold("nomic-embed-text:latest") == 0.9
+    assert get_dedup_threshold("bge-m3") == 0.9
+
+
+# --------------------------------------------------------------------------
 # Contextual prefixes
 # --------------------------------------------------------------------------
 def test_document_context_prefix_names_document_and_section():

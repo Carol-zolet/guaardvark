@@ -170,20 +170,36 @@ CHUNK_SIMILARITY_THRESHOLD = float(os.environ.get("GUAARDVARK_CHUNK_SIMILARITY_T
 # Per-model dedup cosine thresholds. Cosine-similarity distributions differ by embedding
 # model, so a single global threshold mis-dedups (drops everything or nothing) when the
 # active model changes. Match on a substring of the active model name; unknown models fall
-# back to CHUNK_SIMILARITY_THRESHOLD. Calibrate new entries with the RAG eval harness —
-# do NOT guess values. The global env var still overrides everything.
+# back to CHUNK_SIMILARITY_THRESHOLD. Calibrate new entries by measurement — do NOT guess.
+#
+# Measured 2026-09-30 on the cosine deduplicate_chunks computes (text[:500], model document
+# prefix) over the fused pools of graded queries (56 on nomic, 33 on embeddinggemma, 23 on
+# qwen3; product docs, public equipment manuals, 30 Linux man pages; 3.2k-7.1k passage
+# pairs per model; a 16 GB NVIDIA card). Each value is the lowest at which <= 0.2% of
+# distinct pairs (< 50% shared word 3-grams) count as copies; 0.85 counted 3-16% of them
+# and cut nomic's candidate pool from 16.3 to 8.7.
+# Against 0.85, with the cross-encoder order kept, nDCG@5 rose 0.643 -> 0.792 (nomic),
+# 0.705 -> 0.759 (embeddinggemma), 0.835 -> 0.852 (qwen3-embedding:4b).
 CHUNK_SIMILARITY_THRESHOLDS_BY_MODEL = {
-    "nomic-embed-text": 0.85,  # historical default this constant was tuned against
+    "nomic-embed-text": 0.96,
+    "embeddinggemma": 0.92,
+    "qwen3-embedding:4b": 0.92,
 }
 
 
 def get_dedup_threshold(model_name: str) -> float:
     """Resolve the near-duplicate cosine threshold for the active embedding model.
 
-    Falls back to CHUNK_SIMILARITY_THRESHOLD for any model without a calibrated entry
-    (and logs once-uncalibrated at debug), so behavior is never worse than the legacy
-    global threshold.
+    GUAARDVARK_CHUNK_SIMILARITY_THRESHOLD, when set, wins over every per-model entry.
+    Otherwise a measured entry applies, and any other model gets
+    CHUNK_SIMILARITY_THRESHOLD.
     """
+    explicit = os.environ.get("GUAARDVARK_CHUNK_SIMILARITY_THRESHOLD", "").strip()
+    if explicit:
+        try:
+            return float(explicit)
+        except ValueError:
+            pass
     name = (model_name or "").lower()
     for key, val in CHUNK_SIMILARITY_THRESHOLDS_BY_MODEL.items():
         if key in name:
