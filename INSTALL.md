@@ -105,6 +105,8 @@ If you want to evaluate the UI/API without a native Python install:
 
 Docker runs the **core stack** (API, UI, PostgreSQL, Redis, Ollama). It does not include plugins, ComfyUI, or the virtual agent display. For the full experience, use `./start.sh`.
 
+**API key.** Under Docker the UI reaches the backend through the frontend container, so every browser, this host's included, counts as another device, and protected actions (running tools, automation, backups, file edits) need this install's API key. The first `./start-docker.sh` creates one, saves it as `GUAARDVARK_API_KEY` in `.env` next to `docker-compose.yml`, and prints it. Open the Web UI, go to **Settings → API key**, paste it and press Save; do the same in each browser you use. Later starts leave the key alone; `grep GUAARDVARK_API_KEY .env` shows it again. To change it, edit that line (or delete it and let the next start make a new one) and run `./start-docker.sh` again. Running `docker compose up` yourself skips this step, and protected actions stay refused until `GUAARDVARK_API_KEY` is set in `.env`.
+
 Stop: `docker compose down`
 
 ## Custom plugin ports
@@ -120,6 +122,7 @@ The file is gitignored and merged over the manifest at load, so the override sur
 ## Troubleshooting
 
 - Permission issues: `chmod +x *.sh`
+- **A page says to enter the API key**: protected actions (running tools, automation, backups, file edits) work without a key only on the Guaardvark machine itself. To use them from another device, create a key in **Settings → API key** on the Guaardvark machine, then paste it into **Settings → API key** on the other device. Once a key exists, every browser needs it, the Guaardvark machine's included; that machine keeps it in `.env` as `GUAARDVARK_API_KEY`.
 - **`start.sh is running as root`**: run `./start.sh` as your normal user, without `sudo`; it asks for your password itself when it installs system packages. If root is the only account on the machine (some GPU cloud hosts and containers), run `GUAARDVARK_ALLOW_ROOT=1 ./start.sh`.
 - Health diagnostics: `./start.sh --test`
 - Wrong Python venv (e.g. after upgrade): `rm -rf backend/venv && ./start.sh`
