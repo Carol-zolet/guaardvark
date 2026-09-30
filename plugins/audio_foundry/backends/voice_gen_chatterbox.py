@@ -78,7 +78,7 @@ class ChatterboxBackend(AudioBackend):
 
         from backends.hub_weights import require_hub_files
 
-        require_hub_files(
+        paths = require_hub_files(
             "ResembleAI/chatterbox",
             ["ve.safetensors", "t3_cfg.safetensors", "s3gen.safetensors",
              "tokenizer.json", "conds.pt"],
@@ -89,7 +89,11 @@ class ChatterboxBackend(AudioBackend):
         if device == "cpu":
             logger.warning("CUDA not available — Chatterbox on CPU will be slow")
 
-        self._model = ChatterboxTTS.from_pretrained(device=device)
+        # from_pretrained is hf_hub_download for these five files followed by
+        # from_local on their folder. Calling from_local on the cached
+        # snapshot keeps the load off the network. The five resolve through
+        # the same refs/main, so they share one snapshot folder.
+        self._model = ChatterboxTTS.from_local(Path(paths["ve.safetensors"]).parent, device)
         logger.info("Chatterbox loaded on %s", device)
 
     def unload(self) -> None:

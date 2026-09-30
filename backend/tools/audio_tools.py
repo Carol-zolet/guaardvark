@@ -16,8 +16,13 @@ from backend.services.agent_tools import BaseTool, ToolParameter, ToolResult
 
 logger = logging.getLogger(__name__)
 
-STUDIO_URL = "/audio-foundry"
+STUDIO_URL = "/audio"
 MAX_SPEECH_CHARS = 3000
+
+
+def _kokoro_voice_ids() -> list[str]:
+    from backend.services.audio_foundry_models import kokoro_voice_ids
+    return kokoro_voice_ids()
 
 
 def _post(path: str, payload: dict, read_timeout: float) -> tuple[Optional[dict], Optional[str]]:
@@ -140,12 +145,16 @@ class GenerateSpeechTool(BaseTool):
     read_only = False
     destructive = False
     description = (
-        "Turn text into speech on this machine with Guaardvark's Audio Foundry, using its built-in "
-        "voices (Kokoro, or Chatterbox when installed). Waits for the file, usually seconds, and "
-        "returns its name, library document id, length and a download link. Up to 3000 characters "
-        "per call; split longer scripts. Needs the Audio Foundry plugin running. Cloning a real "
-        "person's voice is not available here; it needs consent recorded in the Studio. For a song "
-        "use generate_music."
+        "Turn text into speech on this machine with Guaardvark's Audio Foundry. Waits for the file, "
+        "usually seconds, and returns its name, library document id, length and a download link. "
+        "Up to 3000 characters per call; split longer scripts. Voices: naming a voice (a Kokoro id "
+        "such as 'af_heart' or 'bm_george') always speaks with Kokoro; with no voice, engine 'auto' "
+        "uses Chatterbox's single stock voice when Chatterbox is installed and Kokoro's default "
+        "voice otherwise. Chatterbox has no voice ids, so engine 'chatterbox' with a voice is "
+        "refused. A model or voice pack that is not installed is refused with a pointer to Audio "
+        "Studio → Manage models; nothing is downloaded. Needs the Audio Foundry plugin running. "
+        "Cloning a real person's voice (a Chatterbox reference clip) is not available here; it "
+        "needs consent recorded in the Studio. For a song use generate_music."
     )
     parameters = {
         "text": ToolParameter(
@@ -154,13 +163,17 @@ class GenerateSpeechTool(BaseTool):
         ),
         "voice": ToolParameter(
             name="voice", type="string", required=False,
-            description="A built-in voice id, e.g. 'af_heart' (Kokoro). Omit for the default voice. "
-                        "The Studio's Audio page lists the voices on this machine.",
+            description="A Kokoro voice id: accent and gender prefix plus a name, e.g. 'af_heart' "
+                        "(American female, the default), 'am_michael', 'bf_emma', 'bm_george', "
+                        "'ef_dora' (Spanish). Naming one selects Kokoro. An unknown id is refused "
+                        "with the full list. Omit for the engine's default voice.",
         ),
         "engine": ToolParameter(
             name="engine", type="string", required=False, default="auto",
             enum=["auto", "kokoro", "chatterbox"],
-            description="'auto' (default) uses Chatterbox when it is installed and falls back to Kokoro.",
+            description="'auto' (default): Kokoro when voice is set; otherwise Chatterbox when it is "
+                        "installed, falling back to Kokoro. 'kokoro': the named voice or af_heart. "
+                        "'chatterbox': its one stock voice; do not combine with voice.",
         ),
     }
 
@@ -175,9 +188,26 @@ class GenerateSpeechTool(BaseTool):
         engine = (engine or "auto").strip().lower()
         if engine not in ("auto", "kokoro", "chatterbox"):
             return ToolResult(success=False, error="engine must be auto, kokoro or chatterbox")
+        voice = (voice or "").strip()
+        if voice:
+            # Validated here as well as in the plugin: Kokoro reads a value
+            # ending in .pt as a file path and a comma as a blend of voices.
+            valid = _kokoro_voice_ids()
+            if voice not in valid:
+                return ToolResult(success=False, error=(
+                    f"Unknown voice {voice!r}. Kokoro voices: {', '.join(valid)}. "
+                    "Omit voice for the default."))
+            if engine == "chatterbox":
+                return ToolResult(success=False, error=(
+                    f"Chatterbox has no built-in voices, so voice {voice!r} cannot be used with "
+                    "engine 'chatterbox'. Use engine 'kokoro' (or 'auto') for that voice, or omit "
+                    "voice to hear Chatterbox's stock voice."))
+            # The plugin's auto mode tries Chatterbox first, and Chatterbox
+            # ignores voice ids, so a named voice must go to Kokoro explicitly.
+            engine = "kokoro"
         payload: dict[str, Any] = {"text": text, "backend": engine}
         if voice:
-            payload["voice_id"] = voice.strip()
+            payload["voice_id"] = voice
 
         body, err = _post("/api/audio-foundry/generate/voice", payload, read_timeout=110)
         if err:

@@ -102,7 +102,7 @@ class WebResearchHandler(BaseTaskHandler):
         """
         Execute web research operations.
         Supports:
-        - search: Web search using DuckDuckGo
+        - search: Web search (the engine named in backend/utils/web_search_sources.py)
         - scrape: Scrape content from URLs
         - analyze_website: Deep analysis of a website
         - batch_scrape: Scrape multiple URLs

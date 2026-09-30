@@ -315,7 +315,7 @@ def test_dedupe_includes_drafted_and_posted_not_aborted(app):
 
 # --- YouTube recon (slice 6) ----------------------------------------------
 # Same shape as the scout_reddit suite above — kill switch, dedupe, candidate
-# emission, LLM gate. Plus YouTube-specific filtering: DDG returns more than
+# emission, LLM gate. Plus YouTube-specific filtering: the search engine returns more than
 # just video pages and we only want /watch?v= URLs.
 
 from backend.services.social_outreach.recon import _extract_youtube_video_id
@@ -328,7 +328,7 @@ def _ddg_result(title: str, url: str, snippet: str = "") -> dict:
 
 def _ddg_response(*results: dict) -> dict:
     """Wrap raw results in the {success, data:{results: [...]}} envelope
-    enhanced_web_search emits on a successful DuckDuckGo pass."""
+    enhanced_web_search emits on a successful search."""
     return {
         "success": True,
         "strategy_used": "duckduckgo_search",
@@ -409,7 +409,7 @@ def test_scout_youtube_emits_candidate_with_expected_fields(app):
         assert row.status == "candidate"
         assert row.target_thread_id == "AGAETsxjg0o"
         # target_url is reconstructed from the canonical /watch?v= shape, NOT
-        # whatever DDG returned — protects against XSS injection if a
+        # whatever the search engine returned — protects against XSS injection if a
         # compromised search response surfaced a javascript:/data: URL.
         assert row.target_url == "https://www.youtube.com/watch?v=AGAETsxjg0o"
         # Single result → rank-decay score = 1.0 - 0/1 = 1.0
@@ -429,7 +429,7 @@ def test_scout_youtube_emits_candidate_with_expected_fields(app):
 
 
 def test_scout_youtube_skips_non_video_urls(app):
-    """DDG sometimes returns channels, playlists, or the search-results page
+    """The search engine sometimes returns channels, playlists, or the search-results page
     itself. Those don't have a video id so they don't become candidates."""
     response = _ddg_response(
         _ddg_result(
@@ -599,7 +599,7 @@ def test_tick_recon_youtube_round_robins_profiles(app):
 
 
 def test_scout_youtube_in_pass_dedupe_same_video_two_url_shapes(app):
-    """DDG can return the same video under two URL shapes (e.g. youtu.be vs
+    """The search engine can return the same video under two URL shapes (e.g. youtu.be vs
     youtube.com/watch?v=) in a single response. Both map to the same video_id
     but neither is in audit yet — without an in-pass dedupe set, both would
     emit candidate rows. Slice-6 review caught this."""
@@ -621,7 +621,7 @@ def test_scout_youtube_in_pass_dedupe_same_video_two_url_shapes(app):
         report = RecondAgent().scout_youtube("Ollama local LLM")
         assert report["candidates"] == 1
         assert report["skipped_dedupe"] == 1
-        # Only one row written, even though both DDG results pass the keyword filter.
+        # Only one row written, even though both search results pass the keyword filter.
         assert SocialOutreachLog.query.count() == 1
 
 
@@ -637,9 +637,9 @@ def test_scout_youtube_handles_non_dict_search_response(app):
 
 
 def test_scout_youtube_target_url_is_canonical_not_ddg_string(app):
-    """Even if DDG returns a tracking-decorated or otherwise-modified URL,
+    """Even if the search engine returns a tracking-decorated or otherwise-modified URL,
     the row's target_url is rebuilt from the regex-validated video_id —
-    closes the XSS surface where a malicious DDG response would land in
+    closes the XSS surface where a malicious search response would land in
     target_url and later flow into a UI <a href>."""
     response = _ddg_response(
         _ddg_result(
