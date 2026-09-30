@@ -49,6 +49,17 @@ _PAGE_TYPE_PREFIXES = ("text/",)
 _PAGE_TYPES = {"application/xhtml+xml", "application/xml", "application/json"}
 _PAGE_TYPE_SUFFIXES = ("+xml", "+json")
 
+# Where a file on this machine can be read instead, for a refusal that is about
+# a local address or a non-web URL (file://).
+LOCAL_FILE_ADVICE = "To read a file from this machine, upload it and use process_file."
+
+# Ends every refusal of a public-only fetch, so the person or the model reading
+# it knows no web tool will reach the address and does not retry with another.
+PUBLIC_ONLY_NOTE = (
+    "Web fetches reach public internet addresses only, never this machine or its "
+    "local network. " + LOCAL_FILE_ADVICE
+)
+
 
 class FetchRefused(Exception):
     """The URL, or a redirect from it, is not one that may be fetched."""
@@ -151,7 +162,7 @@ def _fetch(session, url: str, headers: dict | None, public_only: bool, deadline:
         if public_only:
             refused = private_address_reason(current)
             if refused:
-                raise FetchRefused(f"Refused to fetch {current}: {refused}")
+                raise FetchRefused(_refusal(current, refused))
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise _timed_out()
@@ -165,10 +176,10 @@ def _fetch(session, url: str, headers: dict | None, public_only: bool, deadline:
             # check above, or requests decoded the host differently.
             reason = getattr(e.args[0], "reason", None) if e.args else None
             if isinstance(reason, PrivateAddressError):
-                raise FetchRefused(
-                    f"Refused to fetch {current}: {reason.host_name} resolves "
-                    f"to a private or local address ({reason.address})"
-                ) from None
+                raise FetchRefused(_refusal(
+                    current,
+                    f"{reason.host_name} resolves to a private or local address ({reason.address})",
+                )) from None
             raise
         location = session.get_redirect_target(response)
         if not location:
@@ -195,6 +206,10 @@ def _fetch(session, url: str, headers: dict | None, public_only: bool, deadline:
             "Only HTML, XML, JSON and plain-text responses are read."
         )
     return Page(url=current, body=body, media_type=media_type, charset=charset, cut=cut)
+
+
+def _refusal(url: str, reason: str) -> str:
+    return f"Refused to fetch {url}: {reason.rstrip('.')}. {PUBLIC_ONLY_NOTE}"
 
 
 def _pieces(response):

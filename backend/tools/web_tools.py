@@ -531,7 +531,8 @@ class WebSearchTool(BaseTool):
         f"says so; when {SEARCH_ENGINE} refuses the search or cannot be reached, the call fails with "
         f"the reason. A question about the weather in a named place goes to {WEATHER_SOURCE} "
         "instead; the current time and plain arithmetic are answered on this machine; a URL in the "
-        "query is fetched directly. Needs web access on in Settings (off by default)."
+        "query is fetched directly, as fetch_url fetches it: private and local addresses are refused, "
+        "including after a redirect. Needs web access on in Settings (off by default)."
     )
 
     parameters = {
@@ -577,15 +578,11 @@ class WebSearchTool(BaseTool):
 
         try:
             from backend.api.web_search_api import enhanced_web_search, search_result_count
-            from backend.utils.backend_http import is_mcp_transport
 
             # Chat callers are not held to the schema's bounds, so the number
             # is brought into range here.
             max_results = search_result_count(kwargs.get("max_results", DEFAULT_SEARCH_RESULTS))
-            # A URL in the query is fetched directly; over MCP only a public
-            # address may be, as with fetch_url.
-            search_results = enhanced_web_search(
-                query, public_only=is_mcp_transport(self), max_results=max_results)
+            search_results = enhanced_web_search(query, max_results=max_results)
 
             if search_results and not search_results.get("success") and (
                     (search_results.get("data") or {}).get("type") == "no_results"):

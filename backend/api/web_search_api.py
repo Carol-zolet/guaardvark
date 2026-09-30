@@ -15,7 +15,9 @@ from backend.utils.settings_utils import get_web_access
 from backend.utils.safe_math import evaluate_arithmetic
 from backend.utils.hosts import no_netrc_session
 from backend.utils.text_focus import focus_window
-from backend.utils.web_fetch import FetchFailed, FetchRefused, decode_page, fetch_page
+from backend.utils.web_fetch import (
+    LOCAL_FILE_ADVICE, FetchFailed, FetchRefused, decode_page, fetch_page,
+)
 from backend.utils.web_search_sources import (
     DEFAULT_SEARCH_RESULTS, MAX_SEARCH_RESULTS, SEARCH_ENGINE, WEATHER_SOURCE,
 )
@@ -23,12 +25,16 @@ from backend.utils.web_search_sources import (
 web_search_bp = Blueprint("web_search_api", __name__, url_prefix="/api/web-search")
 logger = logging.getLogger(__name__)
 
+_NOT_A_WEB_URL = f"Refused: only http and https URLs can be fetched. {LOCAL_FILE_ADVICE}"
+
+
 def extract_website_content(url: str, query: Optional[str] = None, public_only: bool = False) -> Dict[str, Any]:
     """Fetch a page and return its title, description and up to 2,000 characters of its text.
 
     ``public_only`` refuses any address that is not globally routable, on every
-    redirect hop (the fetch_url and analyze_website tools ask for it). Logins
-    saved in ~/.netrc are never sent, with or without it.
+    redirect hop; every fetch of a URL a caller or a model chose asks for it
+    (fetch_url, analyze_website, a URL in a web search, a competitor page).
+    Logins saved in ~/.netrc are never sent, with or without it.
 
     The fetch is bounded in size and time (:mod:`backend.utils.web_fetch`). A
     page that was read only in part is still returned, with ``page_cut`` saying
@@ -41,7 +47,7 @@ def extract_website_content(url: str, query: Optional[str] = None, public_only: 
         url = url.strip()
         scheme = re.match(r"^([A-Za-z][A-Za-z0-9+.-]*)://", url)
         if scheme and scheme.group(1).lower() not in ("http", "https"):
-            return {"success": False, "url": url, "error": "Refused: only http and https URLs can be fetched"}
+            return {"success": False, "url": url, "error": _NOT_A_WEB_URL}
         if scheme:
             url = scheme.group(1).lower() + url[len(scheme.group(1)):]
         else:
@@ -189,7 +195,7 @@ def read_sitemap(url: str) -> Dict[str, Any]:
     url = (url or "").strip()
     scheme = re.match(r"^([A-Za-z][A-Za-z0-9+.-]*)://", url)
     if scheme and scheme.group(1).lower() not in ("http", "https"):
-        return {"success": False, "url": url, "error": "Refused: only http and https URLs can be fetched"}
+        return {"success": False, "url": url, "error": _NOT_A_WEB_URL}
     if not scheme:
         url = "https://" + url
 
@@ -293,13 +299,14 @@ def get_weather_info(location: str) -> Dict[str, Any]:
             "error": f"Weather service error: {str(e)}"
         }
 
-def enhanced_web_search(query: str, public_only: bool = False,
-                        max_results: int = DEFAULT_SEARCH_RESULTS) -> Dict[str, Any]:
-    """Answer ``query`` from the web. A URL in the query is fetched directly;
-    ``public_only`` refuses that fetch for addresses that are not globally
-    routable, as fetch_url does. ``max_results`` is how many search results to
-    ask for (1 to ``MAX_SEARCH_RESULTS``). ``data["source"]`` names the service
-    that answered."""
+def enhanced_web_search(query: str, max_results: int = DEFAULT_SEARCH_RESULTS) -> Dict[str, Any]:
+    """Answer ``query`` from the web. A URL in the query is fetched directly,
+    and only from a public address, on every redirect, exactly as fetch_url
+    fetches: the query can come from a model or from a page it read, on any
+    path (chat and MCP tools, the web-search routes, /websearch, research tasks,
+    the outreach recon). ``max_results`` is how many search results to ask for
+    (1 to ``MAX_SEARCH_RESULTS``). ``data["source"]`` names the service that
+    answered."""
 
     results = {
         "query": query,
@@ -320,7 +327,7 @@ def enhanced_web_search(query: str, public_only: bool = False,
             url = 'https://' + url
             
         logger.info(f"Direct website access for: {url}")
-        website_data = extract_website_content(url, public_only=public_only)
+        website_data = extract_website_content(url, public_only=True)
         if not website_data["success"] and str(website_data.get("error", "")).startswith(
                 ("Refused", "Not a web page")):
             # A refused address, or a URL that serves a file instead of a page,

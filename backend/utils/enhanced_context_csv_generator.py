@@ -199,8 +199,9 @@ class EnhancedContextCSVGenerator:
             
             logger.info(f"Analyzing competitor: {competitor_url}")
             
-            # Extract website content
-            content_data = extract_website_content(competitor_url)
+            # The URL comes from the request or the task record, so it is
+            # fetched as fetch_url fetches: public addresses only.
+            content_data = extract_website_content(competitor_url, public_only=True)
             
             # Extract products/services from content
             products = self._extract_products_from_content(content_data.get("content", ""))
