@@ -5,9 +5,9 @@
 //
 // ApiKeyRefusalNotice is mounted once in App and answers AUTH_REFUSED_EVENT from
 // any request, so pages that only log their errors still tell the person what
-// to do. Each kind of refusal is shown once until the key in this browser
-// changes, so a page that polls a protected route does not repeat it. It stays
-// quiet on the Settings page, which shows the state itself.
+// to do. Each kind of refusal is shown once until this browser signs in or out,
+// so a page that polls a protected route does not repeat it. It stays quiet on
+// the Settings page, which shows the state itself.
 // ApiKeyRefusalAlert is the same advice inline, for pages that show the error
 // where the action was.
 /* eslint-env browser */
@@ -19,12 +19,11 @@ import CloseIcon from "@mui/icons-material/Close";
 import { useNavigate } from "react-router-dom";
 
 import {
-  API_KEY_CHANGED_EVENT,
   API_KEY_SETTINGS_PATH,
   AUTH_REFUSED_EVENT,
   describeAuthRefusal,
-  getStoredApiKey,
-} from "../../api/apiKey";
+  onSessionChanged,
+} from "../../api/apiAuth";
 
 const LINK_LABEL = "Settings → API key";
 // How many ApiKeyRefusalAlerts are on screen. The notice waits a moment and
@@ -71,26 +70,25 @@ export default function ApiKeyRefusalNotice() {
     const onRefused = (event) => {
       const code = event.detail?.code;
       if (!code || window.location.pathname.startsWith("/settings")) return;
-      const hasKey = Boolean(getStoredApiKey());
-      const seen = `${code}:${hasKey}`;
+      const rejected = Boolean(event.detail?.rejected);
+      const seen = `${code}:${rejected}`;
       if (shown.current.has(seen)) return;
       shown.current.add(seen);
       const timer = window.setTimeout(() => {
         timers.delete(timer);
-        if (inlineAlerts === 0) setNotice(describeAuthRefusal(code, hasKey));
+        if (inlineAlerts === 0) setNotice(describeAuthRefusal(code, rejected));
       }, INLINE_GRACE_MS);
       timers.add(timer);
     };
-    const onKeyChanged = () => {
+    window.addEventListener(AUTH_REFUSED_EVENT, onRefused);
+    const stopWatching = onSessionChanged(() => {
       shown.current.clear();
       setNotice(null);
-    };
-    window.addEventListener(AUTH_REFUSED_EVENT, onRefused);
-    window.addEventListener(API_KEY_CHANGED_EVENT, onKeyChanged);
+    });
     return () => {
       timers.forEach((t) => window.clearTimeout(t));
       window.removeEventListener(AUTH_REFUSED_EVENT, onRefused);
-      window.removeEventListener(API_KEY_CHANGED_EVENT, onKeyChanged);
+      stopWatching();
     };
   }, []);
 

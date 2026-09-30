@@ -35,7 +35,7 @@ import {
   reloadMcpConfig,
   saveMcpServer,
 } from "../../api/mcpService";
-import { API_KEY_CHANGED_EVENT } from "../../api/apiKey";
+import { onSessionChanged } from "../../api/apiAuth";
 import { ApiKeyRefusalAlert } from "../common/ApiKeyRefusalNotice";
 import { ActionButton, ConfirmActionDialog, SettingChip, StatusPill } from "./ui";
 
@@ -287,7 +287,7 @@ const MCPServersSection = () => {
   const [message, setMessage] = useState(null);
   // Set when the backend refuses this browser (these routes answer the
   // Guaardvark machine, or this install's API key): the advice to show in
-  // place of the page. Polling stops until the key in this browser changes.
+  // place of the page. Polling stops until this browser signs in or out.
   const [refused, setRefused] = useState(null);
 
   const refresh = useCallback(async () => {
@@ -307,9 +307,7 @@ const MCPServersSection = () => {
   }, []);
 
   useEffect(() => {
-    const retry = () => setRefused(null);
-    window.addEventListener(API_KEY_CHANGED_EVENT, retry);
-    return () => window.removeEventListener(API_KEY_CHANGED_EVENT, retry);
+    return onSessionChanged(() => setRefused(null));
   }, []);
 
   const refreshAudit = useCallback(async () => {

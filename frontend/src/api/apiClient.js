@@ -1,7 +1,7 @@
 // frontend/src/api/apiClient.js
 // Version 1.0: Centralized API client logic.
 
-import { authRefusalCode, describeAuthRefusal, isBackendUrl } from "./apiKey";
+import { announceRefusal, authRefusalCode, describeAuthRefusal, isBackendUrl } from "./apiAuth";
 
 // Default to '/api' so requests use the Vite proxy during development
 // Strip any trailing slash to avoid double slashes or Flask 405 errors
@@ -62,8 +62,9 @@ export const handleResponse = async (response, options = {}) => {
       (!response.url || isBackendUrl(response.url))
         ? authRefusalCode(errorData)
         : null;
+    const rejected = Boolean(refusal && errorData.credential_rejected);
     const errorMessage =
-      (refusal && describeAuthRefusal(refusal)) ||
+      (refusal && describeAuthRefusal(refusal, rejected)) ||
       (typeof nested === "string" && nested) ||
       (typeof nested?.message === "string" && nested.message) ||
       (typeof errorData?.message === "string" && errorData.message) ||
@@ -71,7 +72,11 @@ export const handleResponse = async (response, options = {}) => {
     const error = new Error(errorMessage);
     error.status = response.status;
     error.data = errorData;
-    if (refusal) error.authRefused = refusal;
+    if (refusal) {
+      error.authRefused = refusal;
+      // ApiKeyRefusalNotice tells pages that only log their errors.
+      announceRefusal({ code: refusal, rejected, url: response.url });
+    }
     // The Vite proxy returns 502 (and {"error":"backend_offline"}) when the Flask
     // backend is unreachable; 504 is a proxy timeout. Surface a single flag so
     // callers (StatusContext, VoiceContext, HealthContext) can distinguish

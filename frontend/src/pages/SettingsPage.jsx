@@ -43,7 +43,7 @@ import StarIcon from "@mui/icons-material/Star";
 import OpenInNewIcon from "@mui/icons-material/OpenInNew";
 import { useLocation, useNavigate } from "react-router-dom";
 import ApiKeySection, { API_KEY_SECTION_ID } from "../components/settings/ApiKeySection";
-import { API_KEY_CHANGED_EVENT } from "../api/apiKey";
+import { onSessionChanged } from "../api/apiAuth";
 import {
   getBranding,
   updateBranding,
@@ -2223,13 +2223,12 @@ const SettingsPage = () => {
 
   useEffect(() => {
     fetchMcpStatus();
-    // A key saved or created in the API key panel may unlock it.
-    window.addEventListener(API_KEY_CHANGED_EVENT, fetchMcpStatus);
     apiService.getConfineToolPaths().then((result) => {
       const on = result?.data?.confine_tool_paths ?? result?.confine_tool_paths;
       if (typeof on === "boolean") setConfineToolPaths(on);
     });
-    return () => window.removeEventListener(API_KEY_CHANGED_EVENT, fetchMcpStatus);
+    // Signing in (or creating a key) in the API key panel may unlock it.
+    return onSessionChanged(fetchMcpStatus);
   }, [fetchMcpStatus]);
 
   // /settings#settings-api-key (the link every refusal carries) and the other
