@@ -2,11 +2,12 @@
 """Lightweight endpoint protection for dangerous operations.
 
 When GUAARDVARK_API_KEY is set in the environment, protected endpoints
-require the key in the X-API-Key header from every host, this machine
-included. When unset, requests from this machine pass and other hosts are
-refused. The web UI keeps the key in the browser (Settings → API key) and
-sends it on every request to this backend; /api/auth/ reports the state and
-manages the key.
+require it from every host, this machine included: in the X-API-Key header
+(command-line clients, the MCP server, scripts), or as a browser signed in
+with it (the HttpOnly session cookie of backend/utils/api_session.py, which
+Settings → API key obtains). When unset, requests from this machine pass and
+other hosts are refused. /api/auth/ reports the state, signs browsers in and
+out, and manages the key.
 
 Agent screen captures (/api/tools/screenshots/) also answer a link signed by
 backend/utils/screenshot_urls.py, which is what chat's <img> tags carry.
@@ -45,8 +46,8 @@ PROTECTED_PREFIXES = (
 # commands and reach internal networks, and a call to /api/tools/execute skips
 # the confirmation prompts chat would show. Tool jobs hold the results of those
 # calls. These routes answer only this machine, or a caller that sends the API
-# key; a browser on another device sends it once it is entered in Settings →
-# API key.
+# key; a browser on another device is signed in once the key is entered in
+# Settings → API key.
 # GUAARDVARK_PROTECT_TOOL_ENDPOINTS=false (or 0, no, off) opens them to every
 # host that can reach the backend; any other value, or none, keeps them closed.
 # It is read per request, like GUAARDVARK_API_KEY.
@@ -65,6 +66,8 @@ TOOL_ENDPOINT_PATHS = (
 # the text as it is, so the text says what to do in both places.
 # local_only: this install has no key and the caller is another host.
 # api_key_required: this install has a key and the caller did not send it.
+# credential_rejected in the body: the caller did send a key or a sign-in, and
+# it is not accepted now.
 LOCAL_ONLY_CODE = "local_only"
 API_KEY_CODE = "api_key_required"
 SCREENSHOT_LINK_CODE = "screenshot_link_invalid"
@@ -303,11 +306,28 @@ def request_is_from_this_machine() -> bool:
     return _is_localhost(_effective_client_ip())
 
 
+def request_has_valid_session() -> bool:
+    """True when a browser signed in with the current key sent its cookie."""
+    from backend.utils.api_session import VALID, session_state
+
+    return session_state() == VALID
+
+
+def credential_rejected() -> bool:
+    """True when the request carried a key or a sign-in that is not accepted
+    now (a wrong key, or a browser signed in with a key since replaced or
+    removed). The web UI words its advice differently for that case."""
+    from backend.utils.api_session import REJECTED, session_state
+
+    sent_key = bool(request.headers.get(API_KEY_HEADER)) and not request_carries_valid_key()
+    return sent_key or session_state() == REJECTED
+
+
 def caller_is_authorized() -> bool:
-    """The rule every protected route applies: the key once one is configured,
-    this machine until then."""
+    """The rule every protected route applies: the key (header or signed-in
+    browser) once one is configured, this machine until then."""
     if configured_api_key():
-        return request_carries_valid_key()
+        return request_carries_valid_key() or request_has_valid_session()
     return request_is_from_this_machine()
 
 
@@ -342,7 +362,7 @@ def protected_summary() -> list[str]:
 
 
 def _refusal(message: str, code: str, status: int):
-    return jsonify({"error": message, "code": code}), status
+    return jsonify({"error": message, "code": code, "credential_rejected": credential_rejected()}), status
 
 
 def check_endpoint_auth():
@@ -375,10 +395,10 @@ def check_endpoint_auth():
         )
         return _refusal(LOCAL_ONLY_MESSAGE, LOCAL_ONLY_CODE, 403)
 
-    if request_carries_valid_key():
+    if request_carries_valid_key() or request_has_valid_session():
         return None
 
     logger.warning(
-        f"[AUTH] Invalid/missing API key for {request.path} from {request.remote_addr}"
+        f"[AUTH] Invalid/missing API key or sign-in for {request.path} from {request.remote_addr}"
     )
     return _refusal(API_KEY_MESSAGE, API_KEY_CODE, 401)

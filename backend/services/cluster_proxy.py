@@ -215,10 +215,20 @@ class HttpProxyForwarder:
 
     def _sanitize_headers(self, incoming: dict, target, request) -> dict:
         import os
-        # X-API-Key is this install's key (the web UI sends it on every
-        # request); another node has its own and gets target.api_key below.
-        out = {k: v for k, v in incoming.items()
-               if k.lower() not in HOP_BY_HOP_HEADERS and k.lower() != "x-api-key"}
+        # X-API-Key and the browser's sign-in cookie belong to this install;
+        # another node has its own key and gets target.api_key below.
+        from backend.utils.api_session import strip_session_cookies
+
+        out = {}
+        for k, v in incoming.items():
+            name = k.lower()
+            if name in HOP_BY_HOP_HEADERS or name == "x-api-key":
+                continue
+            if name == "cookie":
+                v = strip_session_cookies(v)
+                if not v:
+                    continue
+            out[k] = v
         out.pop("Host", None)  # let requests set it
         try:
             prev_hops = int(incoming.get("X-Guaardvark-Hops", "0"))

@@ -111,6 +111,18 @@ def test_with_a_key_the_key_or_a_signature_opens_it(client, monkeypatch):
     assert _get(client, screenshot_url("agent_capture_1.webp"), LOCAL).status_code == 200
 
 
+def test_a_signed_in_browser_needs_no_signature(client, monkeypatch):
+    from backend.utils import api_session
+
+    monkeypatch.setenv("GUAARDVARK_API_KEY", "k-test")
+    plain = f"{PREFIX}agent_capture_1.webp"
+    assert _get(client, plain, REMOTE).status_code == 403
+    client.set_cookie(api_session.cookie_name(), api_session.session_token("k-test"))
+    assert _get(client, plain, REMOTE).data == b"one"
+    client.set_cookie(api_session.cookie_name(), api_session.session_token("an-old-key"))
+    assert _get(client, plain, REMOTE).status_code == 403
+
+
 def test_the_secret_is_private_and_deleting_it_revokes_every_link(client, secret_file):
     old = screenshot_url("agent_capture_1.webp")
     assert stat.S_IMODE(secret_file.stat().st_mode) == 0o600
