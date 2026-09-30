@@ -201,13 +201,12 @@ def enhanced_web_search(query: str, public_only: bool = False) -> Dict[str, Any]
     special_result = handle_special_queries(query)
     if special_result["success"]:
         return special_result
-    
-    url_pattern = r'(?:https?://|www\.)[^\s]+'
-    urls = re.findall(url_pattern, query.lower())
-    
+
+    urls = _urls_in_text(query)
+
     if urls:
         url = urls[0]
-        if not url.startswith(('http://', 'https://')):
+        if not re.match(r'https?://', url, re.IGNORECASE):
             url = 'https://' + url
             
         logger.info(f"Direct website access for: {url}")
@@ -267,10 +266,135 @@ def enhanced_web_search(query: str, public_only: bool = False) -> Dict[str, Any]
     }
 
 
+_URL_IN_TEXT = re.compile(r'(?:https?://|www\.)\S+', re.IGNORECASE)
+_URL_TRAILING_PUNCTUATION = ".,;:!?'\"`*"
+_URL_CLOSERS = {")": "(", "]": "[", "}": "{", ">": "<"}
+
+
+def _urls_in_text(text: str) -> List[str]:
+    """The URLs in ``text`` as written (path case kept), without the sentence
+    punctuation or quotes that follow them. A closing bracket stays when the URL
+    itself opened it, as in ``https://en.wikipedia.org/wiki/Mercury_(planet)``."""
+    urls = []
+    for url in _URL_IN_TEXT.findall(text or ""):
+        while url:
+            last = url[-1]
+            if last in _URL_TRAILING_PUNCTUATION or (
+                last in _URL_CLOSERS and url.count(last) > url.count(_URL_CLOSERS[last])
+            ):
+                url = url[:-1]
+            else:
+                break
+        if _URL_IN_TEXT.fullmatch(url):
+            urls.append(url)
+    return urls
+
+
+# Shortcuts that answer a query without searching: the clock, wttr.in and the
+# calculator. Each fires only when the whole query asks for it. A query that
+# merely contains 'time', 'temperature', 'forecast' or '=' ('python requests
+# timeout', 'LLM temperature setting explained', 'equation of a line y = 2x + 3')
+# goes to the search. Chat passes the person's whole message, so a short polite
+# lead-in and a trailing "now" / "today" are allowed around each form.
+_LEAD_IN = (
+    r"(?:(?:hey|hi|ok|okay|so|please)[,!]?\s+)*"
+    r"(?:(?:can|could|would|will)\s+you\s+(?:please\s+)?(?:tell\s+me|check|look\s+up|find\s+out)\s+"
+    r"|(?:do|does)\s+(?:you|anyone)\s+know\s+"
+    r"|(?:please\s+)?tell\s+me\s+"
+    r"|i\s+(?:want|need|would\s+like)\s+to\s+know\s+)?"
+)
+_WHEN = r"(?:\s+(?:now|right\s+now|today|tonight|currently|at\s+the\s+moment|please))*"
+# Every shortcut form is a short question; a longer query is always searched,
+# which also keeps the matchers below cheap on very long input.
+_SHORTCUT_MAX_CHARS = 200
+_WHAT_IS = r"what(?:'s|s|\s+is)?"
+
+# The clock knows this machine's zone and UTC only, so "what time is it in
+# Tokyo" is left to the search.
+_TIME_QUERY = re.compile(
+    "^" + _LEAD_IN + "(?:"
+    + _WHAT_IS + r"\s+(?:the\s+)?(?:current\s+|exact\s+)?time(?:\s+is\s+it|\s+it\s+is)?"
+    r"|(?:the\s+)?(?:current|exact)\s+time"
+    r"|(?:the\s+)?time(?:\s+right)?\s+now"
+    r"|(?:(?:can|could|would|will)\s+you\s+(?:please\s+)?)?tell\s+me\s+the\s+time"
+    ")" + _WHEN + "$"
+)
+
+_WEATHER_QUERY = re.compile(
+    "^" + _LEAD_IN + "(?:"
+    r"(?:(?:what|how)(?:'s|s|\s+is)?\s+)?(?:the\s+)?(?:current\s+|today'?s\s+)?weather"
+    r"(?:\s+forecast)?(?:\s+(?:like|is|going\s+to\s+be))*"
+    r"|(?:" + _WHAT_IS + r"\s+(?:the\s+)?(?:current\s+)?|(?:the\s+)?current\s+)temperature(?:\s+(?:is|outside))*"
+    r"|how\s+(?:hot|cold|warm)\s+is\s+it(?:\s+outside)?"
+    r"|is\s+it\s+(?:raining|snowing|sunny|hot|cold|warm)(?:\s+outside)?"
+    ")" + _WHEN + r"\s+(?:in|at|for)\s+(?P<place>[^\W_][\w .,'\-]*?)" + _WHEN + "$"
+)
+_PLACE_MAX_WORDS = 5
+# First words of phrases after "in/at/for" that are not a place name:
+# "temperature in celsius", "how hot is it in a car", "weather for tomorrow".
+_NOT_A_PLACE = frozenset({
+    "a", "an", "this", "next", "my", "your", "our",
+    "celsius", "fahrenheit", "kelvin", "degrees",
+    "today", "tonight", "tomorrow", "now",
+})
+
+# A query that is itself arithmetic, optionally after "calculate" / "what is".
+_MATH_QUERY = re.compile(
+    "^" + _LEAD_IN
+    + r"(?:(?P<verb>(?:(?:can|could|would)\s+you\s+(?:please\s+)?)?"
+    r"(?:calculate|compute|evaluate|solve|work\s+out|how\s+much\s+is|" + _WHAT_IS + r"))\s+)?"
+    r"(?P<expr>[\d\s.+\-*/%^()]+?)(?:\s*=)?$"
+)
+_MATH_BINARY_OP = re.compile(r"[\d.)]\s*(?:\*\*|//|[-+*/%^])\s*[-+(\s]*[\d.]")
+# Digits joined by one repeated '-' or '/' read as a date, phone or part
+# number ("2026-09-30", "9/30/2026", "555-123-4567"); without "calculate" in
+# front they are searched, not subtracted or divided.
+_MATH_IDENTIFIER = re.compile(r"^\d+(?:-\d+){2,}$|^\d+(?:/\d+){2,}$")
+
+
+# Typographic apostrophe, multiplication, division and minus signs.
+_QUERY_CHARACTERS = str.maketrans({"\u2019": "'", "\u00d7": "*", "\u00f7": "/", "\u2212": "-"})
+
+
+def _normalise_query(query: str) -> str:
+    text = (query or "").translate(_QUERY_CHARACTERS)
+    return re.sub(r"\s+", " ", text).strip().lower().rstrip("?!. ")
+
+
+def _is_time_query(normalised: str) -> bool:
+    return bool(_TIME_QUERY.match(normalised))
+
+
+def _weather_place(normalised: str) -> Optional[str]:
+    """The place a weather question names, or None when the query is not one."""
+    match = _WEATHER_QUERY.match(normalised)
+    if not match:
+        return None
+    place = match.group("place").strip(" ,.")
+    words = place.split()
+    if not words or len(words) > _PLACE_MAX_WORDS or words[0] in _NOT_A_PLACE:
+        return None
+    return place
+
+
+def _arithmetic_expression(normalised: str) -> Optional[str]:
+    """The expression when the query is an arithmetic question, else None."""
+    match = _MATH_QUERY.match(normalised)
+    if not match:
+        return None
+    expr = match.group("expr").strip()
+    if not _MATH_BINARY_OP.search(expr):
+        return None
+    if not match.group("verb") and _MATH_IDENTIFIER.match(expr):
+        return None
+    return expr.replace("^", "**")
+
+
 def handle_special_queries(query: str) -> Dict[str, Any]:
-    query_lower = query.lower().strip()
-    
-    if any(keyword in query_lower for keyword in ['time', 'clock', 'current time', 'what time']):
+    normalised = _normalise_query(query)
+    short = len(normalised) <= _SHORTCUT_MAX_CHARS
+
+    if short and _is_time_query(normalised):
         try:
             from datetime import datetime
             import pytz
@@ -300,91 +424,58 @@ def handle_special_queries(query: str) -> Dict[str, Any]:
         except Exception as e:
             logger.warning(f"Time query failed: {e}")
     
-    weather_keywords = ['weather', 'temperature', 'forecast', 'climate', 'how hot', 'how cold', 'degrees']
-    location_keywords = ['in ', 'at ', 'for ']
-    
-    if any(keyword in query_lower for keyword in weather_keywords):
+    location = _weather_place(normalised) if short else None
+    if location:
         try:
-            import re
-            location = None
-            
-            location_patterns = [
-                r'(?:weather|temperature|forecast|climate).*?(?:in|at|for)\s+([^?]+?)(?:\?|$)',
-                r'(?:what.*?)(?:weather|temperature).*?(?:in|at|for)\s+([^?]+?)(?:\?|$)',
-                r'(?:how\s+hot|how\s+cold).*?(?:in|at|for)\s+([^?]+?)(?:\?|$)',
-                r'current\s+temperature\s+(?:in|at|for)\s+([^?]+?)(?:\?|$)'
-            ]
-            
-            for pattern in location_patterns:
-                match = re.search(pattern, query_lower)
-                if match:
-                    location = match.group(1).strip()
-                    location = re.sub(r'\b(right\s+now|now|currently|today|tonight)\b', '', location, flags=re.IGNORECASE).strip()
-                    location = re.sub(r',\s*$', '', location).strip()
-                    break
-            
-            if not location:
-                words = query_lower.split()
-                if len(words) >= 2:
-                    location = ' '.join(words[-2:])
-                    
-                    location = re.sub(r'\b(what|is|the|current)\b', '', location).strip()
-            
-            if location and len(location) > 1:
-                logger.info(f"Weather query detected for location: {location}")
-                weather_result = get_weather_info(location)
-                
-                if weather_result.get("success"):
-                    temp_f = weather_result.get('temperature_fahrenheit', 'N/A')
-                    temp_c = weather_result.get('temperature_celsius', 'N/A')
-                    description = weather_result.get('description', 'N/A')
-                    humidity = weather_result.get('humidity', 'N/A')
-                    
-                    snippet = f"Current weather in {location}:\nTemperature: {temp_f}°F ({temp_c}°C)\nConditions: {description}\nHumidity: {humidity}%"
-                    
-                    return {
-                        "query": query,
-                        "strategy_used": "weather_service",
-                        "success": True,
-                        "data": {
-                            "type": "weather",
-                            "location": location,
-                            "temperature_fahrenheit": temp_f,
-                            "temperature_celsius": temp_c,
-                            "description": description,
-                            "humidity": humidity,
-                            "snippet": snippet,
-                            "source": "Weather API"
-                        }
-                    }
-                else:
-                    logger.warning(f"Weather lookup failed for {location}: {weather_result.get('error', 'Unknown error')}")
-            else:
-                logger.warning(f"Could not extract location from weather query: {query}")
-        except Exception as e:
-            logger.warning(f"Weather query processing failed: {e}")
-    
-    if any(keyword in query_lower for keyword in ['calculate', 'math', 'equation', '=']) and any(op in query for op in ['+', '-', '*', '/', '=']):
-        try:
-            import re
-            math_expr = re.sub(r'[^0-9+\-*/.() ]', '', query)
-            if math_expr.strip():
-                result = evaluate_arithmetic(math_expr.strip())
+            logger.info(f"Weather query detected for location: {location}")
+            weather_result = get_weather_info(location)
+
+            if weather_result.get("success"):
+                temp_f = weather_result.get('temperature_fahrenheit', 'N/A')
+                temp_c = weather_result.get('temperature_celsius', 'N/A')
+                description = weather_result.get('description', 'N/A')
+                humidity = weather_result.get('humidity', 'N/A')
+
+                snippet = f"Current weather in {location}:\nTemperature: {temp_f}°F ({temp_c}°C)\nConditions: {description}\nHumidity: {humidity}%"
+
                 return {
                     "query": query,
-                    "strategy_used": "math_calculation",
+                    "strategy_used": "weather_service",
                     "success": True,
                     "data": {
-                        "type": "calculation",
-                        "expression": math_expr.strip(),
-                        "result": result,
-                        "snippet": f"Calculation: {math_expr.strip()} = {result}",
-                        "source": "System Calculator"
+                        "type": "weather",
+                        "location": location,
+                        "temperature_fahrenheit": temp_f,
+                        "temperature_celsius": temp_c,
+                        "description": description,
+                        "humidity": humidity,
+                        "snippet": snippet,
+                        "source": "Weather API"
                     }
                 }
+            logger.warning(f"Weather lookup failed for {location}: {weather_result.get('error', 'Unknown error')}")
+        except Exception as e:
+            logger.warning(f"Weather query processing failed: {e}")
+
+    math_expr = _arithmetic_expression(normalised) if short else None
+    if math_expr:
+        try:
+            result = evaluate_arithmetic(math_expr)
+            return {
+                "query": query,
+                "strategy_used": "math_calculation",
+                "success": True,
+                "data": {
+                    "type": "calculation",
+                    "expression": math_expr,
+                    "result": result,
+                    "snippet": f"Calculation: {math_expr} = {result}",
+                    "source": "System Calculator"
+                }
+            }
         except Exception as e:
             logger.warning(f"Math calculation failed: {e}")
-    
+
     return {
         "query": query,
         "success": False,
