@@ -4,6 +4,18 @@ MCP server configuration.
 Single source of truth: ``data/config/mcp.json`` (optional). Env vars override
 anything in the file. Defaults are safe (default-deny on destructive tool
 categories, outputs resource enabled read-only).
+
+This is the server that other agents connect to. The backend is also an MCP
+*client* of external servers, configured in ``backend/config.py``, and the
+server process loads the same ``.env`` and profile. So the server's own
+switches have their own names:
+
+  * ``GUAARDVARK_MCP_SERVER_ENABLED`` turns this server off.
+    ``GUAARDVARK_MCP_ENABLED`` is the client's switch and is not read here:
+    the Creator profile sets it to false, which must not stop the server.
+  * ``GUAARDVARK_MCP_SERVER_TIMEOUT`` is this server's per-call ceiling.
+    ``GUAARDVARK_MCP_TIMEOUT``, which the client also reads (its default is
+    30 s), is used only when the server's own variable is unset.
 """
 
 from __future__ import annotations
@@ -95,11 +107,15 @@ class ResourcePolicy:
 
 @dataclass
 class MCPConfig:
+    # False refuses to start the server (``server.build_server``). Set by
+    # ``server.enabled`` in mcp.json or ``GUAARDVARK_MCP_SERVER_ENABLED``.
     enabled: bool = True
+    # The setting that turned the server off, for the refusal message.
+    disabled_by: str = ""
     server_name: str = "guaardvark"
     tools: ToolPolicy = field(default_factory=ToolPolicy)
     resources: ResourcePolicy = field(default_factory=ResourcePolicy)
-    # Per-call timeout in seconds (``GUAARDVARK_MCP_TIMEOUT``). Enforced by the
+    # Per-call timeout in seconds (``GUAARDVARK_MCP_SERVER_TIMEOUT``). Enforced by the
     # tools adapter: the tool keeps running in its worker thread, the caller gets
     # an error that says so. Generation tools queue by default (see
     # ``ToolPolicy.argument_defaults``), so this only has to cover synchronous
@@ -128,12 +144,33 @@ def _config_path() -> Path:
     return Path(__file__).resolve().parent.parent.parent / "data" / "config" / "mcp.json"
 
 
+SERVER_ENABLED_ENV = "GUAARDVARK_MCP_SERVER_ENABLED"
+SERVER_TIMEOUT_ENV = "GUAARDVARK_MCP_SERVER_TIMEOUT"
+# Read by the backend's MCP client too; the server falls back to it.
+SHARED_TIMEOUT_ENV = "GUAARDVARK_MCP_TIMEOUT"
+
+
+def _as_bool(value: Any) -> bool | None:
+    """True or False for a JSON boolean or a flag string; None for anything else."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        flag = value.strip().lower()
+        if flag in ("true", "1", "yes", "on"):
+            return True
+        if flag in ("false", "0", "no", "off"):
+            return False
+    return None
+
+
 def load_config() -> MCPConfig:
     """
     Load MCP config. Precedence (lowest → highest):
       1. Built-in defaults
       2. ``data/config/mcp.json`` (if it exists)
-      3. Env vars: ``GUAARDVARK_MCP_ENABLED``, ``GUAARDVARK_MCP_TIMEOUT``.
+      3. Env vars: ``GUAARDVARK_MCP_SERVER_ENABLED``, and
+         ``GUAARDVARK_MCP_SERVER_TIMEOUT`` or, when that is unset,
+         ``GUAARDVARK_MCP_TIMEOUT``.
     Missing keys are fine; we fill with defaults.
     """
     cfg = MCPConfig()
@@ -146,6 +183,7 @@ def load_config() -> MCPConfig:
             server = raw.get("server", {})
             if "enabled" in server:
                 cfg.enabled = bool(server["enabled"])
+                cfg.disabled_by = "" if cfg.enabled else "server.enabled in data/config/mcp.json"
             if "name" in server:
                 cfg.server_name = str(server["name"])
             if "timeout_seconds" in server:
@@ -185,16 +223,24 @@ def load_config() -> MCPConfig:
             # to defaults and tell whoever's listening.
             logger.warning("Could not parse %s (%s); using defaults", path, exc)
 
-    # Env overrides — these come from backend.config for compatibility.
-    env_enabled = os.environ.get("GUAARDVARK_MCP_ENABLED")
+    env_enabled = os.environ.get(SERVER_ENABLED_ENV)
     if env_enabled is not None:
-        cfg.enabled = env_enabled.lower() == "true"
-    env_timeout = os.environ.get("GUAARDVARK_MCP_TIMEOUT")
-    if env_timeout is not None:
+        flag = _as_bool(env_enabled)
+        if flag is None:
+            logger.warning("%s=%r is not true or false; ignored", SERVER_ENABLED_ENV, env_enabled)
+        else:
+            cfg.enabled = flag
+            cfg.disabled_by = "" if flag else SERVER_ENABLED_ENV
+    for name in (SERVER_TIMEOUT_ENV, SHARED_TIMEOUT_ENV):
+        env_timeout = os.environ.get(name)
+        if env_timeout is None:
+            continue
         try:
             cfg.timeout_seconds = int(env_timeout)
         except ValueError:
-            pass
+            logger.warning("%s=%r is not a whole number of seconds; ignored", name, env_timeout)
+            continue
+        break
 
     return cfg
 

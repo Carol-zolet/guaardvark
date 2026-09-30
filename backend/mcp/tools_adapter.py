@@ -28,7 +28,7 @@ from jsonschema import Draft202012Validator
 from jsonschema.exceptions import best_match
 
 from backend.mcp.audit import audit_call
-from backend.mcp.config import WAIT_TIMEOUT_SECONDS, MCPConfig, tool_is_exposed
+from backend.mcp.config import SERVER_TIMEOUT_ENV, WAIT_TIMEOUT_SECONDS, MCPConfig, tool_is_exposed
 from backend.services.agent_tools import BaseTool, get_tool_registry
 from backend.services.tool_execution_guard import ToolExecutionGuard
 
@@ -218,7 +218,7 @@ def _timeout_message(name: str, timeout: float, read_only: bool = False, key: st
     if read_only:
         return head + (
             " It changes nothing, so calling it again is safe; for longer work raise "
-            "GUAARDVARK_MCP_TIMEOUT or data/config/mcp.json server.timeout_seconds."
+            f"{SERVER_TIMEOUT_ENV} or data/config/mcp.json server.timeout_seconds."
         )
     if key:
         return head + (

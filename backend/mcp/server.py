@@ -35,14 +35,25 @@ def _ensure_tools_initialized() -> None:
     initialize_all_tools()
 
 
+class MCPServerDisabled(RuntimeError):
+    """The configuration switches the server off; nothing is built or served."""
+
+
 def build_server(config: MCPConfig | None = None) -> tuple[Server, dict[str, int]]:
     """
     Construct the MCP server with all adapters wired up.
 
     Returns (server, stats) where stats is ``{"tools": N, "resources": M}``.
     Callers print the stats banner before handing off to a transport.
+    Raises ``MCPServerDisabled`` when the configuration turns the server off.
     """
     cfg = config or load_config()
+    if not cfg.enabled:
+        raise MCPServerDisabled(
+            "The Guaardvark MCP server is switched off by "
+            f"{cfg.disabled_by or 'its configuration'}. Set it to true, or remove it, "
+            "to let MCP clients connect."
+        )
     version = get_version()
 
     _ensure_tools_initialized()

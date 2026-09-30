@@ -354,6 +354,7 @@ jobs:
             backend/tests/test_plugin_kill_own_install.py \
             backend/tests/services/test_workflow_contract_*.py \
             backend/tests/services/test_video_render_limits.py \
+            backend/tests/test_mcp_server_config.py \
             backend/tests/test_mcp_installer_idempotent.py \
             backend/tests/services/test_video_prompt_defaults.py \
             backend/tests/services/test_video_quality_gate.py \
