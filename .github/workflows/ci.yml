@@ -327,6 +327,7 @@ jobs:
             backend/tests/services/test_gpu_load_gates.py \
             backend/tests/services/test_gpu_session_wraps_generation.py \
             backend/tests/services/test_video_vram_wait.py \
+            backend/tests/test_mcp_tool_jobs.py \
             backend/tests/api/test_batch_video_lifecycle.py \
             backend/tests/services/test_offline_image_unload_hooks.py \
             backend/tests/services/test_offline_image_oom_ladder.py \

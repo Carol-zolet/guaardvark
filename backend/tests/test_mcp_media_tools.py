@@ -88,7 +88,7 @@ def test_tools_execute_runs_forwarded_calls_as_mcp_calls():
     assert seen == [True, False]
 
 
-# ---- edit family (runs in the MCP process) ------------------------------------------------
+# ---- edit family (the MCP server forwards it; the backend checks the inputs) ---------------
 def _tool(cls, transport):
     tool = cls()
     tool.set_context({"transport": "mcp"} if transport == "mcp" else {})
@@ -98,16 +98,20 @@ def _tool(cls, transport):
 def test_edit_family_refuses_files_outside_uploads_and_outputs_over_mcp(tree):
     from backend.tools import image_tools as it
 
-    res = _tool(it.RemoveBackgroundTool, "mcp").execute(image=str(tree.outside))
-    assert not res.success and "MCP resources serve" in res.error
-    res = _tool(it.InpaintImageTool, "mcp").execute(instruction="x", image="/api/outputs/../../../outside.png")
-    assert not res.success and "leaves the outputs folder" in res.error
-    res = _tool(it.OutpaintImageTool, "mcp").execute(image=str(tree.outside))
-    assert not res.success and "MCP resources serve" in res.error
-    edit = _tool(it.EditImageTool, "mcp")
-    res = edit.execute(instruction="x", image="/api/batch-image/image/ImageBatch_1/a.png",
-                       reference_image_2=str(tree.outside))
-    assert not res.success and "reference_image_2" in res.error
+    # As the backend runs a call the MCP server forwarded: the inputs are
+    # refused in the request, before any tool job starts.
+    with calls_for_mcp_client(True):
+        res = _tool(it.RemoveBackgroundTool, "backend").execute(image=str(tree.outside))
+        assert not res.success and "MCP resources serve" in res.error
+        res = _tool(it.InpaintImageTool, "backend").execute(
+            instruction="x", image="/api/outputs/../../../outside.png")
+        assert not res.success and "leaves the outputs folder" in res.error
+        res = _tool(it.OutpaintImageTool, "backend").execute(image=str(tree.outside))
+        assert not res.success and "MCP resources serve" in res.error
+        edit = _tool(it.EditImageTool, "backend")
+        res = edit.execute(instruction="x", image="/api/batch-image/image/ImageBatch_1/a.png",
+                           reference_image_2=str(tree.outside))
+        assert not res.success and "reference_image_2" in res.error
 
 
 def test_edit_family_accepts_resource_uris_and_keeps_chat_paths(tree):

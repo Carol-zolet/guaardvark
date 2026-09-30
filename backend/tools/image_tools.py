@@ -11,7 +11,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+from backend.services import tool_jobs as _tool_jobs
 from backend.services.agent_tools import BaseTool, ToolParameter, ToolResult
+from backend.utils.backend_http import BackendError
 from backend.utils.backend_http import backend_base_url as _backend_base_url
 from backend.utils.backend_http import http_json as _http_json
 from backend.utils.backend_http import is_mcp_caller, is_mcp_transport, run_tool_in_backend
@@ -635,8 +637,117 @@ STATUS_POLL_S = 3
 _ACTIVE_JOB_STATUSES = {"queued", "pending", "running", "processing", "start", "in_progress"}
 
 
+# ---- tool jobs: photo edits and animations called over MCP ----------------------------------
+# These tools can run longer than an MCP client waits for one call. An MCP call
+# runs as a tool job in the backend (backend/services/tool_jobs.py) and answers
+# with a job id for get_generation_status; chat and the Studio run them inline.
+
+# What each tool's job is called in get_generation_status.
+_TOOL_JOB_KINDS = {
+    "edit_image": "image edit",
+    "inpaint_image": "inpaint",
+    "outpaint_image": "outpaint",
+    "remove_background": "background removal",
+    "generate_animation": "animation",
+}
+
+# Sentence for the descriptions of the tools that run as tool jobs over MCP.
+_TOOL_JOB_NOTE = (
+    " Over MCP the call returns a job id at once; poll get_generation_status with it for the "
+    "file, unless wait_for_result is true."
+)
+
+
+def _wait_for_result_param() -> ToolParameter:
+    return ToolParameter(
+        name="wait_for_result", type="bool", required=False, default=False,
+        description=(
+            "Over MCP: false (default) starts the work as a job and returns its job id at once; poll "
+            "get_generation_status with it for the file. true waits up to "
+            f"{_tool_jobs.MAX_WAIT_S:.0f} s (half the server's MCP timeout when that is shorter) and "
+            "returns the result, or the job id if it is still running. In chat the tool always runs "
+            "inline and this is ignored."
+        ),
+    )
+
+
+def _truthy(value) -> bool:
+    return str(value).lower() in ("1", "true", "yes")
+
+
+def _job_queued_result(snapshot: dict, waited_s: Optional[float] = None) -> ToolResult:
+    job_id = snapshot["job_id"]
+    kind = _TOOL_JOB_KINDS.get(snapshot["tool"], snapshot["tool"])
+    kind = kind[0].upper() + kind[1:]
+    if waited_s is None:
+        head = f"{kind} queued as job {job_id}."
+    else:
+        head = f"{kind} job {job_id} is still {snapshot.get('status') or 'running'} after {waited_s:.0f} s."
+    return ToolResult(
+        success=True,
+        output="\n".join([
+            head,
+            f"Poll: get_generation_status(batch_id=\"{job_id}\") for the file. The job runs in the "
+            "Guaardvark backend; closing this client does not stop it.",
+        ]),
+        metadata={"job_id": job_id, "queued": True, "tool": snapshot["tool"],
+                  "status_tool": "get_generation_status"},
+    )
+
+
+def _job_tool_result(snapshot: dict) -> Optional[ToolResult]:
+    """A finished job's own ToolResult, or None while it is queued or running."""
+    if snapshot.get("status") not in ("done", "failed"):
+        return None
+    result = snapshot.get("result") or {}
+    return ToolResult(
+        success=bool(result.get("success")),
+        output=result.get("output"),
+        error=result.get("error"),
+        metadata={**(result.get("metadata") or {}), "job_id": snapshot["job_id"]},
+    )
+
+
+def _run_or_queue(tool: BaseTool, run) -> ToolResult:
+    """``run()`` now, or as a tool job when an MCP client made the call.
+
+    The MCP server forwards these tools to the backend (``_forward_tool_job``),
+    where the call is marked as an MCP client's (``is_mcp_caller``). By the
+    time this runs the tool has checked its inputs, so a bad image is refused
+    at once rather than as a failed job. Every other caller, chat included,
+    gets ``run()`` inline.
+    """
+    if not is_mcp_caller(tool) or _tool_jobs.in_job():
+        return run()
+    try:
+        return _job_queued_result(_tool_jobs.submit(tool.name, run))
+    except _tool_jobs.ToolJobsBusy as e:
+        return ToolResult(success=False, error=str(e))
+
+
+def _forward_tool_job(tool: BaseTool, arguments: dict, wait_for_result) -> ToolResult:
+    """In the MCP server: start the call as a tool job in the backend.
+
+    The backend answers with the job id at once. With ``wait_for_result`` this
+    process then waits for the job up to ``tool_jobs.wait_seconds()``, which
+    follows this server's own call timeout, and returns the job's result or
+    its id.
+    """
+    started = run_tool_in_backend(tool.name, {k: v for k, v in arguments.items() if v is not None})
+    job_id = (started.metadata or {}).get("job_id")
+    if not _truthy(wait_for_result) or not started.success or not job_id:
+        return started
+    wait_s = _tool_jobs.wait_seconds()
+    try:
+        snapshot = _http_json("GET", f"/api/tools/jobs/{job_id}?wait_s={wait_s:g}", timeout=wait_s + 30)
+    except RuntimeError as e:
+        logger.warning("waiting for tool job %s: %s", job_id, e)
+        return started
+    return _job_tool_result(snapshot) or _job_queued_result(snapshot, waited_s=wait_s)
+
+
 class GenerationStatusTool(BaseTool):
-    """Read the state of a queued image or video batch by id."""
+    """Read the state of a queued image or video batch, bulk CSV job, song or tool job by id."""
 
     name = "get_generation_status"
     read_only = True
@@ -644,18 +755,22 @@ class GenerationStatusTool(BaseTool):
     description = (
         "Report the state of a queued generation: an image batch (ImageBatch_...) from "
         "generate_image with wait_for_result=false or started in the Studio, a video batch "
-        "from generate_video, a bulk CSV job (bulk_gen_...) from generate_bulk_csv, or a song "
-        "(a 32-character job id) from generate_music. Returns status, progress while running, and "
-        "each finished file (URL for images and video; for a CSV, its path and how many rows it "
-        "holds; for a song, its download link). Use after a queued generate call, or when the "
-        "user asks whether a render is done. Read-only; an unknown id is an error, and so is a "
-        "backend that does not answer (over MCP the backend must be running)."
+        "from generate_video, a bulk CSV job (bulk_gen_...) from generate_bulk_csv, a song "
+        "(a 32-character job id) from generate_music, or a tool job (tooljob_...) from edit_image, "
+        "inpaint_image, outpaint_image, remove_background or generate_animation called over MCP. "
+        "Returns status (a tool job is queued, running, done or failed, with the time since it "
+        "started), progress while running, and each finished file (URL for images, video and "
+        "animations; for a CSV, its path and how many rows it holds; for a song, its download "
+        "link), or the error of a failed job. Use after a queued generate call, or when the user "
+        "asks whether a render is done. Read-only; an unknown id is an error, and so is a backend "
+        "that does not answer (over MCP the backend must be running)."
     )
     parameters = {
         "batch_id": ToolParameter(
             name="batch_id",
             type="string",
-            description="The id a generate tool returned, e.g. ImageBatch_09-11-2026_132620_013, bulk_gen_1790556697_3fa2c1 or a song's job id.",
+            description=("The id a generate or edit tool returned, e.g. ImageBatch_09-11-2026_132620_013, "
+                         "bulk_gen_1790556697_3fa2c1, a song's job id or tooljob_3fa2c1_0123456789ab."),
             required=True,
         ),
         "wait_seconds": ToolParameter(
@@ -929,18 +1044,67 @@ class GenerationStatusTool(BaseTool):
         resp.raise_for_status()
         return cls._audio_info(job_id, resp.json())
 
+    @staticmethod
+    def _tool_job_info(snapshot: dict):
+        """A tool job (backend/services/tool_jobs.py) in this tool's shape."""
+        result = snapshot.get("result") or {}
+        meta = result.get("metadata") or {}
+        status = snapshot.get("status")
+        files = []
+        if status == "done":
+            for key in ("image_url", "gif_url", "video_url"):
+                url = meta.get(key)
+                if url and all(f["url"] != url for f in files):
+                    files.append({"url": url})
+        tool = snapshot.get("tool") or "tool"
+        return {
+            "kind": _TOOL_JOB_KINDS.get(tool, tool), "noun": "job", "tool": tool,
+            "batch_id": snapshot.get("job_id"), "status": status, "note": snapshot.get("note"),
+            "elapsed_s": snapshot.get("elapsed_s"),
+            "output": result.get("output") if status == "done" else None,
+            "error": result.get("error") if status == "failed" else None,
+            "errors": [], "files": files, "studio_url": None,
+        }
+
+    @classmethod
+    def _tool_job_status(cls, job_id: str):
+        if not _tool_jobs.is_job_id(job_id):
+            return None
+        snapshot = _tool_jobs.get(job_id)
+        if snapshot is None:
+            return {"missing": _tool_jobs.missing(job_id)[1]}
+        return cls._tool_job_info(snapshot)
+
+    @classmethod
+    def _tool_job_status_http(cls, job_id: str):
+        if not _tool_jobs.is_job_id(job_id):
+            return None
+        try:
+            snapshot = _http_json("GET", f"/api/tools/jobs/{job_id}")
+        except BackendError as e:
+            if e.status != 404:
+                raise
+            if isinstance(e.body, dict) and e.body.get("reason"):
+                return {"missing": str(e)}
+            return {"missing": (f"The Guaardvark backend does not know tool jobs yet ({e}); restart it "
+                                "so it runs the same version as this MCP server.")}
+        return cls._tool_job_info(snapshot)
+
     def _read(self, batch_id: str):
         """(info, unreachable): the job from whichever reader knows its id."""
         info = None
         unreachable = None
         remote = self._context.get("transport") == "mcp"
-        readers = (
-            (self._bulk_status_http, self._bulk_status_tracking, self._audio_status_http,
-             self._image_status_http, self._video_status_http)
-            if remote else
-            (self._bulk_status, self._bulk_status_tracking, self._audio_status,
-             self._image_status, self._video_status)
-        )
+        if _tool_jobs.is_job_id(batch_id):
+            readers = (self._tool_job_status_http,) if remote else (self._tool_job_status,)
+        else:
+            readers = (
+                (self._bulk_status_http, self._bulk_status_tracking, self._audio_status_http,
+                 self._image_status_http, self._video_status_http)
+                if remote else
+                (self._bulk_status, self._bulk_status_tracking, self._audio_status,
+                 self._image_status, self._video_status)
+            )
         for reader in readers:
             try:
                 info = reader(batch_id)
@@ -978,9 +1142,12 @@ class GenerationStatusTool(BaseTool):
                 "Try again shortly."))
         if info is None:
             return ToolResult(success=False, error=f"No image, video, audio or bulk CSV job named {batch_id}")
+        if info.get("missing"):
+            return ToolResult(success=False, error=info["missing"])
         total = info.get("total")
         done = info.get("completed") or 0
-        noun = "job" if info["kind"] in ("song", "speech", "sound effect", "audio") else "batch"
+        noun = info.get("noun") or (
+            "job" if info["kind"] in ("song", "speech", "sound effect", "audio") else "batch")
         head = f"{info['kind'][0].upper()}{info['kind'][1:]} {noun} {batch_id}: {info['status']}"
         if total:
             head += f" ({done}/{total} finished"
@@ -1020,9 +1187,16 @@ class GenerationStatusTool(BaseTool):
                 lines.append(f"Failed item: {err}")
         if info.get("progress") is not None and info["status"] == "running":
             lines.append(f"Progress: {info['progress']}% — {info.get('message') or ''}".rstrip(" —"))
+        if info.get("elapsed_s") is not None:
+            lines.append(f"Elapsed: {info['elapsed_s']:.0f} s")
+        if info.get("note"):
+            lines.append(info["note"])
+        if info.get("output"):
+            lines.append(str(info["output"]))
         if info["status"] in ("queued", "pending", "running"):
             lines.append("Still running; poll again in a few seconds, or pass wait_seconds to wait here.")
-        lines.append(f"Open Studio: {info['studio_url']}")
+        if info.get("studio_url"):
+            lines.append(f"Open Studio: {info['studio_url']}")
         return ToolResult(success=True, output="\n".join(lines), metadata=info)
 
 
@@ -1043,7 +1217,7 @@ class AnimationGeneratorTool(BaseTool):
         "a downloaded image model that supports it (Z-Image Turbo, SDXL or Stable "
         "Diffusion, picked automatically). Use when the user asks to animate, create "
         "a GIF, or make a looping frame morph. For a cinema clip from a video model "
-        "use generate_video instead."
+        "use generate_video instead." + _TOOL_JOB_NOTE
     )
     parameters = {
         "prompt": ToolParameter(
@@ -1086,6 +1260,7 @@ class AnimationGeneratorTool(BaseTool):
             required=False,
             default=False,
         ),
+        "wait_for_result": _wait_for_result_param(),
     }
 
     def __init__(self):
@@ -1093,16 +1268,22 @@ class AnimationGeneratorTool(BaseTool):
 
     def execute(self, prompt: str, motion: str, frames: int = 8,
                 strength: float = 0.20, format: str = "both",
-                vision_steering: bool = False, **kwargs) -> ToolResult:
+                vision_steering: bool = False, wait_for_result: bool = False, **kwargs) -> ToolResult:
         logger.info(f"AnimationGeneratorTool: prompt={prompt[:60]}..., motion={motion}, frames={frames}")
 
         if is_mcp_transport(self):
             # The frames render on the GPU, which belongs to the backend process.
-            return run_tool_in_backend(self.name, {
+            return _forward_tool_job(self, {
                 "prompt": prompt, "motion": motion, "frames": frames, "strength": strength,
                 "format": format, "vision_steering": vision_steering,
-            }, read_timeout=31 * 60)
+            }, wait_for_result)
+        return _run_or_queue(self, lambda: self._animate(
+            prompt, motion, frames=frames, strength=strength, format=format,
+            vision_steering=vision_steering,
+        ))
 
+    def _animate(self, prompt: str, motion: str, *, frames: int, strength: float,
+                 format: str, vision_steering: bool) -> ToolResult:
         try:
             from backend.services.animation_generator import (
                 get_animation_generator, AnimationRequest
@@ -1119,23 +1300,32 @@ class AnimationGeneratorTool(BaseTool):
                 use_vision_steering=vision_steering,
             )
 
-            from backend.services.gpu_resource_policy import gpu_session
+            from backend.services.gpu_resource_policy import gpu_session, gpu_session_when_free
             from backend.services.job_operation_gate import GpuBusyError
             from backend.services.job_types import JobKind
             from backend.services.offline_image_generator import get_image_generator
+            # A tool job waits its turn for a busy GPU; chat is told at once.
+            gpu_wait = _job_gpu_wait()
             try:
                 # Use the image gen's ram estimate for the animation (reuses SD pipeline)
                 img_gen = get_image_generator()
                 ram_est = img_gen._ram_estimate_gb(request.model) if hasattr(img_gen, "_ram_estimate_gb") else 6.0
-                with gpu_session(JobKind.VIDEO_RENDER, f"chat_anim_{uuid.uuid4().hex[:8]}",
-                                 on_busy="raise", evict_ollama=True, vram_estimate_mb=8000,
-                                 ram_estimate_gb=ram_est, require_fit=True, cross_process=True):
+                op_id = f"chat_anim_{uuid.uuid4().hex[:8]}"
+                session_kwargs = dict(evict_ollama=True, vram_estimate_mb=8000,
+                                      ram_estimate_gb=ram_est, require_fit=True, cross_process=True)
+                if gpu_wait:
+                    claim = gpu_session_when_free(
+                        JobKind.VIDEO_RENDER, op_id, wait_s=gpu_wait["wait_s"],
+                        on_wait=gpu_wait["on_wait"], should_stop=gpu_wait["should_stop"],
+                        **session_kwargs,
+                    )
+                else:
+                    claim = gpu_session(JobKind.VIDEO_RENDER, op_id, on_busy="raise", **session_kwargs)
+                with claim:
                     result = anim_gen.generate(request)
-            except GpuBusyError:
-                return ToolResult(
-                    success=False,
-                    error="GPU is busy with another render right now — try again in a moment.",
-                )
+            except GpuBusyError as e:
+                return ToolResult(success=False, error=_gpu_refusal(e, gpu_wait) or (
+                    "GPU is busy with another render right now — try again in a moment."))
 
             if result.success:
                 output_lines = [
@@ -1662,7 +1852,7 @@ class EditImageTool(BaseTool):
         "Preserves the original subject and only applies the requested edit. If the "
         "user did not attach an image, ask them to attach one (an MCP client passes image). Do NOT use this to make "
         "a brand-new image from scratch — use generate_image. For a new scene that "
-        "keeps a face from an attached photo, use generate_identity."
+        "keeps a face from an attached photo, use generate_identity." + _TOOL_JOB_NOTE
     )
     parameters = {
         "instruction": ToolParameter(
@@ -1700,6 +1890,7 @@ class EditImageTool(BaseTool):
             description="Optional third reference, in the same forms as image. Qwen-Image-Edit only.",
             required=False, default="",
         ),
+        "wait_for_result": _wait_for_result_param(),
     }
 
     @staticmethod
@@ -1827,14 +2018,29 @@ class EditImageTool(BaseTool):
 
     def execute(self, instruction: str, image: str = "", steps: int = 28,
                 model: str = "auto", reference_image_2: str = "",
-                reference_image_3: str = "", **kwargs) -> ToolResult:
+                reference_image_3: str = "", wait_for_result: bool = False, **kwargs) -> ToolResult:
+        if is_mcp_transport(self):
+            # The edit renders on the GPU, which belongs to the backend process.
+            return _forward_tool_job(self, {
+                "instruction": instruction, "image": image, "steps": steps, "model": model,
+                "reference_image_2": reference_image_2, "reference_image_3": reference_image_3,
+            }, wait_for_result)
+        inputs = self._edit_inputs(image, reference_image_2, reference_image_3)
+        if isinstance(inputs, ToolResult):
+            return inputs
+        src, extra = inputs
+        return _run_or_queue(self, lambda: self._edit(
+            src, extra, instruction=instruction, steps=steps, model=model,
+        ))
+
+    def _edit_inputs(self, image: str, reference_image_2: str = "", reference_image_3: str = ""):
+        """(source path, extra reference paths), or the ToolResult that refuses them."""
         found = self._resolve_image_ref(image)
         if not found.path:
             return ToolResult(
                 success=False,
                 error=found.error or "No image to edit. Ask the user to attach the image they want edited.",
             )
-        src = found.path
         extra = []
         for label, raw in (("reference_image_2", reference_image_2), ("reference_image_3", reference_image_3)):
             ref = self._resolve_image_ref(raw, label=label)
@@ -1842,6 +2048,9 @@ class EditImageTool(BaseTool):
                 return ToolResult(success=False, error=ref.error)
             if ref.path:
                 extra.append(ref.path)
+        return found.path, extra
+
+    def _edit(self, src: str, extra: list, *, instruction: str, steps, model: str) -> ToolResult:
         gpu_wait = None
         try:
             from backend.config import OUTPUT_DIR
@@ -1908,6 +2117,32 @@ _GPU_STILL_BUSY = (
     "The GPU stayed busy with another render for {mins} minutes, so this did not run. "
     "Say \"try again\" when it is free."
 )
+_JOB_GPU_STILL_BUSY = (
+    "The GPU stayed busy with other work for {mins} minutes, so this job did not run. Start it "
+    "again when the GPU is free (inspect_gpu shows what holds it)."
+)
+
+
+def _image_vram_wait_s() -> float:
+    """GUAARDVARK_IMAGE_VRAM_WAIT_S: how long image work waits for a busy GPU (default 600 s,
+    the batch image wait)."""
+    try:
+        return max(0.0, float(os.environ.get("GUAARDVARK_IMAGE_VRAM_WAIT_S", "600")))
+    except ValueError:
+        return 600.0
+
+
+def _job_gpu_wait() -> dict | None:
+    """In a tool job, queue behind a busy GPU the way a batch image job does.
+
+    No client holds the call open, so the job waits up to
+    GUAARDVARK_IMAGE_VRAM_WAIT_S and get_generation_status shows it as queued
+    meanwhile. Anywhere else: None.
+    """
+    if not _tool_jobs.in_job():
+        return None
+    return {"wait_s": _image_vram_wait_s(), "on_wait": _tool_jobs.note_gpu_wait,
+            "should_stop": None, "still_busy": _JOB_GPU_STILL_BUSY}
 
 
 def _chat_gpu_wait() -> dict | None:
@@ -1915,17 +2150,14 @@ def _chat_gpu_wait() -> dict | None:
 
     Waits up to GUAARDVARK_IMAGE_VRAM_WAIT_S (the batch image wait, default
     600 s) with a status line in the chat, and gives up when the person presses
-    Stop. Other callers (the MCP server, scripts) get None and keep the
-    immediate answer, since a client there may time out while it waits.
+    Stop. A tool job waits too (``_job_gpu_wait``). Other callers (scripts, the
+    Tools page) get None and keep the immediate answer.
     """
     from backend.services.agent_control_service import get_chat_emit_fn, get_chat_stop_check
     stop = get_chat_stop_check()
     if stop is None:
-        return None
-    try:
-        wait_s = max(0.0, float(os.environ.get("GUAARDVARK_IMAGE_VRAM_WAIT_S", "600")))
-    except ValueError:
-        wait_s = 600.0
+        return _job_gpu_wait()
+    wait_s = _image_vram_wait_s()
     emit = get_chat_emit_fn()
 
     def on_wait(reason: str) -> None:
@@ -1937,7 +2169,7 @@ def _chat_gpu_wait() -> dict | None:
 
 
 def _gpu_refusal(e: Exception, gpu_wait: dict | None) -> str | None:
-    """Chat text for a GPU refusal, or None when ``e`` is not one."""
+    """Chat (or tool job) text for a GPU refusal, or None when ``e`` is not one."""
     from backend.services.gpu_resource_policy import GpuWaitStopped
     from backend.services.job_operation_gate import GpuBusyError, GpuCapacityError
     if isinstance(e, GpuWaitStopped):
@@ -1946,7 +2178,8 @@ def _gpu_refusal(e: Exception, gpu_wait: dict | None) -> str | None:
         return None
     if isinstance(e, GpuBusyError):
         if gpu_wait and gpu_wait.get("wait_s"):
-            return _GPU_STILL_BUSY.format(mins=max(1, round(gpu_wait["wait_s"] / 60)))
+            text = gpu_wait.get("still_busy") or _GPU_STILL_BUSY
+            return text.format(mins=max(1, round(gpu_wait["wait_s"] / 60)))
         return "GPU is busy with another render right now — try again in a moment."
     return None
 
@@ -1976,7 +2209,7 @@ class RemoveBackgroundTool(BaseTool):
         "Remove the background from an attached photo and return a transparent PNG. "
         "Use for product shots, stickers, and cut-outs. Does not invent a new scene — "
         "use generate_identity or edit_image for that. In chat the attached image is used "
-        "when `image` is omitted; an MCP client passes `image`."
+        "when `image` is omitted; an MCP client passes `image`." + _TOOL_JOB_NOTE
     )
     parameters = {
         "image": ToolParameter(
@@ -1984,13 +2217,20 @@ class RemoveBackgroundTool(BaseTool):
             description=f"The photo. In chat, omit it to use the attached image; otherwise {_IMAGE_INPUT_FORMS}",
             required=False, default="",
         ),
+        "wait_for_result": _wait_for_result_param(),
     }
 
-    def execute(self, image: str = "", **kwargs) -> ToolResult:
+    def execute(self, image: str = "", wait_for_result: bool = False, **kwargs) -> ToolResult:
+        if is_mcp_transport(self):
+            # The cut-out model runs on the GPU when it can, which belongs to the backend process.
+            return _forward_tool_job(self, {"image": image}, wait_for_result)
         found = _edit_tool_for(self)._resolve_image_ref(image)
         if not found.path:
             return ToolResult(success=False, error=found.error or "Attach the photo to cut out.")
-        src = found.path
+        return _run_or_queue(self, lambda: self._cut_out(found.path))
+
+    @staticmethod
+    def _cut_out(src: str) -> ToolResult:
         from PIL import Image
         from backend.services.background_removal import (
             BackgroundRemovalNotInstalled, installed_model, remove_background,
@@ -2025,7 +2265,7 @@ class InpaintImageTool(BaseTool):
         "instruction ('remove the coffee cup', 'replace the sky with sunset'). "
         "Uses Qwen-Image-Edit when installed, else FLUX Kontext. For extending the "
         "canvas use outpaint_image. For a brand-new scene of a person's face use "
-        "generate_identity."
+        "generate_identity." + _TOOL_JOB_NOTE
     )
     parameters = {
         "instruction": ToolParameter(
@@ -2043,13 +2283,25 @@ class InpaintImageTool(BaseTool):
             description="Diffusion steps. Default 20.",
             required=False, default=20,
         ),
+        "wait_for_result": _wait_for_result_param(),
     }
 
-    def execute(self, instruction: str, image: str = "", steps: int = 20, **kwargs) -> ToolResult:
+    def execute(self, instruction: str, image: str = "", steps: int = 20,
+                wait_for_result: bool = False, **kwargs) -> ToolResult:
+        if is_mcp_transport(self):
+            return _forward_tool_job(self, {
+                "instruction": instruction, "image": image, "steps": steps, "model": kwargs.get("model"),
+            }, wait_for_result)
         model = kwargs.get("model") or "auto"
-        return _edit_tool_for(self).execute(
-            instruction=instruction, image=image, steps=int(steps) or 20, model=model,
-        )
+        steps = int(steps) or 20
+        edit = _edit_tool_for(self)
+        inputs = edit._edit_inputs(image)
+        if isinstance(inputs, ToolResult):
+            return inputs
+        src, extra = inputs
+        return _run_or_queue(self, lambda: edit._edit(
+            src, extra, instruction=instruction, steps=steps, model=model,
+        ))
 
 
 class OutpaintImageTool(BaseTool):
@@ -2061,7 +2313,7 @@ class OutpaintImageTool(BaseTool):
     description = (
         "Expand an attached photo in one or more directions and fill the new area "
         "so it matches the scene. Use when the user says extend, expand the canvas, "
-        "or outpaint. Prefer Qwen-Image-Edit when installed."
+        "or outpaint. Prefer Qwen-Image-Edit when installed." + _TOOL_JOB_NOTE
     )
     parameters = {
         "image": ToolParameter(
@@ -2079,10 +2331,17 @@ class OutpaintImageTool(BaseTool):
         "top": ToolParameter(name="top", type="int", description="Pixels to add on the top.", required=False, default=0),
         "bottom": ToolParameter(name="bottom", type="int", description="Pixels to add on the bottom.", required=False, default=0),
         "steps": ToolParameter(name="steps", type="int", description="Diffusion steps. Default 20.", required=False, default=20),
+        "wait_for_result": _wait_for_result_param(),
     }
 
     def execute(self, image: str = "", instruction: str = "", left: int = 0, right: int = 0,
-                top: int = 0, bottom: int = 0, steps: int = 20, **kwargs) -> ToolResult:
+                top: int = 0, bottom: int = 0, steps: int = 20, wait_for_result: bool = False,
+                **kwargs) -> ToolResult:
+        if is_mcp_transport(self):
+            return _forward_tool_job(self, {
+                "image": image, "instruction": instruction, "left": left, "right": right,
+                "top": top, "bottom": bottom, "steps": steps,
+            }, wait_for_result)
         found = _edit_tool_for(self)._resolve_image_ref(image)
         if not found.path:
             return ToolResult(success=False, error=found.error or "Attach the photo to extend.")
@@ -2103,6 +2362,10 @@ class OutpaintImageTool(BaseTool):
             "Show the same scene in a wider shot, continuing it past the edges with matching "
             "lighting, perspective and style. Keep everything already in the picture unchanged."
         )
+        return _run_or_queue(self, lambda: self._outpaint(src, pad, fill, steps))
+
+    @staticmethod
+    def _outpaint(src: str, pad: dict, fill: str, steps) -> ToolResult:
         gpu_wait = None
         try:
             from backend.services.comfyui_image_generator import ComfyUIImageGenerator

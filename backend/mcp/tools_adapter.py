@@ -199,7 +199,11 @@ def _content_blocks_from_result(result: Any) -> list[mcp_types.ContentBlock]:
 
 def _call_timeout(config: MCPConfig, arguments: dict[str, Any]) -> float:
     """The per-call ceiling: the configured timeout, or the wait ceiling when
-    the caller asked a generation tool to block until the render finishes."""
+    the caller asked a generation tool to block until the render finishes.
+
+    Tools that run as tool jobs (backend/services/tool_jobs.py) wait at most
+    half the configured timeout even with wait_for_result, so this ceiling
+    never cuts them off first."""
     wait = arguments.get("wait_for_result")
     if str(wait).lower() in ("1", "true", "yes"):
         return float(max(config.timeout_seconds, WAIT_TIMEOUT_SECONDS))
