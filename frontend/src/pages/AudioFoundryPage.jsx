@@ -35,21 +35,26 @@ import {
   CloudUpload as UploadIcon,
   Close as CloseIcon,
 } from "@mui/icons-material";
+import { useSearchParams } from "react-router-dom";
 import PageLayout from "../components/layout/PageLayout";
 import WaveformPlayer from "../components/audio/WaveformPlayer";
 import axios from "axios";
 import { ActionButton, DashboardStrip, DashboardTile } from "../components/settings/ui";
 import AlertSnackbar from "../components/common/AlertSnackbar";
 import VoiceConsentDialog from "../components/audio/VoiceConsentDialog";
+import VoiceClipManager from "../components/audio/VoiceClipManager";
+import { confirmVoiceClipConsent, voiceClipAudioUrl } from "../api/audioFoundryService";
 import SettingsIcon from "@mui/icons-material/Settings";
 
 const AudioFoundryModelsModal = React.lazy(() => import("../components/modals/AudioFoundryModelsModal"));
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL || "/api";
 
-// Hardcoded fallback if /api/audio-foundry/voices is unreachable (e.g. plugin
-// is stopped). The live source of truth is the GET /voices endpoint, which the
-// frontend fetches on mount. The two should stay roughly aligned.
+// Hardcoded fallback if /api/audio-foundry/voices is unreachable (the backend
+// answers it from the checkout's catalog while the plugin is stopped, so this
+// is for a backend that does not answer). The live source of truth is the GET
+// /voices endpoint, which the frontend fetches on mount. The two should stay
+// roughly aligned.
 const FALLBACK_VOICES = [
   { label: "American Female", voices: [
     { id: "af_heart",   label: "Heart (default)" },
@@ -213,6 +218,18 @@ const AudioFoundryPage = () => {
       .catch(() => {});
   }, []);
   useEffect(() => { refreshCatalog(); }, [refreshCatalog]);
+  // /audio?models=<id> opens Manage models on that row; the Cast page's voice
+  // picker links here for a voice that is not installed.
+  const [searchParams, setSearchParams] = useSearchParams();
+  useEffect(() => {
+    const wanted = searchParams.get("models");
+    if (wanted === null) return;
+    setHighlightModelId(wanted || null);
+    setModelsModalOpen(true);
+    const next = new URLSearchParams(searchParams);
+    next.delete("models");
+    setSearchParams(next, { replace: true });
+  }, [searchParams, setSearchParams]);
   const music3Ready = catalog.find((m) => m.id === "minimax-music3-int8")?.installed ?? null;
   const [musicPolish, setMusicPolish] = useState(true);
   const [musicPreview, setMusicPreview] = useState(null);
@@ -281,10 +298,7 @@ const AudioFoundryPage = () => {
         }
         setReferenceClip(res.data);
       } else {
-        await axios.post(
-          `${API_BASE}/audio-foundry/voice-clips/${encodeURIComponent(request.clip.id)}/consent`,
-          { confirmed: true },
-        );
+        await confirmVoiceClipConsent(request.clip);
         setReferenceClip({ ...request.clip, consented: true });
       }
       setConsentRequest(null);
@@ -298,12 +312,17 @@ const AudioFoundryPage = () => {
     }
   };
 
-  // (Backend exposes DELETE /voice-clips/<id> for future delete-from-library UI;
-  //  not yet wired here — user can manage clips from the filesystem if needed.)
+  // A clip whose consent was withdrawn, or that was deleted, stops being the
+  // selected reference; picking a withdrawn clip again asks for consent.
+  const handleClipRemoved = (clip) => {
+    setReferenceClip((current) =>
+      current && (current.filename || current.id) === (clip.filename || clip.id) ? null : current,
+    );
+  };
 
   // Pull the live voice catalog from the backend on mount. Falls back to the
-  // hardcoded FALLBACK_VOICES if the audio_foundry plugin is offline. This
-  // way new Kokoro voices appear without a frontend redeploy.
+  // hardcoded FALLBACK_VOICES if the backend does not answer. This way new
+  // Kokoro voices appear without a frontend redeploy.
   useEffect(() => {
     let cancelled = false;
     axios.get(`${API_BASE}/audio-foundry/voices`)
@@ -315,7 +334,7 @@ const AudioFoundryPage = () => {
         }
       })
       .catch(() => {
-        // audio_foundry plugin offline — quietly use FALLBACK_VOICES.
+        // Backend unreachable: quietly use FALLBACK_VOICES.
       });
     return () => { cancelled = true; };
   }, []);
@@ -777,7 +796,7 @@ const AudioFoundryPage = () => {
                                 </Typography>
                                 <audio
                                   controls
-                                  src={`${API_BASE}/audio-foundry/voice-clips/${referenceClip.id}/download`}
+                                  src={voiceClipAudioUrl(referenceClip)}
                                   style={{ width: "100%", height: 32, marginTop: 4 }}
                                 />
                               </Box>
@@ -819,13 +838,13 @@ const AudioFoundryPage = () => {
                             <Select
                               value=""
                               onChange={(e) => {
-                                handlePickClip(voiceClipLibrary.find((x) => x.id === e.target.value));
+                                handlePickClip(voiceClipLibrary.find((x) => x.filename === e.target.value));
                               }}
                               MenuProps={{ PaperProps: { sx: { maxHeight: 300 } } }}
                               sx={{ borderRadius: 2 }}
                             >
                               {voiceClipLibrary.map((c) => (
-                                <MenuItem key={c.id} value={c.id}>
+                                <MenuItem key={c.filename} value={c.filename}>
                                   <Box sx={{ display: "flex", justifyContent: "space-between", width: "100%" }}>
                                     <span>{c.filename}</span>
                                     <Typography component="span" variant="caption" sx={{ opacity: 0.5, ml: 2 }}>
@@ -837,6 +856,12 @@ const AudioFoundryPage = () => {
                             </Select>
                           </FormControl>
                         )}
+
+                        <VoiceClipManager
+                          clips={voiceClipLibrary}
+                          onChanged={refreshVoiceClips}
+                          onRemoved={handleClipRemoved}
+                        />
                       </Stack>
                     )}
                     <Button
