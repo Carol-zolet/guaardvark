@@ -16,6 +16,8 @@ def index(monkeypatch):
     """Set what the embedding probe returns and which tables exist."""
     monkeypatch.setenv("GUAARDVARK_VECTOR_STORE", "pgvector")
     monkeypatch.setattr(ix, "_test_table_prefix", lambda: "")
+    # The scope comes from the saved index profiles; pin it so no settings are read.
+    monkeypatch.setattr(ix, "_vector_scope", lambda project_id=None, profile=None: "global")
     monkeypatch.setattr("backend.config.get_active_embedding_model", lambda: "some-embedder")
 
     def arrange(width, tables):
