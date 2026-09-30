@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import functools
 import ipaddress
+import os
 import socket
 from urllib.parse import urlparse
 
@@ -107,6 +109,46 @@ def is_public_address(address: str) -> bool:
     )
 
 
+@functools.lru_cache(maxsize=None)
+def _no_netrc_session_class():
+    import requests
+    from requests.auth import AuthBase
+
+    class _NoAuth(AuthBase):
+        def __call__(self, r):
+            return r
+
+    class NoNetrcSession(requests.Session):
+        def __init__(self):
+            super().__init__()
+            # A session-level auth stops prepare_request from looking up .netrc.
+            self.auth = _NoAuth()
+
+        def rebuild_auth(self, prepared_request, response):
+            # requests' own version also reads .netrc for every redirect target,
+            # whatever auth was set; keep only its removal of the Authorization
+            # header when a redirect leaves the original host.
+            headers = prepared_request.headers
+            if "Authorization" in headers and self.should_strip_auth(
+                response.request.url, prepared_request.url
+            ):
+                del headers["Authorization"]
+
+    return NoNetrcSession
+
+
+def no_netrc_session():
+    """A requests Session that never sends logins from ~/.netrc (or $NETRC).
+
+    requests reads .netrc on every request and every redirect hop, and a
+    ``default`` entry there matches any host, so a fetch of a URL someone else
+    chose would carry the user's saved login to it. Proxy settings and CA
+    bundles from the environment still apply; an auth passed to a request
+    explicitly is still sent.
+    """
+    return _no_netrc_session_class()()
+
+
 def public_only_session():
     """A requests Session that connects only to globally routable addresses.
 
@@ -114,9 +156,14 @@ def public_only_session():
     exactly the address that was checked, so a name that resolves differently
     between a check and the fetch (DNS rebinding) or a host that requests
     decodes differently from the checker (percent-encoding) cannot reach this
-    machine or its networks. TLS is still verified against the host name. A
-    configured HTTP proxy connects on its own and gets only the name check
-    private_address_reason makes.
+    machine or its networks. TLS is still verified against the host name.
+
+    The session ignores the environment's HTTP(S)_PROXY / ALL_PROXY settings and
+    ~/.netrc (or $NETRC): a proxy would open the connection itself, past the
+    address check, and .netrc would hand the user's saved logins to whatever
+    host is fetched (its ``default`` entry to every host). A proxy passed to a
+    request explicitly is refused for the same reason. A CA bundle named in
+    REQUESTS_CA_BUNDLE or CURL_CA_BUNDLE is still used.
     """
     import requests
     from requests.adapters import HTTPAdapter
@@ -161,7 +208,17 @@ def public_only_session():
             super().init_poolmanager(*args, **kwargs)
             self.poolmanager.pool_classes_by_scheme = {"http": _HTTPPool, "https": _HTTPSPool}
 
-    session = requests.Session()
+        def proxy_manager_for(self, proxy, **proxy_kwargs):
+            raise requests.exceptions.ProxyError(
+                "public-only fetches do not go through a proxy")
+
+    session = no_netrc_session()
+    # trust_env=False also turns off requests' own reading of REQUESTS_CA_BUNDLE
+    # and CURL_CA_BUNDLE, so that part is restored here.
+    session.trust_env = False
+    session.verify = (
+        os.environ.get("REQUESTS_CA_BUNDLE") or os.environ.get("CURL_CA_BUNDLE") or True
+    )
     session.mount("http://", _Adapter())
     session.mount("https://", _Adapter())
     return session
