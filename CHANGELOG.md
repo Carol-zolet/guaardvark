@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+- **Cast: a character's voice is picked from a list.** The Overview's free-text "Voice ID" let a
+  typo become an id that renders drop. It is now a list of Audio Foundry's voices, grouped as in
+  the Audio Studio, with "Default voice" first; voices that are not installed say so and link to
+  Audio Studio → Manage models. A saved id that is not a voice is shown as invalid until another
+  is picked, and is never changed on its own. Cloned voices are not offered: a Cast member has no
+  reference clip to clone from. `GET /api/audio-foundry/voices` now answers while Audio Foundry is
+  stopped, from the catalog in the checkout, with `plugin_running: false`.
+- **Audio Studio: withdraw consent for a voice clip, or delete it.** "Manage imported clips" under
+  the reference clip lists each clip and whether consent is recorded. *Withdraw consent* removes
+  the record and keeps the clip, which is not cloned again until consent is confirmed; *Delete
+  clip* removes the clip and its record. A clone already running finishes; one still waiting to
+  start is refused. Deleting needs the Guaardvark machine or the API key, like the Cast Library's
+  deletes; withdrawing is as open as giving consent. Deleting `me` no longer also deletes
+  `me.v2.wav`, clips renamed on import (`me (2).wav`) can be played and confirmed, and a new import
+  never inherits the consent of a clip removed under the same name.
+- **Chatterbox's own voice stays its own after a clone.** Chatterbox kept the last cloned voice as
+  its default, so a later voiceover without a reference clip (the Audio Studio's default voice, a
+  Film Crew character without a voice) spoke in that clone's voice, even after its consent was
+  withdrawn, until the model unloaded. The stock voice now comes back after every generation, and
+  a clone reads its clip once rather than once per chunk.
 - **Only Guaardvark's own pages can read its replies.** A web page served from any device on the
   local network (any 192.168.x, 10.x or 172.16–31.x address, on any port) could call the backend
   and read what it answered. Browsers are now answered only for this install's own pages: its

@@ -254,16 +254,16 @@ def run_casting_director(prod_id: int, llm=None):
         # Cast library (existing trained Subject rows where lora_path is not None)
         library = Subject.query.filter(Subject.lora_path.isnot(None)).all()
         
-        # Fetch available voices from Audio Foundry
+        # The built-in voices installed on this machine: the ids the Editor's
+        # voiceover can speak. Read from the voice catalog the plugin ships,
+        # so the list does not depend on Audio Foundry running.
         available_voices = []
         try:
-            flask_port = os.environ.get("FLASK_PORT", "5002")
-            resp = requests.get(f"http://localhost:{flask_port}/api/audio-foundry/voices", timeout=5)
-            if resp.status_code == 200:
-                available_voices = resp.json().get("voices", [])
+            from backend.services.audio_foundry_models import kokoro_voice_choices
+            available_voices = kokoro_voice_choices(installed_only=True)
         except Exception as e:
             import logging
-            logging.warning(f"Could not fetch available voices: {e}")
+            logging.warning(f"Could not read the Audio Foundry voice catalog: {e}")
 
         input_data = {
             "subjects": script_subjects,

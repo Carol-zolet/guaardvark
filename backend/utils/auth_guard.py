@@ -120,6 +120,15 @@ PROTECTED_DELETE_PREFIXES = (
     '/api/audio-foundry/jobs',
 )
 
+# Protected only on DELETE of the item itself, the id being the last path
+# segment. Deleting an imported voice clip removes a person's recording, like
+# the Cast Library deletes above. Withdrawing consent for a clip
+# (DELETE .../voice-clips/<id>/consent) stays as open as recording it
+# (POST .../consent and the import), so withdrawing is never harder than giving.
+PROTECTED_DELETE_ITEM_PREFIXES = (
+    '/api/audio-foundry/voice-clips/',
+)
+
 # Explicitly safe operations that are exempt from the host check even though they
 # live under an otherwise-protected prefix. /api/meta is shared by many blueprints
 # (jobs, index management, diagnostics) that MUST stay protected, but clearing
@@ -296,6 +305,9 @@ def _is_protected():
     if request.method == 'DELETE':
         for prefix in PROTECTED_DELETE_PREFIXES:
             if path.startswith(prefix):
+                return True
+        for prefix in PROTECTED_DELETE_ITEM_PREFIXES:
+            if path.startswith(prefix) and '/' not in path[len(prefix):].strip('/'):
                 return True
     return False
 

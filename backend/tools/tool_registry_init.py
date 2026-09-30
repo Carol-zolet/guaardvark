@@ -484,10 +484,20 @@ def register_rag_tools() -> List[str]:
 
 
 def register_media_tools() -> List[str]:
-    """Register media player control tools"""
+    """Register media player control tools.
+
+    Registered on Linux only: they use D-Bus MPRIS2, amixer and a Linux VLC, so
+    elsewhere chat and MCP clients would see four tools that can only refuse.
+    """
     global _tool_categories
     registered = []
     category = "media"
+
+    from backend.utils.platform import media_player_available, os_name
+    if not media_player_available():
+        logger.info("Media player tools not registered: they need Linux (D-Bus MPRIS2, amixer, "
+                    "VLC) and this machine runs %s", os_name())
+        return registered
 
     try:
         from backend.tools.media_tools import (

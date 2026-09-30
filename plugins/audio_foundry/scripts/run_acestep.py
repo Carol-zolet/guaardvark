@@ -50,12 +50,35 @@ import json
 import os
 import sys
 import traceback
+from pathlib import Path
 from typing import Any
 
 # Heavy imports are deferred to load() — keep daemon startup snappy so the
 # parent's spawn-and-ping handshake doesn't hang for 30 seconds.
 _pipeline: Any = None
 _torch = None
+
+# Every file ACEStepPipeline reads, shared with the Install probe
+# (backend/services/audio_foundry_models.py) and the parent process.
+_REQUIRED_FILES = Path(__file__).resolve().parents[1] / "backends" / "acestep_files.json"
+
+_INSTALL_HINT = (
+    "Open Audio Studio → Manage models and Install ACE-Step. "
+    "Generation never downloads on its own."
+)
+
+
+def _missing_files(snapshot_dir: str) -> list[str]:
+    """Required files absent from the snapshot folder (a symlink whose blob is
+    gone counts as absent).
+
+    snapshot_download(local_files_only=True) returns the folder whenever the
+    snapshot exists, complete or not, and ACEStepPipeline answers a missing
+    model folder by downloading the whole repo, which the offline Hub client
+    turns into an unrelated error mid-load.
+    """
+    files = json.loads(_REQUIRED_FILES.read_text(encoding="utf-8"))["files"]
+    return [f for f in files if not os.path.isfile(os.path.join(snapshot_dir, f))]
 
 
 def _eprint(msg: str) -> None:
@@ -98,10 +121,15 @@ def _do_load(model_id: str) -> dict[str, Any]:
     except Exception as e:
         return {
             "ok": False,
+            "error": f"ACE-Step weights are not on this machine. {_INSTALL_HINT} ({e})",
+        }
+    missing = _missing_files(local)
+    if missing:
+        return {
+            "ok": False,
             "error": (
-                "ACE-Step weights are not on this machine. "
-                "Open Audio Studio → Manage models and Install ACE-Step. "
-                f"({e})"
+                f"ACE-Step's download on this machine is incomplete (missing {missing[0]}). "
+                f"{_INSTALL_HINT}"
             ),
         }
 
