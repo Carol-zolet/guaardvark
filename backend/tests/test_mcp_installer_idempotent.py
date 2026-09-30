@@ -6,10 +6,12 @@ replaced by a recorder: nothing here reads or writes a real client config.
 """
 
 import json
+import shlex
 from types import SimpleNamespace
 
 import pytest
 
+from backend.mcp import cli as snippets
 from backend.mcp import installer
 
 SECRET = "sk-test-0001"
@@ -281,3 +283,26 @@ def test_run_install_twice_exits_zero_and_the_second_pass_changes_nothing(home, 
     assert "Restart the client" in first and "Restart the client" not in second
     assert second.count(installer.ALREADY_CONFIGURED) == len(clients)
     assert cli.calls == []
+
+
+# ---- `config --client`: what to paste or run, and where ------------------------------------
+def test_the_claude_code_instruction_is_its_own_cli_not_a_file_it_never_reads(home, capsys):
+    assert snippets.print_snippet("claude-code") == 0
+    out = capsys.readouterr().out
+
+    command, args = _launch()
+    line = next(text for text in out.splitlines() if text.startswith("claude "))
+    assert shlex.split(line) == ["claude", "mcp", "add", "--scope", "user", "guaardvark", "--", command, *args]
+    assert "mcp_servers.json" not in out and ".mcp.json" in out
+
+
+@pytest.mark.parametrize("client", snippets.CLIENT_CHOICES)
+def test_every_snippet_launches_the_way_install_does(home, capsys, client):
+    assert snippets.print_snippet(client) == 0
+    out = capsys.readouterr().out
+
+    entry = next(iter(json.loads(out[out.index("{"):]).values()))["guaardvark"]
+    launch = entry["command"] if isinstance(entry["command"], dict) else entry
+    command, args = _launch()
+    assert [launch.get("path", launch.get("command")), *launch["args"]] == [command, *args]
+    assert "cwd" not in launch

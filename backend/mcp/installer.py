@@ -36,12 +36,11 @@ from pathlib import Path
 from typing import Any, Callable
 
 from backend.mcp.cli import (
+    SERVER_NAME,
     _claude_desktop_config_path,
     _project_root,
-    _python_executable,
+    _shell_wrapper,
 )
-
-SERVER_NAME = "guaardvark"
 
 CLIENTS = ("cursor", "claude-code", "codex", "grok", "antigravity", "opencode",
            "claude-desktop", "zed", "gemini")
@@ -49,20 +48,6 @@ CLIENTS = ("cursor", "claude-code", "codex", "grok", "antigravity", "opencode",
 # An installer's detail line starts with this when the client already had the
 # entry this checkout would write, so nothing was run or rewritten.
 ALREADY_CONFIGURED = "already configured"
-
-
-def _shell_wrapper() -> tuple[str, list[str]]:
-    """
-    Command that launches the stdio server from any working directory.
-
-    ``python -m backend.mcp`` needs the repo root on ``sys.path`` (and several
-    tools resolve ``data/`` relative to the cwd), so the entry must cd first.
-    Not every client honours a ``cwd`` key, so wrap in ``sh -c`` — portable
-    across every POSIX client we target.
-    """
-    root = shlex.quote(str(_project_root()))
-    python = shlex.quote(_python_executable())
-    return "sh", ["-c", f"cd {root} && exec {python} -m backend.mcp"]
 
 
 def _stdio_entry() -> dict[str, Any]:
