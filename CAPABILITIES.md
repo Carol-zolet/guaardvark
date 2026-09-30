@@ -678,9 +678,10 @@ GUAARDVARK_AGENT_BROWSER=firefox     # Override agent's browser
 Running a tool directly (`/api/tools/execute`) and the automation routes
 (`/api/automation/*`) answer only the Guaardvark machine itself, or a client
 that sends this install's API key (`GUAARDVARK_API_KEY`) in the `X-API-Key`
-header. A browser on another device sends it once it is entered in
-Settings → API key; the key is created there on the Guaardvark machine, or by
-`./start-docker.sh` under Docker. `GUAARDVARK_PROTECT_TOOL_ENDPOINTS=false`
+header. A browser on another device is signed in once the key is entered in
+Settings → API key (an HttpOnly cookie; the browser does not keep the key);
+the key is created there on the Guaardvark machine, or by `./start-docker.sh`
+under Docker. `GUAARDVARK_PROTECT_TOOL_ENDPOINTS=false`
 opens these routes to every device that can reach the backend.
 
 ---

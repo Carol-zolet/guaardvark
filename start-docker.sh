@@ -101,12 +101,12 @@ if [ -n "$NEW_API_KEY" ]; then
     echo "      $NEW_API_KEY"
     echo ""
     echo "  Open the Web UI, go to Settings → API key, paste it and press Save."
-    echo "  Do the same in every browser you use. Running tools, automation,"
-    echo "  backups and other protected actions need it."
+    echo "  That signs the browser in; do it once in every browser you use."
+    echo "  Running tools, automation, backups and other protected actions need it."
     echo "  ────────────────────────────────────────────────────────────────"
 else
     echo "  API key:      GUAARDVARK_API_KEY in .env (grep GUAARDVARK_API_KEY .env);"
-    echo "                enter it in Settings → API key in each browser."
+    echo "                enter it once in Settings → API key in each browser."
 fi
 echo ""
 echo "  Note: Docker mode runs the core stack only. Use ./start.sh for the full install."

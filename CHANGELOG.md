@@ -18,12 +18,13 @@
   `/api/tools/execute`, `/api/tools/jobs/` and `/api/automation/*` answered every device on the
   network. They now answer the Guaardvark machine itself, or a client that sends
   `GUAARDVARK_API_KEY`. `GUAARDVARK_PROTECT_TOOL_ENDPOINTS=false` brings back the old behaviour.
-- **API key in Settings.** Settings → API key keeps this install's key in the browser and sends it
-  with every request to this Guaardvark, never to another host. On the Guaardvark machine it creates
-  the key (shown once, saved in `.env`, working at once without a restart); with the key it replaces
-  or removes it. Once a key exists every device needs it, the Guaardvark machine included. Pages
-  that are refused (Tools, MCP Servers, and the rest through one notice) say what to do and link
-  there.
+- **API key in Settings.** Pasting this install's key into Settings → API key signs the browser in:
+  the backend answers with an HttpOnly, SameSite=Strict cookie holding a token derived from the key,
+  so the page never keeps the key and a script in it cannot read the sign-in. On the Guaardvark
+  machine the panel creates the key (shown once, saved in `.env`, working at once without a
+  restart); a signed-in browser replaces or removes it, which signs every other browser out. Once a
+  key exists every device needs it, the Guaardvark machine included. Pages that are refused (Tools,
+  MCP Servers, and the rest through one notice) say what to do and link there.
 - **Agent screenshots are served by signed links.** `/api/tools/screenshots/` answered any device
   that guessed a capture's name. Chat now shows each capture through a link signed for that one
   file, which works on every device; anything else needs the Guaardvark machine or the key.

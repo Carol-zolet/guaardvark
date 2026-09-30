@@ -1,7 +1,8 @@
 ###############################################################################
 # Guaardvark — Self-Hosted AI Workstation
 # ./start-docker.sh — that's it. On first start it writes GUAARDVARK_API_KEY
-# to .env next to this file and prints it; enter it in Settings → API key.
+# to .env next to this file and prints it; enter it once in Settings → API key
+# in each browser.
 # GPU: ./start-docker.sh --gpu  (or: docker compose -f docker-compose.yml -f docker-compose.gpu.yml up)
 ###############################################################################
 
