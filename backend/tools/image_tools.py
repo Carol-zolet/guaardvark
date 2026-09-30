@@ -2335,7 +2335,7 @@ class RemoveBackgroundTool(BaseTool):
 
     def execute(self, image: str = "", wait_for_result: bool = False, **kwargs) -> ToolResult:
         if is_mcp_transport(self):
-            # The cut-out model runs on the GPU when it can, which belongs to the backend process.
+            # The backend loads the cut-out model once and keeps it; this process does not load its own.
             return _forward_tool_job(self, {"image": image}, wait_for_result)
         found = _edit_tool_for(self)._resolve_image_ref(image)
         if not found.path:
@@ -2346,8 +2346,9 @@ class RemoveBackgroundTool(BaseTool):
     def _cut_out(src: str) -> ToolResult:
         from PIL import Image
         from backend.services.background_removal import (
-            BackgroundRemovalNotInstalled, installed_model, remove_background,
+            BackgroundRemovalNotInstalled, device_used, installed_model, remove_background,
         )
+        from backend.services.image_editing_packs import pack_by_id
         try:
             model_id = installed_model()
             with Image.open(src) as im:
@@ -2355,10 +2356,13 @@ class RemoveBackgroundTool(BaseTool):
             output_path, filename = _chat_png_path("nobg")
             out.save(output_path)
             image_url = f"/api/outputs/generated_images/{filename}"
+            device = device_used(model_id)
+            label = (pack_by_id(model_id) or {}).get("short") or model_id
             return ToolResult(
                 success=True,
-                output=f"Background removed.\nImage URL: {image_url}",
-                metadata={"image_url": image_url, "filename": filename, "backend": model_id},
+                output=f"Background removed ({label}, on the {device}).\nImage URL: {image_url}",
+                metadata={"image_url": image_url, "filename": filename, "backend": model_id,
+                          "device": device.lower()},
             )
         except BackgroundRemovalNotInstalled as e:
             return ToolResult(success=False, error=str(e))
