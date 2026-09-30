@@ -13,6 +13,7 @@ import time
 from flask import Blueprint, request, jsonify, current_app, send_from_directory, abort
 from typing import Dict, Any, Optional
 from backend.utils.path_guard import PathEscapesRoot, contained, contained_path
+from backend.utils.screenshot_urls import screenshot_url
 
 logger = logging.getLogger(__name__)
 
@@ -46,7 +47,7 @@ def _extract_and_save_screenshots(result):
                 with open(filepath, "wb") as f:
                     f.write(base64.b64decode(image_b64))
 
-                url = f"/api/tools/screenshots/{filename}"
+                url = screenshot_url(filename)
                 screenshot_urls.append(url)
                 logger.info(f"Saved screenshot: {filepath} -> {url}")
     except Exception as e:

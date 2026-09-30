@@ -4854,8 +4854,12 @@ def get_chat_history(session_id: str):
 
         logger.info(f"Retrieved {len(formatted_messages)} messages for session {session_id} (total: {total_count})")
 
+        from backend.utils.screenshot_urls import sign_screenshot_urls
+
+        # Screenshot links are signed as they go out, so messages saved before
+        # a secret change (or before links were signed) still show them.
         return jsonify({
-            "messages": formatted_messages,
+            "messages": sign_screenshot_urls(formatted_messages),
             "has_more": has_more,
             "session_id": session_id,
             "total_count": total_count,

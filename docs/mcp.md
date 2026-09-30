@@ -123,7 +123,7 @@ terminal (`--json`, pipes) it refuses unless the tool matches
 | `POST /reload-config` | Re-read the config file (localhost or API key only) |
 | `POST /connect`, `POST /disconnect` | `{server}` |
 | `GET /tools?server=` | Tools with their policy |
-| `POST /execute` | `{server, tool, arguments}`; a caller on this machine or with the API key approves confirm tools, anyone else can run only allow tools |
+| `POST /execute` | `{server, tool, arguments}`; a caller on this machine or with the API key approves confirm tools. Where the opt-out below lets other callers in, they can run only allow tools |
 | `GET /resources`, `POST /resources/read` | Resources |
 | `GET /prompts`, `POST /prompts/get` | Prompts |
 | `GET /audit-log` | Recent calls |
@@ -132,9 +132,15 @@ terminal (`--json`, pipes) it refuses unless the tool matches
 
 - Config writes start programs, so `PUT/DELETE /servers/<name>` and
   `/reload-config` always need a local caller or the `X-API-Key` header.
-- `GUAARDVARK_PROTECT_TOOL_ENDPOINTS=true` puts all of `/api/automation/` and
-  `/api/tools/execute` behind the same rule. It is off by default because the
-  Tools page and automation panels are used from other devices on the LAN.
+- All of `/api/automation/`, `/api/tools/execute` and `/api/tools/jobs/` are
+  behind the same rule. A browser on another device uses them once it is
+  signed in with this install's API key in Settings → API key; until then the MCP
+  Servers page and the Tools page say so and link there. A browser on the
+  Guaardvark machine itself is a local caller. Once `GUAARDVARK_API_KEY` is
+  set, every caller needs the key, that browser included.
+- `GUAARDVARK_PROTECT_TOOL_ENDPOINTS=false` in `.env` (then restart the
+  backend) opens those routes to every host that can reach the backend. Config
+  writes stay closed.
 - Server processes get a minimal environment: `PATH`, `HOME`, locale,
   proxy/CA settings, Node/Python basics, plus their own `env`. `DATABASE_URL`,
   API keys, tokens and Redis/Celery URLs are withheld.

@@ -14,6 +14,27 @@
   local folders such as scratch copies and worktrees. On a workstation holding about 49,000 such
   `.py` copies the static analysis of the whole checkout went from 270 s to 9 s; a fresh clone
   maps the same files as before. Outside a git checkout the folder is walked as before.
+- **Running tools and automation needs the Guaardvark machine or the API key.**
+  `/api/tools/execute`, `/api/tools/jobs/` and `/api/automation/*` answered every device on the
+  network. They now answer the Guaardvark machine itself, or a client that sends
+  `GUAARDVARK_API_KEY`. `GUAARDVARK_PROTECT_TOOL_ENDPOINTS=false` brings back the old behaviour.
+- **API key in Settings.** Pasting this install's key into Settings → API key signs the browser in:
+  the backend answers with an HttpOnly, SameSite=Strict cookie holding a token derived from the key,
+  so the page never keeps the key and a script in it cannot read the sign-in. On the Guaardvark
+  machine the panel creates the key (shown once, saved in `.env`, working at once without a
+  restart); a signed-in browser replaces or removes it, which signs every other browser out. Once a
+  key exists every device needs it, the Guaardvark machine included. Pages that are refused (Tools,
+  MCP Servers, and the rest through one notice) say what to do and link there.
+- **Agent screenshots are served by signed links.** `/api/tools/screenshots/` answered any device
+  that guessed a capture's name. Chat now shows each capture through a link signed for that one
+  file, which works on every device; anything else needs the Guaardvark machine or the key.
+  Deleting `data/.screenshot_url_secret` revokes every link; saved chats keep their pictures.
+- **The CLI and MCP server on the Guaardvark machine find the key in `.env`.** A key created or
+  replaced in Settings works for them at once, without copying it into their environment.
+- **Docker: the first `./start-docker.sh` creates the API key** in `.env` next to
+  `docker-compose.yml` and prints it for Settings → API key, since under Docker no browser counts
+  as the Guaardvark machine. API URLs ending in `.png`, `.svg` and the like now reach the backend
+  instead of nginx's static files.
 
 ## 2.9.3 — The command line does what it says, agents make music and voice, outpaint fills the frame
 

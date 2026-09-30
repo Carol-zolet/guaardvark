@@ -105,7 +105,8 @@ def fetch_media(url: str, server: str = "", timeout: float = 60.0) -> bytes | No
 
     if not url.startswith(("http://", "https://")):
         url = (server or get_server_url()).rstrip("/") + "/" + url.lstrip("/")
-    headers = {"X-API-Key": get_api_key()} if get_api_key() else {}
+    api_key = get_api_key(url)
+    headers = {"X-API-Key": api_key} if api_key else {}
     try:
         resp = httpx.get(url, headers=headers, timeout=timeout)
         return resp.content if resp.status_code == 200 and resp.content else None
