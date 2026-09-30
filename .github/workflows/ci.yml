@@ -337,6 +337,7 @@ jobs:
             backend/tests/services/test_video_model_preflight.py \
             backend/tests/services/test_job_service_start.py \
             backend/tests/services/test_audio_foundry_offline.py \
+            backend/tests/test_mcp_generate_speech_voices.py \
             backend/tests/services/test_model_capabilities.py \
             backend/tests/utils/test_inline_reasoning.py \
             backend/tests/test_thinking_channel.py \
