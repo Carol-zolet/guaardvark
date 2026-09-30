@@ -44,7 +44,10 @@ def test_description_names_guaardvarks_own_source():
     desc = cst.SearchCodebaseTool.description
     assert "this Guaardvark install's own source" in desc
     assert "current project" not in desc
-    assert "grep" not in desc and " ls" not in desc
+    # The description may name the zvec_grep engine; what must be gone is the
+    # steer away from the client's own grep/ls, which searched a different tree.
+    assert "instead of shell commands" not in desc
+    assert "grep or ls" not in desc
 
 
 def test_mcp_refuses_a_root_outside_the_checkout(checkout, outside):
