@@ -6,11 +6,12 @@ approve cuts or start a GPU render — that stays a human gate in Studio.
 from __future__ import annotations
 
 import logging
+import os
 import re
 from pathlib import Path
 
 from backend.services.agent_tools import BaseTool, ToolParameter, ToolResult
-from backend.utils.backend_http import is_mcp_transport, run_tool_in_backend
+from backend.utils.backend_http import is_mcp_caller, is_mcp_transport, run_tool_in_backend
 
 logger = logging.getLogger(__name__)
 
@@ -83,66 +84,99 @@ def parse_film_crew_nl(message: str) -> dict:
     return {"script_text": script or None}
 
 
-_OUTSIDE_DATA_DIRS = "must be inside the uploads or outputs directory or the install root"
+# A feature-length screenplay is a few hundred KB of plain text. The cap keeps a
+# request thread from reading a model weight or disk image named by mistake.
+SCRIPT_FILE_MAX_BYTES = 1024 * 1024
+
+_REFERENCE_PREFIXES = ("http://", "https://", "guaardvark://", "/api/")
 
 
-def _local_media_path(ref: str):
-    """``ref`` as a Path when it names a file under a directory this install owns.
+def _script_accepted(mcp: bool) -> str:
+    where = ("uploads folder or an outputs folder MCP resources serve" if mcp
+             else "uploads, outputs or install folder")
+    return (
+        "Pass the screenplay itself as text, or a UTF-8 text file of up to "
+        f"{SCRIPT_FILE_MAX_BYTES // (1024 * 1024)} MB inside Guaardvark's {where} (by path, "
+        "/api/outputs/ URL or guaardvark://outputs/ URI)."
+    )
 
-    Returns (path, None), (None, error) when the path is outside those
-    directories, or (None, None) when ``ref`` does not point at an existing
-    file at all. Chat and MCP callers hand these tools arbitrary strings, so
-    the same containment as output registration applies.
+
+def _read_script_file(path: str):
+    """(text, None) for a UTF-8 text file up to SCRIPT_FILE_MAX_BYTES, else (None, error)."""
+    try:
+        size = os.path.getsize(path)
+        data = b""
+        if size <= SCRIPT_FILE_MAX_BYTES:
+            with open(path, "rb") as fh:
+                data = fh.read(SCRIPT_FILE_MAX_BYTES + 1)
+    except OSError as e:
+        return None, f"could not read script file: {e}"
+    if size > SCRIPT_FILE_MAX_BYTES or len(data) > SCRIPT_FILE_MAX_BYTES:
+        return None, (
+            f"script file is {max(size, len(data)) / (1024 * 1024):.1f} MB; script files are read up to "
+            f"{SCRIPT_FILE_MAX_BYTES // (1024 * 1024)} MB. Paste the screenplay text instead."
+        )
+    if b"\x00" in data:
+        return None, "script file is not a text file. Save the screenplay as plain UTF-8 text, or paste it."
+    try:
+        return data.decode("utf-8-sig"), None
+    except UnicodeDecodeError:
+        return None, (
+            "script file is not UTF-8 text (a .pdf, .docx or other binary file cannot be read as a "
+            "script). Save the screenplay as plain UTF-8 text, or paste it."
+        )
+
+
+def _script_body(script_text: str, *, mcp: bool = False):
+    """Return (text, None) or (None, error).
+
+    A one-line script_text that names a file (a path, an /api/outputs/ URL or a
+    guaardvark://outputs/ URI) is read under the shared media-input rules
+    (backend/utils/media_inputs.py) plus a text-only check and a size cap; any
+    other text is the script itself.
     """
-    from backend.services.output_registration import registrable_path
+    from backend.utils.media_inputs import resolve_media_ref
 
-    text = (ref or "").strip()
-    if not text:
-        return None, None
-    candidate = Path(text).expanduser()
-    inside = registrable_path(str(candidate))
-    if inside is not None and inside.is_file():
-        return inside, None
-    if candidate.is_file():
-        return None, f"{text} {_OUTSIDE_DATA_DIRS}"
-    return None, None
-
-
-def _script_body(script_text: str):
-    """Return (text, None) or (None, error). A one-line path to a script file
-    under the data directories is read; any other text is the script itself."""
     text = (script_text or "").strip()
     if not text:
         return None, "script_text is required"
-    if "\n" not in text:
-        path, err = _local_media_path(text)
-        if err:
-            return None, f"script file {err}"
-        if path is not None:
-            try:
-                return path.read_text(encoding="utf-8"), None
-            except OSError as e:
-                return None, f"could not read script file: {e}"
+    if "\n" in text:
+        return text, None
+    found = resolve_media_ref(
+        text, mcp=mcp, label="script file", within_install=True, accepted=_script_accepted(mcp),
+    )
+    if found.path:
+        return _read_script_file(found.path)
+    if found.refused or text.lower().startswith(_REFERENCE_PREFIXES):
+        return None, found.error
     return text, None
 
 
-def _document_from_song_ref(song: str):
-    """Return (Document, None) or (None, error). Creates a row for a local file."""
+def _document_from_song_ref(song: str, *, mcp: bool = False):
+    """Return (Document, None) or (None, error). Creates a row for a local file.
+
+    A document id (or its /api/files/document/<id>/download link) names an
+    existing row; anything else is resolved under the shared media-input rules.
+    """
     from backend.models import Document, db
+    from backend.utils.media_inputs import accepted_forms, document_id_from_ref, resolve_media_ref
 
     ref = (song or "").strip()
     if not ref:
         return None, "song is required (document id or path to an audio file)"
-    if ref.isdigit():
-        doc = db.session.get(Document, int(ref))
+    doc_id = document_id_from_ref(ref)
+    if doc_id is not None:
+        doc = db.session.get(Document, doc_id)
         if not doc:
-            return None, f"song document {ref} not found"
+            return None, f"song document {doc_id} not found"
         return doc, None
-    path, err = _local_media_path(ref)
-    if err:
-        return None, f"song file {err}"
-    if path is None:
-        return None, f"song file not found: {ref}"
+    found = resolve_media_ref(
+        ref, mcp=mcp, label="song file", within_install=True,
+        accepted=accepted_forms(mcp=mcp, documents=True, within_install=True),
+    )
+    if not found.path:
+        return None, found.error
+    path = Path(found.path)
     resolved = str(path)
     existing = Document.query.filter_by(path=resolved).first()
     if existing:
@@ -169,13 +203,21 @@ class MusicVideoTool(BaseTool):
         "Start a music-video project from a song and a visual style. Uploads or "
         "attaches the song, writes unique cut prompts, and stops at the approval "
         "gate — it does not spend GPU rendering clips. Use when the user asks to "
-        "make a music video. Pass song as a document id or a path to an audio file."
+        "make a music video. Pass song as a document id (generate_music reports one) "
+        "or the location of an audio file."
     )
     parameters = {
         "song": ToolParameter(
             name="song",
             type="string",
-            description="Document id or filesystem path of the song (mp3/wav/flac/ogg).",
+            description=(
+                "The song (mp3/wav/flac/ogg/m4a/aac): a library document id or "
+                "/api/files/document/<id>/download link, an /api/outputs/<path> URL, a "
+                "guaardvark://outputs/<path> resource URI, or a file path. Over MCP the file must be "
+                "in Guaardvark's uploads folder or in an outputs folder MCP resources serve (what "
+                "resources/list shows); in chat, anywhere in its uploads, outputs or install folder. "
+                "Files named like keys or credentials are refused everywhere."
+            ),
             required=True,
         ),
         "style_prompt": ToolParameter(
@@ -212,12 +254,18 @@ class MusicVideoTool(BaseTool):
             from backend.services.music_video_service import MusicVideoService
             from backend.api.music_video_api import _resolve_song
 
-            doc, err = _document_from_song_ref(song)
+            from backend.utils.media_inputs import check_media_file
+
+            mcp = is_mcp_caller(self)
+            doc, err = _document_from_song_ref(song, mcp=mcp)
             if err:
                 return ToolResult(success=False, error=err)
             song_path = _resolve_song(doc.id)
             if not song_path:
                 return ToolResult(success=False, error=f"song document {doc.id} is not on disk")
+            checked = check_media_file(str(song_path), mcp=mcp, label="song", shown=f"document {doc.id}")
+            if checked.error:
+                return ToolResult(success=False, error=checked.error)
 
             settings = {}
             if (i2v_model or "").strip():
@@ -283,7 +331,14 @@ class FilmCrewTool(BaseTool):
         "script_text": ToolParameter(
             name="script_text",
             type="string",
-            description="Screenplay or scene list (plain text).",
+            description=(
+                "Screenplay or scene list as plain text. A single line that names a file (a path, an "
+                "/api/outputs/<path> URL or a guaardvark://outputs/<path> URI) is read instead: UTF-8 "
+                "text only, up to 1 MB. Over MCP the file must be in Guaardvark's uploads folder or "
+                "in an outputs folder MCP resources serve (what resources/list shows); in chat, "
+                "anywhere in its uploads, outputs or install folder. Files named like keys or "
+                "credentials are refused everywhere."
+            ),
             required=True,
         ),
         "name": ToolParameter(
@@ -306,7 +361,7 @@ class FilmCrewTool(BaseTool):
             # The production row, model resolution and screenwriter dispatch belong to the backend process.
             arguments = {"script_text": script_text, "name": name, "video_model": video_model}
             return run_tool_in_backend(self.name, {k: v for k, v in arguments.items() if v is not None})
-        script_text, script_err = _script_body(script_text)
+        script_text, script_err = _script_body(script_text, mcp=is_mcp_caller(self))
         if script_err:
             return ToolResult(success=False, error=script_err)
         try:

@@ -11,8 +11,10 @@ deduplication.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Optional
@@ -75,6 +77,42 @@ def is_mcp_transport(tool: Any) -> bool:
     """True when the MCP adapter is the one calling this tool."""
     context = getattr(tool, "_context", None) or {}
     return context.get("transport") == "mcp"
+
+
+# Body field run_tool_in_backend adds so POST /api/tools/execute knows the call
+# came from an MCP client.
+CALLER_TRANSPORT_FIELD = "caller_transport"
+
+_caller = threading.local()
+
+
+@contextlib.contextmanager
+def calls_for_mcp_client(active: bool = True):
+    """Treat tool calls made on this thread as calls from an MCP client.
+
+    POST /api/tools/execute enters this for calls that run_tool_in_backend
+    forwarded, so a tool the MCP server hands to the backend keeps the input
+    rules it has over MCP. The mark is thread-local and only ever makes those
+    rules stricter, so a caller that sets it on purpose gains nothing.
+    """
+    previous = getattr(_caller, "mcp", False)
+    _caller.mcp = previous or bool(active)
+    try:
+        yield
+    finally:
+        _caller.mcp = previous
+
+
+def is_mcp_caller(tool: Any) -> bool:
+    """True when an MCP client asked for this call, in either process.
+
+    ``is_mcp_transport`` answers only "am I in the MCP server, so hand the
+    work to the backend?" and is false once the backend runs the tool. Rules
+    that are stricter for MCP clients (which files a tool may read) check this
+    instead: it is also true inside the backend for a call run_tool_in_backend
+    forwarded.
+    """
+    return is_mcp_transport(tool) or bool(getattr(_caller, "mcp", False))
 
 
 def _error_message(body: Any, fallback: str) -> str:
@@ -166,9 +204,11 @@ def run_tool_in_backend(tool_name: str, arguments: Mapping[str, Any], read_timeo
 
     For tools whose work belongs to the backend: its database session, Flask
     config, Celery dispatch or GPU queue. POST /api/tools/execute runs the
-    same tool through the backend's registry, so behaviour matches chat.
-    Arguments starting with ``_`` are internal to the calling process and
-    are not sent.
+    same tool through the backend's registry, so behaviour matches chat,
+    except where a tool is stricter with MCP clients: the call is marked as
+    coming from one (``CALLER_TRANSPORT_FIELD``), and ``is_mcp_caller`` is
+    true while the backend runs it. Arguments starting with ``_`` are
+    internal to the calling process and are not sent.
     """
     from backend.services.agent_tools import ToolResult
 
@@ -176,7 +216,7 @@ def run_tool_in_backend(tool_name: str, arguments: Mapping[str, Any], read_timeo
     try:
         body = request_json(
             "POST", "/api/tools/execute",
-            payload={"tool_name": tool_name, "parameters": parameters},
+            payload={"tool_name": tool_name, "parameters": parameters, CALLER_TRANSPORT_FIELD: "mcp"},
             read_timeout=read_timeout,
         ).body or {}
     except BackendError as e:

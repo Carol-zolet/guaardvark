@@ -323,6 +323,9 @@ jobs:
             backend/tests/test_search_codebase_scope.py \
             backend/tests/api/test_chat_export_api.py \
             backend/tests/test_audit_batch2_security.py \
+            backend/tests/utils/test_media_inputs.py \
+            backend/tests/test_mcp_media_tools.py \
+            backend/tests/services/test_animation_model_choice.py \
             backend/tests/services/test_connections_safety.py \
             backend/tests/services/test_resource_hardening.py \
             backend/tests/services/test_gpu_resource_policy.py \

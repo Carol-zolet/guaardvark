@@ -795,6 +795,17 @@ class OfflineImageGenerator:
             return "sdxl"
         return "sd"
 
+    def supports_img2img(self, model_key: str) -> bool:
+        """True when catalog key ``model_key`` can run generate_image_from_image
+        (a family ``_build_img2img_pipeline`` builds)."""
+        model_id = self.available_models.get(model_key or "")
+        if not model_id or model_key in self.comfy_only_models:
+            return False
+        family = self._model_family(model_id)
+        if family == "zimage":
+            return ZImageImg2ImgPipeline is not None
+        return family in ("sdxl", "sd")
+
     def _build_img2img_pipeline(self, family: str):
         """Share weights from the loaded txt2img pipeline for img2img edits."""
         if family == 'krea2':

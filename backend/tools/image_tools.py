@@ -14,7 +14,7 @@ from typing import Optional
 from backend.services.agent_tools import BaseTool, ToolParameter, ToolResult
 from backend.utils.backend_http import backend_base_url as _backend_base_url
 from backend.utils.backend_http import http_json as _http_json
-from backend.utils.backend_http import is_mcp_transport, run_tool_in_backend
+from backend.utils.backend_http import is_mcp_caller, is_mcp_transport, run_tool_in_backend
 from backend.services.job_types import RenderErrorKind, batch_failure, describe_failure, failure_kind, failure_text
 
 logger = logging.getLogger(__name__)
@@ -25,6 +25,23 @@ _KONTEXT_MODEL_IDS = frozenset({
 _QWEN_EDIT_MODEL_IDS = frozenset({
     "qwen", "qwen-image-edit", "qwen-edit", "qwenimage-edit",
 })
+
+# What the media-input parameters accept (rules: backend/utils/media_inputs.py).
+_SERVED_FORMS = (
+    "a URL an image or edit tool returned (/api/batch-image/image/<batch>/<file> or "
+    "/api/outputs/<path>, also with http://host:port in front), a guaardvark://outputs/<path> "
+    "resource URI"
+)
+_PATH_RULE = (
+    "Over MCP the file must be in Guaardvark's uploads folder or in an outputs folder MCP "
+    "resources serve (what resources/list shows); files named like keys or credentials "
+    "(.env, *.pem, *.key, id_rsa* and similar) are refused everywhere."
+)
+_IMAGE_INPUT_FORMS = f"{_SERVED_FORMS}, a data: URI, or a file path. {_PATH_RULE}"
+_VIDEO_INPUT_FORMS = (
+    f"a library document id or /api/files/document/<id>/download link, {_SERVED_FORMS}, "
+    f"or a file path. {_PATH_RULE}"
+)
 
 
 def _unwrap_nested_prompt_json(prompt: str) -> tuple[str, list[int]]:
@@ -1022,9 +1039,11 @@ class AnimationGeneratorTool(BaseTool):
     destructive = False
     description = (
         "Generate a short looping GIF or frame-morph MP4 from a text prompt with "
-        "motion description, via Stable Diffusion img2img. Use when the user asks "
-        "to animate, create a GIF, or make a looping frame morph. For a cinema "
-        "clip from a video model use generate_video instead."
+        "motion description: frame 1 from the prompt, each later frame by img2img on "
+        "a downloaded image model that supports it (Z-Image Turbo, SDXL or Stable "
+        "Diffusion, picked automatically). Use when the user asks to animate, create "
+        "a GIF, or make a looping frame morph. For a cinema clip from a video model "
+        "use generate_video instead."
     )
     parameters = {
         "prompt": ToolParameter(
@@ -1183,24 +1202,20 @@ def _dims_for_ratio(ratio: str, caps: dict) -> tuple:
     return width, height
 
 
-def _media_path(ref: Optional[str]) -> Optional[str]:
-    """A local path for a Document id or a path the caller already has."""
-    if ref is None:
-        return None
-    text = str(ref).strip()
-    if not text:
-        return None
-    if text.isdigit():
-        try:
-            from backend.models import Document
-            from backend.services.document_path_resolver import resolve_document_path
-            doc = Document.query.get(int(text))
-            path = resolve_document_path(doc) if doc else None
-            return str(path) if path else None
-        except Exception as e:  # noqa: BLE001 — a missing row is a plain "not found"
-            logger.info("document %s did not resolve: %s", text, e)
-            return None
-    return text if os.path.exists(text) else None
+def _document_file(doc_id: int) -> Optional[str]:
+    """The file behind a library document, or None."""
+    from backend.models import Document, db
+    from backend.services.document_path_resolver import resolve_document_path
+    doc = db.session.get(Document, doc_id)
+    path = resolve_document_path(doc) if doc else None
+    return str(path) if path else None
+
+
+def _media_input(ref, *, mcp: bool, label: str):
+    """A generate_video input (document id, served URL, resource URI or path)
+    as a MediaRef, under the shared media-input rules."""
+    from backend.utils.media_inputs import resolve_media_ref
+    return resolve_media_ref(ref, mcp=mcp, label=label, document_path=_document_file)
 
 
 class VideoGeneratorTool(BaseTool):
@@ -1274,27 +1289,29 @@ class VideoGeneratorTool(BaseTool):
         "first_image": ToolParameter(
             name="first_image",
             type="string",
-            description="Document id or path of the first frame (image-to-video).",
+            description=f"First frame (image-to-video): {_VIDEO_INPUT_FORMS}",
             required=False,
         ),
         "last_image": ToolParameter(
             name="last_image",
             type="string",
-            description="Document id or path of the last frame; needs a model with first+last-frame mode.",
+            description=("Last frame; needs a model with first+last-frame mode. Same forms as "
+                         "first_image."),
             required=False,
         ),
         "reference_images": ToolParameter(
             name="reference_images",
             type="list",
             items="string",
-            description=("Document ids or paths of reference images (identity, look), each "
-                         "as a string; needs the reference build."),
+            description=("Reference images (identity, look), each as a string in the same forms "
+                         "as first_image; needs the reference build."),
             required=False,
         ),
         "reference_audio": ToolParameter(
             name="reference_audio",
             type="string",
-            description="Document id or path of a voice or music reference; needs the reference build.",
+            description=("A voice or music reference, in the same forms as first_image (a generated "
+                         "song's document id works); needs the reference build."),
             required=False,
         ),
         "speed_profile": ToolParameter(
@@ -1484,6 +1501,19 @@ class VideoGeneratorTool(BaseTool):
         duration_frames = params["duration_frames"]
         num_inference_steps = params.get("num_inference_steps")
 
+        # Inputs resolve before the model preflight, which may start ComfyUI.
+        mcp = is_mcp_caller(self)
+        inputs = [("first_image", first_image), ("last_image", last_image)]
+        inputs += [("reference image", r) for r in (reference_images or []) if str(r or "").strip()]
+        inputs.append(("reference_audio", reference_audio))
+        resolved = []
+        for label, ref in inputs:
+            found = _media_input(ref, mcp=mcp, label=label)
+            if found.error:
+                return ToolResult(success=False, error=found.error)
+            resolved.append(found.path)
+        first_path, last_path, *ref_paths, ref_audio_path = resolved
+
         logger.info("VideoGeneratorTool: model=%s frames=%s steps=%s wait=%s prompt=%r",
                     model_id, duration_frames, num_inference_steps, wait_for_result, prompt[:100])
         try:
@@ -1499,19 +1529,6 @@ class VideoGeneratorTool(BaseTool):
             generator = get_batch_video_generator()
             if not generator.service_available:
                 return ToolResult(success=False, error="Video generation service not available")
-
-            first_path = _media_path(first_image) if first_image else None
-            if first_image and not first_path:
-                return ToolResult(success=False, error=f"first_image not found: {first_image}")
-            last_path = _media_path(last_image) if last_image else None
-            if last_image and not last_path:
-                return ToolResult(success=False, error=f"last_image not found: {last_image}")
-            ref_paths = [_media_path(r) for r in (reference_images or [])]
-            if any(p is None for p in ref_paths):
-                return ToolResult(success=False, error="A reference image was not found")
-            ref_audio_path = _media_path(reference_audio) if reference_audio else None
-            if reference_audio and not ref_audio_path:
-                return ToolResult(success=False, error=f"reference_audio not found: {reference_audio}")
 
             if ref_paths or ref_audio_path:
                 # The reference build reads the references from the batch
@@ -1655,9 +1672,8 @@ class EditImageTool(BaseTool):
         ),
         "image": ToolParameter(
             name="image", type="string",
-            description=("The image to edit. In chat, omit it to use the image the user just attached. "
-                         "From an MCP client, pass a url that get_generation_status or an edit tool "
-                         "returned (e.g. /api/batch-image/image/<batch>/<file>), or a file path."),
+            description=("The image to edit. In chat, omit it to use the image the user just attached; "
+                         f"otherwise {_IMAGE_INPUT_FORMS}"),
             required=False, default="",
         ),
         "steps": ToolParameter(
@@ -1676,12 +1692,12 @@ class EditImageTool(BaseTool):
         ),
         "reference_image_2": ToolParameter(
             name="reference_image_2", type="string",
-            description="Optional second reference (another person or style). Qwen-Image-Edit only.",
+            description="Optional second reference (another person or style), in the same forms as image. Qwen-Image-Edit only.",
             required=False, default="",
         ),
         "reference_image_3": ToolParameter(
             name="reference_image_3", type="string",
-            description="Optional third reference. Qwen-Image-Edit only.",
+            description="Optional third reference, in the same forms as image. Qwen-Image-Edit only.",
             required=False, default="",
         ),
     }
@@ -1779,70 +1795,53 @@ class EditImageTool(BaseTool):
         )
 
     def _resolve_image(self, image: str):
-        """Resolve a path / URL / data-URI to a local file. None if unresolvable.
-        (The common case — the user's attached image — is injected by the chat engine
-        as a real disk path, so this is the fallback for explicit paths/URLs.)"""
+        """The local file for ``image``, or None when it cannot be used."""
+        return self._resolve_image_ref(image).path
+
+    def _resolve_image_ref(self, image: str, label: str = "image"):
+        """``image`` (data URI, served URL, resource URI or path) as a MediaRef.
+
+        The chat engine injects the user's attached image as a disk path in the
+        uploads folder; explicit URLs and paths go through the shared
+        media-input rules (backend/utils/media_inputs.py), which are stricter
+        for MCP clients and never download a remote URL.
+        """
+        from backend.utils.media_inputs import MediaRef, resolve_media_ref
         if not image:
-            return None
-        if os.path.exists(image):
-            return image
-        try:
-            from backend.config import OUTPUT_DIR
-        except Exception:
-            OUTPUT_DIR = "."
-        edit_dir = os.path.join(OUTPUT_DIR, "edit_inputs")
-        os.makedirs(edit_dir, exist_ok=True)
-        # data URI or bare base64 blob
+            return MediaRef()
+        # data URI or bare base64 blob: the caller sent the bytes, nothing is read from disk
         if image.startswith("data:") or (len(image) > 256 and "/" not in image[:64] and " " not in image[:64]):
             try:
                 import base64
+                from backend.config import OUTPUT_DIR
+                edit_dir = os.path.join(OUTPUT_DIR, "edit_inputs")
+                os.makedirs(edit_dir, exist_ok=True)
                 raw = base64.b64decode(image.split(",", 1)[1] if image.startswith("data:") else image)
                 p = os.path.join(edit_dir, f"edit_src_{uuid.uuid4().hex[:12]}.png")
                 with open(p, "wb") as f:
                     f.write(raw)
-                return p
-            except Exception:
-                return None
-        # a served output URL → map back to disk
-        if "/api/outputs/" in image:
-            cand = os.path.join(OUTPUT_DIR, image.split("/api/outputs/", 1)[1].split("?", 1)[0])
-            if os.path.exists(cand):
-                return cand
-        # an image-batch URL, as get_generation_status reports it → the batch folder
-        batch_ref = re.search(r"/api/batch-image/image/([^/?#]+)/([^/?#]+)", image)
-        if batch_ref:
-            from backend.config import UPLOAD_DIR
-            base = (Path(UPLOAD_DIR) / "Images").resolve()
-            cand = (base / batch_ref.group(1) / "images" / batch_ref.group(2)).resolve()
-            if cand.is_relative_to(base) and cand.is_file():
-                return str(cand)
-        # OFFLINE-FIRST: never fetch an external URL. A remote image URL (e.g. a
-        # files.oaiusercontent.com / CDN link that rode in with the attachment) must
-        # NOT trigger an outbound request. Same-host app URLs were already mapped to
-        # disk above; anything else is refused, not downloaded.
-        if image.startswith("http://") or image.startswith("https://"):
-            logger.warning(
-                "edit_image: refusing to fetch a non-local image URL (offline-first): %s",
-                image[:80],
-            )
-            return None
-        return None
+                return MediaRef(path=p)
+            except Exception as e:  # noqa: BLE001 — undecodable input is a plain refusal
+                return MediaRef(error=f"{label} looked like base64 image data but did not decode: {e}")
+        return resolve_media_ref(image, mcp=is_mcp_caller(self), label=label)
 
     def execute(self, instruction: str, image: str = "", steps: int = 28,
                 model: str = "auto", reference_image_2: str = "",
                 reference_image_3: str = "", **kwargs) -> ToolResult:
-        src = self._resolve_image(image)
-        if not src:
+        found = self._resolve_image_ref(image)
+        if not found.path:
             return ToolResult(
                 success=False,
-                error="No image to edit. Ask the user to attach the image they want edited.",
+                error=found.error or "No image to edit. Ask the user to attach the image they want edited.",
             )
+        src = found.path
         extra = []
-        for raw in (reference_image_2, reference_image_3):
-            if raw:
-                p = self._resolve_image(raw)
-                if p:
-                    extra.append(p)
+        for label, raw in (("reference_image_2", reference_image_2), ("reference_image_3", reference_image_3)):
+            ref = self._resolve_image_ref(raw, label=label)
+            if ref.refused:
+                return ToolResult(success=False, error=ref.error)
+            if ref.path:
+                extra.append(ref.path)
         gpu_wait = None
         try:
             from backend.config import OUTPUT_DIR
@@ -1952,6 +1951,13 @@ def _gpu_refusal(e: Exception, gpu_wait: dict | None) -> str | None:
     return None
 
 
+def _edit_tool_for(caller: BaseTool) -> "EditImageTool":
+    """An EditImageTool that shares ``caller``'s context, so input rules see the same transport."""
+    tool = EditImageTool()
+    tool.set_context(dict(getattr(caller, "_context", None) or {}))
+    return tool
+
+
 def _chat_png_path(prefix: str) -> tuple[str, str]:
     from backend.config import OUTPUT_DIR
     output_dir = os.path.join(OUTPUT_DIR, "generated_images")
@@ -1975,16 +1981,16 @@ class RemoveBackgroundTool(BaseTool):
     parameters = {
         "image": ToolParameter(
             name="image", type="string",
-            description=("The photo. In chat, omit it to use the attached image. From an MCP client, pass a "
-                         "url that get_generation_status or an edit tool returned, or a file path."),
+            description=f"The photo. In chat, omit it to use the attached image; otherwise {_IMAGE_INPUT_FORMS}",
             required=False, default="",
         ),
     }
 
     def execute(self, image: str = "", **kwargs) -> ToolResult:
-        src = EditImageTool()._resolve_image(image)
-        if not src:
-            return ToolResult(success=False, error="Attach the photo to cut out.")
+        found = _edit_tool_for(self)._resolve_image_ref(image)
+        if not found.path:
+            return ToolResult(success=False, error=found.error or "Attach the photo to cut out.")
+        src = found.path
         from PIL import Image
         from backend.services.background_removal import (
             BackgroundRemovalNotInstalled, installed_model, remove_background,
@@ -2029,8 +2035,7 @@ class InpaintImageTool(BaseTool):
         ),
         "image": ToolParameter(
             name="image", type="string",
-            description=("The photo. In chat, omit it to use the attached image. From an MCP client, pass a "
-                         "url that get_generation_status or an edit tool returned, or a file path."),
+            description=f"The photo. In chat, omit it to use the attached image; otherwise {_IMAGE_INPUT_FORMS}",
             required=False, default="",
         ),
         "steps": ToolParameter(
@@ -2042,7 +2047,7 @@ class InpaintImageTool(BaseTool):
 
     def execute(self, instruction: str, image: str = "", steps: int = 20, **kwargs) -> ToolResult:
         model = kwargs.get("model") or "auto"
-        return EditImageTool().execute(
+        return _edit_tool_for(self).execute(
             instruction=instruction, image=image, steps=int(steps) or 20, model=model,
         )
 
@@ -2061,8 +2066,7 @@ class OutpaintImageTool(BaseTool):
     parameters = {
         "image": ToolParameter(
             name="image", type="string",
-            description=("The photo. In chat, omit it to use the attached image. From an MCP client, pass a "
-                         "url that get_generation_status or an edit tool returned, or a file path."),
+            description=f"The photo. In chat, omit it to use the attached image; otherwise {_IMAGE_INPUT_FORMS}",
             required=False, default="",
         ),
         "instruction": ToolParameter(
@@ -2079,9 +2083,10 @@ class OutpaintImageTool(BaseTool):
 
     def execute(self, image: str = "", instruction: str = "", left: int = 0, right: int = 0,
                 top: int = 0, bottom: int = 0, steps: int = 20, **kwargs) -> ToolResult:
-        src = EditImageTool()._resolve_image(image)
-        if not src:
-            return ToolResult(success=False, error="Attach the photo to extend.")
+        found = _edit_tool_for(self)._resolve_image_ref(image)
+        if not found.path:
+            return ToolResult(success=False, error=found.error or "Attach the photo to extend.")
+        src = found.path
         pad = {
             "left": max(0, int(left) or 0),
             "right": max(0, int(right) or 0),
@@ -2175,8 +2180,7 @@ class GenerateIdentityTool(BaseTool):
         ),
         "image": ToolParameter(
             name="image", type="string",
-            description=("Face reference. In chat, omit it to use the attached image; otherwise a url an "
-                         "image tool returned, or a file path."),
+            description=f"Face reference. In chat, omit it to use the attached image; otherwise {_IMAGE_INPUT_FORMS}",
             required=False, default="",
         ),
         "consented": ToolParameter(
@@ -2226,9 +2230,11 @@ class GenerateIdentityTool(BaseTool):
                       "likeness the user has the right to use (their photo or a Cast subject "
                       "they uploaded).",
             )
-        src = EditImageTool()._resolve_image(image)
-        if not src:
-            return ToolResult(success=False, error="Attach a face photo, then describe the new scene.")
+        found = _edit_tool_for(self)._resolve_image_ref(image)
+        if not found.path:
+            return ToolResult(success=False,
+                              error=found.error or "Attach a face photo, then describe the new scene.")
+        src = found.path
         if not has_consent(src):
             return ToolResult(
                 success=False,
