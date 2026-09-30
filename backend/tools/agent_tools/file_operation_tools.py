@@ -257,7 +257,9 @@ class ProcessFileTool(BaseTool):
         "elements, tags dropped. CSV, .txt, .md, .rst, .json, .yaml, .toml, .ini, .log and .html: the "
         "file as-is (UTF-8, up to 10 MB). Excel (.xlsx, .xlsm): a workbook summary, then for each sheet "
         "with data its size, column names and first 20 rows (up to 50 sheets and 10,000 rows a sheet "
-        "are read); .xls and .xlsb need the xlrd or pyxlsb package, which a stock install lacks. "
+        "are read); .xls needs the xlrd package and .xlsb the pyxlsb package, which a stock install "
+        "lacks. A file that is password-protected, damaged or in an old format fails with an error "
+        "that says which. "
         "Image text (.jpg, .jpeg, .png, .gif, .bmp, .webp) is read by a vision model in the local "
         "Ollama, and fails with an error when none is available. For documents already indexed use "
         "search_knowledge_base or read_document_section; for source code, read_code."
@@ -391,19 +393,27 @@ class ProcessFileTool(BaseTool):
             )
 
         try:
-            from backend.utils.enhanced_file_processor import create_file_processor
-            result = create_file_processor().process_file(str(path))
+            from backend.utils.enhanced_file_processor import FileProcessingError, create_file_processor
         except ImportError as e:
             logger.error(f"Enhanced file processor not available: {e}")
             return ToolResult(success=False, error="File processing system not available")
+        def reason_text(reason) -> str:
+            # A reader's message may spell out the file's full path.
+            return str(reason).replace(str(path), shown)
+
+        try:
+            result = create_file_processor().process_file(str(path), raise_errors=True)
+        except FileProcessingError as e:
+            return ToolResult(success=False, error=f"Could not read {shown}: {reason_text(e)}")
         except Exception as e:
             logger.error(f"Error processing file {file_path}: {e}", exc_info=True)
-            return ToolResult(success=False, error=f"Failed to process {shown}: {e}")
+            return ToolResult(success=False, error=f"Failed to process {shown}: {reason_text(e)}")
 
         if not result:
+            kind = f"'{path.suffix.lower()}' files" if path.suffix else "files without an extension"
             return ToolResult(
                 success=False,
-                error=f"Failed to process {shown}: unsupported type or the file could not be parsed",
+                error=f"Cannot read {shown}: {kind} are not a type this tool reads",
             )
 
         meta = result.metadata
@@ -413,7 +423,7 @@ class ProcessFileTool(BaseTool):
             extraction = result.extraction_results or {}
             if not extraction.get("success"):
                 reason = extraction.get("error") or "the workbook could not be read"
-                return ToolResult(success=False, error=f"Could not read {shown}: {reason}")
+                return ToolResult(success=False, error=f"Could not read {shown}: {reason_text(reason)}")
         if fmt in ("jpg", "jpeg", "png", "gif", "bmp", "webp", "svg"):
             extraction = result.extraction_results or {}
             if not extraction.get("success"):
