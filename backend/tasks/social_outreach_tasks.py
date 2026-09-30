@@ -172,7 +172,7 @@ def tick_recon_reddit(self) -> dict:
 def tick_recon_youtube(self) -> dict:
     """Beat tick — Recon agent scouts YouTube via web_search for candidates.
 
-    Read-only: pulls a DDG result page filtered to site:youtube.com, writes
+    Read-only: pulls a web search result page filtered to site:youtube.com, writes
     status="candidate" rows for video URLs. Never drafts, never posts. Safe
     to run on cron — same kill-switch gate as the reddit recon. Disabled by
     default in celery_app.py beat schedule.

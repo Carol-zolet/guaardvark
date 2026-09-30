@@ -370,6 +370,7 @@ jobs:
             backend/tests/services/test_video_model_preflight.py \
             backend/tests/services/test_job_service_start.py \
             backend/tests/services/test_model_capabilities.py \
+            backend/tests/unit/test_web_search_sitemap.py \
             backend/tests/unit/test_process_file_failure_reasons.py \
             backend/tests/unit/test_process_file_upload_paths.py \
             backend/tests/unit/test_web_search_sources.py \

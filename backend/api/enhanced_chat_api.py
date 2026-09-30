@@ -103,6 +103,13 @@ _request_cache = {}
 _cache_lock = threading.Lock()
 
 
+def _web_answer_source(search_results: Dict[str, Any]) -> str:
+    """The service that answered a web search, as enhanced_web_search names it
+    in data["source"]; the page's URL for a page read directly."""
+    data = search_results.get("data") or {}
+    return data.get("source") or data.get("url") or search_results.get("strategy_used", "unknown")
+
+
 class StaticResponseStream:
     """Adapter wrapping a completed LLM response for stream-compatible callers."""
 
@@ -1691,19 +1698,26 @@ Context: {context_info.get('total_contexts', 0)} conversation contexts available
                     "strategy_used": strategy,
                     "raw_results": search_results,
                     "formatted_context": formatted_context,
-                    "user_message": f"Based on web search results ({strategy}): {data.get('snippet', 'Information retrieved')}"
+                    "user_message": (
+                        f"Based on web search results ({_web_answer_source(search_results)}): "
+                        f"{data.get('snippet', 'Information retrieved')}"
+                    )
                 }
             else:
                 # Web search failed - return failure info for transparency
                 error_info = search_results.get("data", {})
                 logger.warning(f"Web search failed: {error_info}")
+                reason = search_results.get("error") or error_info.get("message") or "the search failed."
 
                 return {
                     "success": False,
                     "error": "Web search failed",
                     "strategy_used": search_results.get("strategy_used", "failed"),
                     "raw_results": search_results,
-                    "user_message": "I attempted to search the web but couldn't retrieve current information. I'll provide what I can from my training knowledge."
+                    "user_message": (
+                        f"I searched the web and could not retrieve current information: {reason} "
+                        "I'll provide what I can from my training knowledge."
+                    )
                 }
 
         except Exception as e:
@@ -1716,12 +1730,11 @@ Context: {context_info.get('total_contexts', 0)} conversation contexts available
             }
 
     def _format_web_search_context(self, search_results: Dict[str, Any], original_query: str) -> str:
-        """CHANGE 4: Format web search results for LLM context with clear source attribution"""
+        """Format web search results for LLM context, naming the service that answered."""
         data = search_results.get("data", {})
-        strategy = search_results.get("strategy_used", "unknown")
 
         context_parts = [f"=== WEB SEARCH RESULTS FOR: {original_query} ==="]
-        context_parts.append(f"Search Strategy: {strategy}")
+        context_parts.append(f"Source: {_web_answer_source(search_results)}")
         context_parts.append(f"Search Timestamp: {datetime.now().isoformat()}")
         context_parts.append("")
         context_parts.append("IMPORTANT: Use this real-time web search information to answer the user's question. This is current, up-to-date information from the internet.")
@@ -1746,9 +1759,7 @@ Context: {context_info.get('total_contexts', 0)} conversation contexts available
             context_parts.append("NOTE: This is current weather data retrieved from the web.")
 
         elif data_type == "search_results":
-            # CHANGE 4: Handle DuckDuckGo search results properly
-            context_parts.append(f"WEB SEARCH RESULTS (DuckDuckGo):")
-            context_parts.append(f"Source: {data.get('source', 'DuckDuckGo')}")
+            context_parts.append("WEB SEARCH RESULTS:")
             if data.get('results'):
                 context_parts.append("")
                 context_parts.append("Search Results:")

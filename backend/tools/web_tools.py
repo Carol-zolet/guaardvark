@@ -14,7 +14,7 @@ from backend.utils.web_fetch import (
     DEADLINE_SECONDS, IDLE_SECONDS, MAX_PAGE_BYTES, MAX_REDIRECTS, megabytes,
 )
 from backend.utils.web_search_sources import (
-    DEFAULT_SEARCH_RESULTS, FALLBACK_SEARCH_SOURCE, MAX_SEARCH_RESULTS, SEARCH_ENGINE, WEATHER_SOURCE,
+    DEFAULT_SEARCH_RESULTS, MAX_SEARCH_RESULTS, SEARCH_ENGINE, WEATHER_SOURCE,
 )
 
 logger = logging.getLogger(__name__)
@@ -526,11 +526,12 @@ class WebSearchTool(BaseTool):
         "source field naming the service that answered. Use this for open-ended research or when "
         "you need to discover pages about a topic. For fetching a SPECIFIC URL or domain the user "
         "already named, use fetch_url instead (it's a direct fetch, no search ranking in between). "
-        f"The query is sent to {SEARCH_ENGINE} (through the duckduckgo-search client); when that "
-        f"returns nothing it is sent to {FALLBACK_SEARCH_SOURCE} (Jina AI's reader). A question "
-        f"about the weather in a named place goes to {WEATHER_SOURCE} instead; the current time and "
-        "plain arithmetic are answered on this machine; a URL in the query is fetched directly. "
-        "Needs web access on in Settings (off by default)."
+        f"The query is sent to {SEARCH_ENGINE} (through the duckduckgo-search client) and nowhere "
+        f"else. When {SEARCH_ENGINE} finds nothing, results is empty, no_results is true and summary "
+        f"says so; when {SEARCH_ENGINE} refuses the search or cannot be reached, the call fails with "
+        f"the reason. A question about the weather in a named place goes to {WEATHER_SOURCE} "
+        "instead; the current time and plain arithmetic are answered on this machine; a URL in the "
+        "query is fetched directly. Needs web access on in Settings (off by default)."
     )
 
     parameters = {
@@ -546,8 +547,7 @@ class WebSearchTool(BaseTool):
             required=False,
             description=(
                 f"How many results to ask for, 1 to {MAX_SEARCH_RESULTS} (default "
-                f"{DEFAULT_SEARCH_RESULTS}). Fewer come back when the search finds fewer; the "
-                f"{FALLBACK_SEARCH_SOURCE} fallback returns at most 5."
+                f"{DEFAULT_SEARCH_RESULTS}). Fewer come back when the search finds fewer."
             ),
             default=DEFAULT_SEARCH_RESULTS,
             minimum=1,
@@ -586,6 +586,24 @@ class WebSearchTool(BaseTool):
             # address may be, as with fetch_url.
             search_results = enhanced_web_search(
                 query, public_only=is_mcp_transport(self), max_results=max_results)
+
+            if search_results and not search_results.get("success") and (
+                    (search_results.get("data") or {}).get("type") == "no_results"):
+                # The engine answered and found nothing. That is a result, not a
+                # fault: the caller can rephrase, and a run of them does not
+                # trip the failure breaker in the chat loop or the MCP server.
+                data = search_results["data"]
+                return ToolResult(
+                    success=True,
+                    output={
+                        "query": query,
+                        "results": [],
+                        "summary": data.get("message", ""),
+                        "source": data.get("source", SEARCH_ENGINE),
+                        "no_results": True,
+                    },
+                    metadata={"result_count": 0, "query": query},
+                )
 
             if not search_results or not search_results.get("success"):
                 error_msg = search_results.get("error") if search_results else "Web search failed"
