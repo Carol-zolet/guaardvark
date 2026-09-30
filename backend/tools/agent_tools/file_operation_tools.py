@@ -272,10 +272,12 @@ class ProcessFileTool(BaseTool):
                 "'data/uploads/report.pdf'), else relative to its uploads folder (e.g. "
                 "'reports/q3.pdf'), or an absolute path inside Guaardvark's uploads, outputs or install "
                 "folder. Files named like keys or credentials (.env*, *.pem, *.key, id_rsa*, "
-                "credentials*, .netrc and similar) are refused everywhere; inside the install folder so "
-                "are git-ignored data (other than uploads and outputs) and .git, venv, logs and similar "
-                "folders. In Guaardvark's own chat an absolute path elsewhere also works, except system "
-                "folders and anything under a hidden folder or named with a leading '.', and not with "
+                "credentials*, .netrc and similar) are refused everywhere. Inside the install folder, "
+                "uploads and outputs included, anything under a .git, venv, node_modules, dist, logs "
+                "or similar folder is refused, and so is git-ignored data other than uploads and "
+                "outputs. A relative and an absolute path to the same file get the same answer. In "
+                "Guaardvark's own chat an absolute path elsewhere also works, except system folders "
+                "and anything under a hidden folder or named with a leading '.', and not with "
                 "Settings > Project folder only on; over MCP it is refused."
             ),
         )
@@ -292,12 +294,18 @@ class ProcessFileTool(BaseTool):
 
         if is_sensitive(str(path)):
             return "credential, key and .env files are not read"
-        if path.is_relative_to(uploads) or path.is_relative_to(outputs):
-            return None
+        internal = "files under .git, venv, node_modules, dist, logs and similar folders are not read"
+        for base in (uploads, outputs):
+            if path.is_relative_to(base):
+                # Uploads and outputs are read although git ignores them. A
+                # repository's own folders are still not documents, wherever the
+                # repository was uploaded to.
+                rel = path.relative_to(base).as_posix()
+                return internal if rel not in ("", ".") and forbidden_path_reason(rel) else None
         if path.is_relative_to(root):
             rel = path.relative_to(root).as_posix()
             if forbidden_path_reason(rel):
-                return "files under .git, venv, node_modules, dist, logs and similar folders are not read"
+                return internal
             if private_path_reason(rel, root):
                 return "git-ignored local data is not read"
             return None
@@ -330,7 +338,12 @@ class ProcessFileTool(BaseTool):
         except RuntimeError as e:  # ~user with no such user
             return None, f"'{file_path}' is not a valid path: {e}"
         # A relative path is tried in the Guaardvark folder, then in its uploads.
+        # A name the first place refuses ('server.log', which the install's
+        # .gitignore covers) may still be a file in uploads, so a refusal there
+        # is kept and given only if uploads has no such file either. That way a
+        # relative and an absolute path to the same upload get the same answer.
         options = [(candidate, None)] if candidate.is_absolute() else [(root / candidate, root), (uploads / candidate, uploads)]
+        refusal = None
         for option, base in options:
             try:
                 path = option.resolve()
@@ -340,12 +353,15 @@ class ProcessFileTool(BaseTool):
                 return None, f"'{file_path}' was refused: a relative path may not leave the Guaardvark folder"
             reason = self._refusal(path, root, uploads, outputs)
             if reason:
-                return None, f"'{file_path}' was refused: {reason}"
+                refusal = refusal or reason
+                continue
             try:
                 if path.is_file():
                     return path, None
             except OSError as e:
                 return None, f"'{file_path}' could not be read: {e}"
+        if refusal:
+            return None, f"'{file_path}' was refused: {refusal}"
         where = "" if candidate.is_absolute() else " (a relative path is looked up in the Guaardvark folder, then in its uploads)"
         return None, f"File not found: {file_path}{where}"
 
@@ -359,9 +375,9 @@ class ProcessFileTool(BaseTool):
         shown = path.relative_to(root).as_posix() if path.is_relative_to(root) else str(path)
 
         if path.suffix.lower() in PLAIN_TEXT_SUFFIXES:
-            if path.stat().st_size > MAX_PLAIN_TEXT_BYTES:
-                return ToolResult(success=False, error=f"{shown} is over 10 MB")
             try:
+                if path.stat().st_size > MAX_PLAIN_TEXT_BYTES:
+                    return ToolResult(success=False, error=f"{shown} is over 10 MB")
                 text = path.read_text(encoding="utf-8")
             except UnicodeDecodeError:
                 return ToolResult(success=False, error=f"{shown} is not UTF-8 text")
