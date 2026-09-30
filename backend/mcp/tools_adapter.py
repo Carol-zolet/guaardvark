@@ -232,7 +232,9 @@ def _timeout_message(name: str, timeout: float, read_only: bool = False, key: st
     )
     if read_only:
         return head + (
-            " It changes nothing, so calling it again is safe; for longer work raise "
+            " It changes nothing, so a retry is safe, but the first run keeps going: a retry "
+            "starts a second one behind it (model-backed tools such as analyze_code can run "
+            "for minutes). Give it time before retrying; for longer work raise "
             f"{SERVER_TIMEOUT_ENV} or data/config/mcp.json server.timeout_seconds."
         )
     if key:

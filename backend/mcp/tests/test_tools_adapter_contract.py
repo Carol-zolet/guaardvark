@@ -262,4 +262,4 @@ def test_timeout_messages_do_not_advise_resubmitting_a_write():
     keyed = tools_adapter._timeout_message("generate_video", 120, key="k9")
     assert "'k9'" in keyed and "will not start a second one" in keyed
     read = tools_adapter._timeout_message("search_code", 120, read_only=True)
-    assert "safe" in read
+    assert "safe" in read and "starts a second one behind it" in read
