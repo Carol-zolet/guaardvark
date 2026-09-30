@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import uuid
 from pathlib import Path
 
@@ -58,12 +59,55 @@ def _truthy(value) -> bool:
     return str(value or "").strip().lower() in ("1", "true", "yes", "on")
 
 
-def _clip_file(clip_id: str):
-    """The audio file for a clip id (its file name without the extension), or None."""
+# The import names a clip after its file: a secure_filename stem, plus the
+# Files-app " (n)" it adds when that name is taken (filename_resolver).
+_COLLISION_SUFFIX = re.compile(r" \([1-9][0-9]{0,3}\)$")
+
+
+def _valid_clip_ref(ref: str) -> bool:
+    """Whether ``ref`` has the shape of a clip reference: a clip id (the file
+    name without its extension) or the file name itself. Either way the stem
+    is a secure_filename, optionally followed by the import's " (n)", so it
+    can hold no path separator or parent reference."""
+    if not ref or ref != ref.strip():
+        return False
+    stem = ref
+    suffix = Path(ref).suffix
+    if suffix.lower() in _ALLOWED_AUDIO_EXTS:
+        stem = ref[: -len(suffix)]
+    base = _COLLISION_SUFFIX.sub("", stem)
+    return bool(base) and secure_filename(base) == base
+
+
+def _clip_file(ref: str):
+    """The audio file ``ref`` names inside voice_references, or None.
+
+    ``ref`` is a file name (``me.wav``) or a clip id (``me``). An exact file
+    name wins, so a client can tell ``me.wav`` from ``me.mp3``; an id matches
+    a whole stem only, never a longer name that starts with it (``me.v2.wav``).
+    Files are compared by name, so ``ref`` never becomes part of a path.
+    """
     d = _voice_ref_dir()
-    for f in sorted(d.glob(f"{clip_id}.*")):
-        if f.suffix.lower() in _ALLOWED_AUDIO_EXTS and f.is_file() and _is_safe_ref_path(f):
+    by_id = None
+    for f in sorted(d.iterdir()):
+        if f.suffix.lower() not in _ALLOWED_AUDIO_EXTS or not f.is_file() or not _is_safe_ref_path(f):
+            continue
+        if f.name == ref:
             return f
+        if by_id is None and f.stem == ref:
+            by_id = f
+    return by_id
+
+
+def _confirmed_json(action: str):
+    """None when the request is JSON carrying ``{"confirmed": true}``, else the
+    400 to answer. Clip mutations take only that, sent after the person
+    confirmed in the Studio; a browser form cannot send JSON."""
+    if not flask_request.is_json:
+        return {"error": f'{action} only when the request is JSON: {{"confirmed": true}}.'}, 400
+    body = flask_request.get_json(silent=True)
+    if not isinstance(body, dict) or body.get("confirmed") is not True:
+        return {"error": f"{action} only when the person confirms it (confirmed: true)."}, 400
     return None
 
 
@@ -389,8 +433,13 @@ def jobs_clear():
 #
 # A clip is cloned only with a consent record (<clip>.consent), written when
 # the person confirms the consent statement: at upload (consent_confirmed) or
-# later through /voice-clips/<id>/consent. The rules live in the plugin's
-# backends/voice_consent.py and are enforced here and in the plugin.
+# later through POST /voice-clips/<id>/consent. DELETE on that path withdraws
+# it and keeps the clip; DELETE /voice-clips/<id> removes clip and record. The
+# rules live in the plugin's backends/voice_consent.py and are enforced here
+# and in the plugin.
+#
+# <id> in these routes is the clip's id (its file name without the extension)
+# or its file name; see _clip_file.
 
 
 @audio_foundry_bp.route("/voice-clips", methods=["GET"])
@@ -463,6 +512,14 @@ def upload_voice_clip():
     # chosen filename's stem now (e.g. "narration" → id="narration").
     asset_id = Path(chosen_name).stem
 
+    # A record left under this name by a clip removed outside the Studio must
+    # not cover the new recording, even when the bytes are the same.
+    try:
+        _consent().remove_record(target)
+    except OSError as e:
+        logger.warning("stale consent record for %s not removed: %s", target.name, e)
+        return jsonify({"error": f"An old consent record for '{target.name}' could not be removed: {e}"}), 500
+
     # Stream-write with a size cap so a malicious / runaway upload can't fill disk.
     written = 0
     try:
@@ -505,13 +562,12 @@ def confirm_voice_clip_consent(clip_id):
     """Record consent for a clip already imported, e.g. one imported before
     consent was asked for. Body: ``{"confirmed": true}``, sent after the
     person confirmed ``consent_statement``."""
-    safe_id = secure_filename(clip_id)
-    if not safe_id or safe_id != clip_id:
+    if not _valid_clip_ref(clip_id):
         return {"error": "Invalid clip id"}, 400
     body = flask_request.get_json(silent=True) or {}
     if body.get("confirmed") is not True:
         return {"error": "Consent is recorded only when the person confirms it (confirmed: true)."}, 400
-    clip = _clip_file(safe_id)
+    clip = _clip_file(clip_id)
     if clip is None:
         return {"error": "Clip not found"}, 404
     try:
@@ -519,19 +575,46 @@ def confirm_voice_clip_consent(clip_id):
     except OSError as e:
         logger.exception("voice clip consent record failed")
         return jsonify({"error": f"Consent could not be recorded: {e}"}), 500
-    return {"id": safe_id, "consented": True, "recorded_at": record["recorded_at"],
-            "statement": record["statement"]}, 200
+    return {"id": clip.stem, "filename": clip.name, "consented": True,
+            "recorded_at": record["recorded_at"], "statement": record["statement"]}, 200
+
+
+@audio_foundry_bp.route("/voice-clips/<clip_id>/consent", methods=["DELETE"])
+def withdraw_voice_clip_consent(clip_id):
+    """Withdraw consent for a clip. Its consent record is removed; the clip
+    stays and is not cloned again until consent is recorded again (POST on
+    this path). JSON body ``{"confirmed": true}``.
+
+    auth_guard leaves this as open as recording consent (the POST above and
+    the upload), so withdrawing is never harder than giving it. A clone that
+    has already started has read the clip and finishes; one that starts later
+    is refused (ChatterboxBackend checks when it takes the model).
+    """
+    if not _valid_clip_ref(clip_id):
+        return {"error": "Invalid clip id"}, 400
+    refusal = _confirmed_json("Consent is withdrawn")
+    if refusal:
+        return refusal
+    clip = _clip_file(clip_id)
+    if clip is None:
+        return {"error": "Clip not found"}, 404
+    try:
+        had_consent = _consent().remove_record(clip)
+    except OSError as e:
+        logger.exception("voice clip consent withdrawal failed")
+        return jsonify({"error": f"Consent could not be withdrawn: {e}"}), 500
+    return {"id": clip.stem, "filename": clip.name, "consented": False,
+            "withdrawn": had_consent}, 200
 
 
 @audio_foundry_bp.route("/voice-clips/<clip_id>/download", methods=["GET"])
 def download_voice_clip(clip_id):
     """Stream a reference clip back to the browser so the UI can preview it
     in an <audio> tag before generation."""
-    safe_id = secure_filename(clip_id)
-    if not safe_id or safe_id != clip_id:
+    if not _valid_clip_ref(clip_id):
         return {"error": "Invalid clip id"}, 400
     # Audio files only: the clip's consent record shares its name.
-    f = _clip_file(safe_id)
+    f = _clip_file(clip_id)
     if f is None:
         return {"error": "Clip not found"}, 404
     # Explicit mimetype so <audio> elements don't get application/octet-stream
@@ -552,18 +635,32 @@ def download_voice_clip(clip_id):
 
 @audio_foundry_bp.route("/voice-clips/<clip_id>", methods=["DELETE"])
 def delete_voice_clip(clip_id):
-    """Remove a reference clip from disk."""
-    safe_id = secure_filename(clip_id)
-    if not safe_id or safe_id != clip_id:
+    """Delete one imported clip and its consent record. JSON body
+    ``{"confirmed": true}``.
+
+    The consent record goes first, so a failure part-way leaves a clip that
+    cannot be cloned rather than a record without its clip. Other clips, such
+    as ``me.v2.wav`` beside ``me.wav``, are never touched. auth_guard protects
+    this route like the Cast Library's deletes (this machine, or the API key).
+    A clone that has already started has read the clip and finishes.
+    """
+    if not _valid_clip_ref(clip_id):
         return {"error": "Invalid clip id"}, 400
-    d = _voice_ref_dir()
-    matches = list(d.glob(f"{safe_id}.*"))
-    if not matches:
+    refusal = _confirmed_json("The clip is deleted")
+    if refusal:
+        return refusal
+    clip = _clip_file(clip_id)
+    if clip is None:
         return {"error": "Clip not found"}, 404
-    for f in matches:
-        if _is_safe_ref_path(f):
-            try:
-                f.unlink()
-            except OSError as e:
-                logger.warning("Could not delete %s: %s", f, e)
-    return {"deleted": clip_id}, 200
+    try:
+        _consent().remove_record(clip)
+    except OSError as e:
+        logger.exception("voice clip consent record not removed")
+        return jsonify({"error": f"The clip was not deleted: its consent record could not be removed ({e})."}), 500
+    try:
+        clip.unlink()
+    except OSError as e:
+        logger.exception("voice clip not deleted")
+        return jsonify({"error": f"Consent for '{clip.name}' was withdrawn, but the clip could not be deleted: {e}",
+                        "consented": False}), 500
+    return {"deleted": clip.name, "id": clip.stem}, 200

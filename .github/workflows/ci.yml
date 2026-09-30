@@ -328,6 +328,7 @@ jobs:
             backend/tests/test_search_code_budget_and_globs.py \
             backend/tests/test_search_codebase_scope.py \
             backend/tests/api/test_chat_export_api.py \
+            backend/tests/test_voice_clip_withdraw_delete.py \
             backend/tests/test_chatterbox_stock_voice.py \
             backend/tests/test_music_video_song_library.py \
             backend/tests/test_video_pipeline_tools_start.py \

@@ -7,7 +7,9 @@ clone that voice. The confirmation is stored beside the clip as
 of the recording it covers. Only the Audio Studio's consent step writes one
 (POST /api/audio-foundry/voice-clips/upload with the confirmation, or
 POST /api/audio-foundry/voice-clips/<id>/consent); importing a clip without it,
-as the Video page's audio guide does, leaves the clip uncloneable.
+as the Video page's audio guide does, leaves the clip uncloneable. Withdrawing
+consent (DELETE /api/audio-foundry/voice-clips/<id>/consent) removes the
+record and keeps the clip; deleting the clip removes both.
 
 The same check runs from this one module in two places: the backend's
 /api/audio-foundry/generate/voice proxy, and this plugin where the clone
@@ -170,6 +172,24 @@ def require_consent(ref: PathLike, ref_dir: Optional[PathLike] = None) -> Path:
             "the right to clone this voice in Audio Studio (Voice, reference clip), then try again."
         )
     return clip
+
+
+def remove_record(clip: PathLike) -> bool:
+    """Withdraw consent for ``clip`` by removing its ``.consent`` file.
+
+    Returns whether the clip could be cloned just before. The clip itself is
+    left alone. A ``.consent`` file that is not a record (empty, unreadable,
+    a symlink) is removed too; a symlink is removed itself, never its target.
+    """
+    had_consent = has_consent(clip)
+    path = record_path(clip)
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        return had_consent
+    if not stat.S_ISDIR(info.st_mode):
+        os.unlink(path)
+    return had_consent
 
 
 def build_record(clip: PathLike, *, source: str) -> dict[str, Any]:

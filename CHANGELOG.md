@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- **Audio Studio: withdraw consent for a voice clip, or delete it.** "Manage imported clips" under
+  the reference clip lists each clip and whether consent is recorded. *Withdraw consent* removes
+  the record and keeps the clip, which is not cloned again until consent is confirmed; *Delete
+  clip* removes the clip and its record. A clone already running finishes; one still waiting to
+  start is refused. Deleting needs the Guaardvark machine or the API key, like the Cast Library's
+  deletes; withdrawing is as open as giving consent. Deleting `me` no longer also deletes
+  `me.v2.wav`, clips renamed on import (`me (2).wav`) can be played and confirmed, and a new import
+  never inherits the consent of a clip removed under the same name.
 - **Chatterbox's own voice stays its own after a clone.** Chatterbox kept the last cloned voice as
   its default, so a later voiceover without a reference clip (the Audio Studio's default voice, a
   Film Crew character without a voice) spoke in that clone's voice, even after its consent was

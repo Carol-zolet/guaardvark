@@ -41,6 +41,8 @@ import axios from "axios";
 import { ActionButton, DashboardStrip, DashboardTile } from "../components/settings/ui";
 import AlertSnackbar from "../components/common/AlertSnackbar";
 import VoiceConsentDialog from "../components/audio/VoiceConsentDialog";
+import VoiceClipManager from "../components/audio/VoiceClipManager";
+import { confirmVoiceClipConsent, voiceClipAudioUrl } from "../api/audioFoundryService";
 import SettingsIcon from "@mui/icons-material/Settings";
 
 const AudioFoundryModelsModal = React.lazy(() => import("../components/modals/AudioFoundryModelsModal"));
@@ -281,10 +283,7 @@ const AudioFoundryPage = () => {
         }
         setReferenceClip(res.data);
       } else {
-        await axios.post(
-          `${API_BASE}/audio-foundry/voice-clips/${encodeURIComponent(request.clip.id)}/consent`,
-          { confirmed: true },
-        );
+        await confirmVoiceClipConsent(request.clip);
         setReferenceClip({ ...request.clip, consented: true });
       }
       setConsentRequest(null);
@@ -298,8 +297,13 @@ const AudioFoundryPage = () => {
     }
   };
 
-  // (Backend exposes DELETE /voice-clips/<id> for future delete-from-library UI;
-  //  not yet wired here — user can manage clips from the filesystem if needed.)
+  // A clip whose consent was withdrawn, or that was deleted, stops being the
+  // selected reference; picking a withdrawn clip again asks for consent.
+  const handleClipRemoved = (clip) => {
+    setReferenceClip((current) =>
+      current && (current.filename || current.id) === (clip.filename || clip.id) ? null : current,
+    );
+  };
 
   // Pull the live voice catalog from the backend on mount. Falls back to the
   // hardcoded FALLBACK_VOICES if the audio_foundry plugin is offline. This
@@ -777,7 +781,7 @@ const AudioFoundryPage = () => {
                                 </Typography>
                                 <audio
                                   controls
-                                  src={`${API_BASE}/audio-foundry/voice-clips/${referenceClip.id}/download`}
+                                  src={voiceClipAudioUrl(referenceClip)}
                                   style={{ width: "100%", height: 32, marginTop: 4 }}
                                 />
                               </Box>
@@ -819,13 +823,13 @@ const AudioFoundryPage = () => {
                             <Select
                               value=""
                               onChange={(e) => {
-                                handlePickClip(voiceClipLibrary.find((x) => x.id === e.target.value));
+                                handlePickClip(voiceClipLibrary.find((x) => x.filename === e.target.value));
                               }}
                               MenuProps={{ PaperProps: { sx: { maxHeight: 300 } } }}
                               sx={{ borderRadius: 2 }}
                             >
                               {voiceClipLibrary.map((c) => (
-                                <MenuItem key={c.id} value={c.id}>
+                                <MenuItem key={c.filename} value={c.filename}>
                                   <Box sx={{ display: "flex", justifyContent: "space-between", width: "100%" }}>
                                     <span>{c.filename}</span>
                                     <Typography component="span" variant="caption" sx={{ opacity: 0.5, ml: 2 }}>
@@ -837,6 +841,12 @@ const AudioFoundryPage = () => {
                             </Select>
                           </FormControl>
                         )}
+
+                        <VoiceClipManager
+                          clips={voiceClipLibrary}
+                          onChanged={refreshVoiceClips}
+                          onRemoved={handleClipRemoved}
+                        />
                       </Stack>
                     )}
                     <Button
