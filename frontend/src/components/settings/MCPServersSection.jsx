@@ -283,6 +283,9 @@ const MCPServersSection = () => {
   const [dialog, setDialog] = useState({ open: false, initial: null, isEdit: false });
   const [removing, setRemoving] = useState(null);
   const [message, setMessage] = useState(null);
+  // The backend's own words when it answers these routes only on its machine
+  // (401/403): this page has no API-key field, so nothing here can work.
+  const [refused, setRefused] = useState(null);
 
   const refresh = useCallback(async () => {
     try {
@@ -291,7 +294,11 @@ const MCPServersSection = () => {
       setServers(list.servers || []);
       setConfigErrors(list.config_errors || []);
     } catch (e) {
-      setMessage({ severity: "error", text: `Could not load MCP status: ${e.message}` });
+      if (e.status === 401 || e.status === 403) {
+        setRefused(e.message);
+      } else {
+        setMessage({ severity: "error", text: `Could not load MCP status: ${e.message}` });
+      }
     }
   }, []);
 
@@ -305,10 +312,11 @@ const MCPServersSection = () => {
   }, []);
 
   useEffect(() => {
+    if (refused) return undefined;
     refresh();
     const t = setInterval(refresh, 15000);
     return () => clearInterval(t);
-  }, [refresh]);
+  }, [refresh, refused]);
 
   useEffect(() => {
     if (showAudit) refreshAudit();
@@ -343,6 +351,9 @@ const MCPServersSection = () => {
     if (name) await withBusy(name, () => deleteMcpServer(name), `Removed ${name}`);
   };
 
+  if (refused) {
+    return <Alert severity="info">{refused}</Alert>;
+  }
   if (status && !status.mcp_enabled) {
     return <Alert severity="info">MCP is disabled. Set GUAARDVARK_MCP_ENABLED=true and restart.</Alert>;
   }

@@ -31,13 +31,41 @@ PROTECTED_PREFIXES = (
 )
 
 # Browser/desktop/MCP automation and direct tool execution can read files, run
-# commands and reach internal networks. Off by default because the Tools page
-# and automation panels are used from other devices on the LAN, which have no
-# API-key field; GUAARDVARK_PROTECT_TOOL_ENDPOINTS=true closes them to remote
-# hosts without the key.
-if os.environ.get("GUAARDVARK_PROTECT_TOOL_ENDPOINTS", "").strip().lower() in ("1", "true", "yes", "on"):
-    # Tool jobs hold the results of tool calls, so they follow /api/tools/execute.
-    PROTECTED_PREFIXES = PROTECTED_PREFIXES + ('/api/automation/', '/api/tools/execute', '/api/tools/jobs/')
+# commands and reach internal networks, and a call to /api/tools/execute skips
+# the confirmation prompts chat would show. Tool jobs hold the results of those
+# calls. These routes answer only this machine, or a caller that sends the API
+# key. The web UI sends no key, so from another device the Tools page cannot
+# run a tool and the MCP Servers page does not load.
+# GUAARDVARK_PROTECT_TOOL_ENDPOINTS=false (or 0, no, off) opens them to every
+# host that can reach the backend; any other value, or none, keeps them closed.
+# It is read per request, like GUAARDVARK_API_KEY.
+TOOL_ENDPOINTS_ENV = "GUAARDVARK_PROTECT_TOOL_ENDPOINTS"
+TOOL_ENDPOINT_PREFIXES = (
+    '/api/automation/',
+    '/api/tools/jobs/',
+)
+# Matched whole: GET /api/tools/execute_python is a tool's schema, not a call.
+TOOL_ENDPOINT_PATHS = (
+    '/api/tools/execute',
+)
+
+# The two refusals. The web UI and the CLI show them as they are, so each says
+# what the action needs: another host with no API key configured, and any
+# caller without the key once one is configured.
+LOCAL_ONLY_MESSAGE = (
+    "This action is only available on the Guaardvark machine itself, or to a "
+    "command-line or API client that sends the API key."
+)
+API_KEY_MESSAGE = (
+    "This action needs this install's API key (GUAARDVARK_API_KEY), sent in "
+    "the X-API-Key header."
+)
+
+
+def tool_endpoints_protected() -> bool:
+    """True unless GUAARDVARK_PROTECT_TOOL_ENDPOINTS opts out."""
+    return os.environ.get(TOOL_ENDPOINTS_ENV, "").strip().lower() not in ("0", "false", "no", "off")
+
 
 # File APIs include both the document library and the live repository editor.
 # Keep read-only document browser GETs public for the local UI, but protect
@@ -205,6 +233,8 @@ def _is_protected():
     for prefix in PROTECTED_PREFIXES:
         if path.startswith(prefix):
             return True
+    if (path in TOOL_ENDPOINT_PATHS or path.startswith(TOOL_ENDPOINT_PREFIXES)) and tool_endpoints_protected():
+        return True
     for prefix in PROTECTED_FILE_PREFIXES:
         if path.startswith(prefix):
             return True
@@ -247,7 +277,7 @@ def check_endpoint_auth():
         logger.warning(
             f"[AUTH] Blocked remote access to {request.path} from {client_ip}"
         )
-        return jsonify({"error": "Access denied from remote host"}), 403
+        return jsonify({"error": LOCAL_ONLY_MESSAGE}), 403
 
     # API key is configured — require it
     provided_key = request.headers.get('X-API-Key', '')
@@ -257,4 +287,4 @@ def check_endpoint_auth():
     logger.warning(
         f"[AUTH] Invalid/missing API key for {request.path} from {request.remote_addr}"
     )
-    return jsonify({"error": "Invalid or missing API key"}), 401
+    return jsonify({"error": API_KEY_MESSAGE}), 401

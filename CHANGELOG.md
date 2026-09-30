@@ -14,6 +14,12 @@
   local folders such as scratch copies and worktrees. On a workstation holding about 49,000 such
   `.py` copies the static analysis of the whole checkout went from 270 s to 9 s; a fresh clone
   maps the same files as before. Outside a git checkout the folder is walked as before.
+- **Running tools and automation needs the Guaardvark machine or the API key.**
+  `/api/tools/execute`, `/api/tools/jobs/` and `/api/automation/*` answered every device on the
+  network. They now answer the Guaardvark machine itself, or a client that sends
+  `GUAARDVARK_API_KEY`. In a browser on another device the Tools page cannot run a tool and the MCP
+  Servers page does not load; both say where the action works. `GUAARDVARK_PROTECT_TOOL_ENDPOINTS=false`
+  brings back the old behaviour.
 
 ## 2.9.3 — The command line does what it says, agents make music and voice, outpaint fills the frame
 

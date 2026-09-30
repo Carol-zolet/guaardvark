@@ -434,13 +434,25 @@ def api(mcp_service):
 class TestRestApi:
     def test_config_writes_blocked_for_remote_hosts(self, api, monkeypatch):
         monkeypatch.delenv("GUAARDVARK_API_KEY", raising=False)
+        monkeypatch.delenv("GUAARDVARK_PROTECT_TOOL_ENDPOINTS", raising=False)
         remote = {"REMOTE_ADDR": "203.0.113.5"}
         entry = {"command": "sh", "args": ["-c", "true"]}
         assert api.put("/api/automation/mcp/servers/evil", json=entry, environ_base=remote).status_code == 403
         assert api.delete("/api/automation/mcp/servers/fx", environ_base=remote).status_code == 403
         assert api.post("/api/automation/mcp/reload-config", environ_base=remote).status_code == 403
-        # Reads stay open to the LAN UI (the views are redacted).
+        # Reads are closed to other hosts too, unless the install opts out.
+        assert api.get("/api/automation/mcp/servers", environ_base=remote).status_code == 403
+
+    def test_opting_out_reopens_reads_but_not_config_writes(self, api, monkeypatch):
+        monkeypatch.delenv("GUAARDVARK_API_KEY", raising=False)
+        monkeypatch.setenv("GUAARDVARK_PROTECT_TOOL_ENDPOINTS", "false")
+        remote = {"REMOTE_ADDR": "203.0.113.5"}
+        entry = {"command": "sh", "args": ["-c", "true"]}
+        # The views are redacted.
         assert api.get("/api/automation/mcp/servers", environ_base=remote).status_code == 200
+        assert api.put("/api/automation/mcp/servers/evil", json=entry, environ_base=remote).status_code == 403
+        assert api.delete("/api/automation/mcp/servers/fx", environ_base=remote).status_code == 403
+        assert api.post("/api/automation/mcp/reload-config", environ_base=remote).status_code == 403
 
     def test_config_writes_need_the_key_when_configured(self, api, monkeypatch):
         monkeypatch.setenv("GUAARDVARK_API_KEY", "k1")
@@ -463,8 +475,13 @@ class TestRestApi:
 
     def test_remote_caller_cannot_run_gated_tools(self, api, monkeypatch):
         monkeypatch.delenv("GUAARDVARK_API_KEY", raising=False)
+        monkeypatch.delenv("GUAARDVARK_PROTECT_TOOL_ENDPOINTS", raising=False)
         remote = {"REMOTE_ADDR": "203.0.113.5"}
         assert api.post("/api/automation/mcp/connect", json={"server": "fx"}).get_json()["success"]
+        call = {"server": "fx", "tool": "add", "arguments": {"a": 1, "b": 2}}
+        assert api.post("/api/automation/mcp/execute", environ_base=remote, json=call).status_code == 403
+        # An install that opens the route to other hosts still holds them to the policy.
+        monkeypatch.setenv("GUAARDVARK_PROTECT_TOOL_ENDPOINTS", "false")
         gated = api.post("/api/automation/mcp/execute", environ_base=remote,
                          json={"server": "fx", "tool": "delete_thing", "arguments": {"name": "z"}})
         assert gated.get_json().get("requires_confirmation") is True

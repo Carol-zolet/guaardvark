@@ -2210,7 +2210,12 @@ const SettingsPage = () => {
   useEffect(() => {
     getMcpStatus()
       .then(setMcpStatus)
-      .catch((err) => console.warn("Failed to read MCP status:", err));
+      .catch((err) => {
+        console.warn("Failed to read MCP status:", err);
+        // 401/403: the backend answers MCP status only on its own machine, or
+        // to the API key, which the web UI does not send.
+        if (err?.status === 401 || err?.status === 403) setMcpStatus({ refused: err.message });
+      });
     apiService.getConfineToolPaths().then((result) => {
       const on = result?.data?.confine_tool_paths ?? result?.confine_tool_paths;
       if (typeof on === "boolean") setConfineToolPaths(on);
@@ -3192,10 +3197,13 @@ const SettingsPage = () => {
           <StatusPill
             tone={mcpStatus?.servers_connected > 0 ? "ok" : "neutral"}
             label={
-              mcpStatus
-                ? `${mcpStatus.servers_connected}/${mcpStatus.servers_configured} connected`
-                : "checking"
+              mcpStatus?.refused
+                ? "not shown in this browser"
+                : mcpStatus
+                  ? `${mcpStatus.servers_connected}/${mcpStatus.servers_configured} connected`
+                  : "checking"
             }
+            tooltip={mcpStatus?.refused || ""}
           />
           <ActionButton onClick={() => navigate("/agents/mcp")}>
             Manage MCP servers
