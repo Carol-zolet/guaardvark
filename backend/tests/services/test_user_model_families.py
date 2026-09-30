@@ -43,6 +43,12 @@ def test_parse_hf_url_variants():
     )
     assert branch["revision"] == "refs/heads/dev"
     assert branch["src"] == "weights/a.safetensors"
+    spaced = umf.parse_hf_url(
+        "https://huggingface.co/org/repo/blob/main/K2%20Style%20(v2).safetensors"
+    )
+    assert spaced["src"] == "K2 Style (v2).safetensors"
+    encoded_pr = umf.parse_hf_url("https://huggingface.co/org/repo/blob/refs%2Fpr%2F3/x.safetensors")
+    assert encoded_pr["revision"] == "refs/pr/3" and encoded_pr["src"] == "x.safetensors"
     assert umf.parse_hf_url("Comfy-Org/MiniMax-H3")["hf_repo"] == "Comfy-Org/MiniMax-H3"
     assert umf.hf_inspect_url("org/repo") == "https://huggingface.co/org/repo"
     assert umf.hf_inspect_url("org/repo", "v1.2") == "https://huggingface.co/org/repo/tree/v1.2"
