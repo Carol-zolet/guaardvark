@@ -97,3 +97,27 @@ def test_a_queued_analyzer_is_reported_running(pipeline):
     res = vpt.MusicVideoTool().execute(song="5", style_prompt="neon rain")
     assert res.success and "Analysis is running" in res.output
     assert res.metadata["analysis_started"] is True and _Service.dispatched == [(7, "analyzer")]
+
+
+# ---- ComfyUI is needed only when the clips render -----------------------------------------
+def test_a_stopped_comfyui_does_not_block_the_screenwriter(pipeline, monkeypatch):
+    from backend.services import plugin_bridge, video_model_registry
+    from backend.services.job_types import RenderErrorKind, RenderFailure
+
+    monkeypatch.setattr(video_model_registry, "preflight_video_model", lambda model_id: (
+        False, RenderFailure(RenderErrorKind.COMFYUI_DOWN, "Wan 2.2 requires ComfyUI.")))
+    monkeypatch.setattr(plugin_bridge, "job_service_start_enabled", lambda: False)
+    res = vpt.FilmCrewTool().execute(script_text=SCRIPT)
+    assert pipeline[-1].get("comfyui_down_ok") is True
+    assert res.success and "The screenwriter is running" in res.output
+    assert "ComfyUI is not running now" in res.output and "before then" in res.output
+    assert res.metadata["comfyui_running"] is False
+
+    monkeypatch.setattr(plugin_bridge, "job_service_start_enabled", lambda: True)
+    res = vpt.FilmCrewTool().execute(script_text=SCRIPT)
+    assert "it is started when the clips render" in res.output
+
+
+def test_a_running_comfyui_adds_nothing(pipeline):
+    res = vpt.FilmCrewTool().execute(script_text=SCRIPT)
+    assert "ComfyUI" not in res.output and res.metadata["comfyui_running"] is True

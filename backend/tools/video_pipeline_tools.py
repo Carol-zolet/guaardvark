@@ -152,6 +152,24 @@ def _script_body(script_text: str, *, mcp: bool = False):
     return text, None
 
 
+def _comfyui_note(model_id: str):
+    """A line for the result when ``model_id`` renders in ComfyUI and ComfyUI
+    is stopped now, else None. Nothing before the clip renders needs it:
+    storyboards are drawn offline (character_still_pipeline)."""
+    from backend.services.job_types import RenderErrorKind
+    from backend.services.plugin_bridge import job_service_start_enabled
+    from backend.services.video_model_registry import preflight_video_model
+
+    ready, err = preflight_video_model(model_id)
+    if ready or getattr(err, "kind", None) != RenderErrorKind.COMFYUI_DOWN:
+        return None
+    if job_service_start_enabled():
+        return ("ComfyUI is not running now; it is started when the clips render, the last "
+                "stage, which you start from Film Crew.")
+    return ("ComfyUI is not running now. Nothing needs it until the clips render, the last stage, "
+            "which you start from Film Crew: start the ComfyUI plugin (Plugins) before then.")
+
+
 def _dispatch_first_stage(svc, row_id: int, agent: str):
     """Start a new project's first agent. Returns (started, error text or None).
 
@@ -349,7 +367,9 @@ class FilmCrewTool(BaseTool):
     description = (
         "Start a five-role Film Crew production from a screenplay. The screenwriter "
         "begins at once; casting, storyboards and GPU renders wait for you in Studio. "
-        "Use when the user asks to film a script or start the film crew."
+        "ComfyUI need not be running: only the clip renders at the end use it, and the "
+        "answer says when it is stopped. Use when the user asks to film a script or start "
+        "the film crew."
     )
     parameters = {
         "script_text": ToolParameter(
@@ -400,10 +420,16 @@ class FilmCrewTool(BaseTool):
             if explicit:
                 if explicit not in VIDEO_MODEL_REGISTRY or not model_capabilities(explicit):
                     return ToolResult(success=False, error=f"video_model '{explicit}' is not a video model")
-            picked, resolve_err = resolve_active_video_model("i2v", explicit, surface="film-crew")
+            # Only the clip renders, the last stage, run on this model, and
+            # they check (and, with job-service start on, start) ComfyUI then;
+            # a stopped ComfyUI does not keep the screenwriter from starting.
+            picked, resolve_err = resolve_active_video_model(
+                "i2v", explicit, surface="film-crew", comfyui_down_ok=True,
+            )
             if resolve_err:
                 return ToolResult(success=False, error=resolve_err)
             settings["video_model"] = picked
+            comfyui_note = _comfyui_note(picked)
 
             first = next((ln.strip() for ln in script_text.splitlines() if ln.strip()), "Film Crew")
             title = (name or "").strip() or first[:80]
@@ -423,6 +449,8 @@ class FilmCrewTool(BaseTool):
                     f"stage '{prod.current_stage}'; use Re-dispatch on the Film Crew page, or restart "
                     "the backend, which resumes it. Do not create it again."
                 ]
+            if comfyui_note:
+                lines.append(comfyui_note)
             return ToolResult(
                 success=True,
                 output="\n".join([
@@ -438,6 +466,7 @@ class FilmCrewTool(BaseTool):
                     "rendered": False,
                     "screenwriter_started": started,
                     "dispatch_error": dispatch_err,
+                    "comfyui_running": comfyui_note is None,
                 },
             )
         except Exception as e:  # noqa: BLE001
