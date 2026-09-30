@@ -44,16 +44,7 @@ social_outreach_bp = Blueprint("social_outreach", __name__, url_prefix="/api/soc
 
 @social_outreach_bp.get("/status")
 def status():
-    return jsonify({
-        "enabled": kill_switch.is_enabled(),
-        "supervised": kill_switch.is_supervised(),
-        "caps": {
-            "min_gap_seconds": kill_switch.CADENCE_MIN_GAP_SECONDS,
-            "daily_cap": kill_switch.CADENCE_DAILY_CAP,
-            "servo_failure_abort_threshold": kill_switch.SERVO_FAILURE_ABORT_THRESHOLD,
-        },
-        "cadence": kill_switch.cadence_status(),
-    })
+    return jsonify(kill_switch.status_snapshot())
 
 
 @social_outreach_bp.post("/enable")

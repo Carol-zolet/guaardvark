@@ -114,20 +114,38 @@ class OutreachStatusTool(BaseTool):
     parameters: Dict[str, ToolParameter] = {}
 
     def execute(self, **kwargs) -> ToolResult:
-        try:
-            payload = {
-                "enabled": kill_switch.is_enabled(),
-                "supervised": kill_switch.is_supervised(),
-                "caps": {
-                    "min_gap_seconds": kill_switch.CADENCE_MIN_GAP_SECONDS,
-                    "daily_cap": kill_switch.CADENCE_DAILY_CAP,
-                },
-                "cadence": kill_switch.cadence_status(),
-            }
-            return ToolResult(success=True, output=payload, metadata=payload)
-        except Exception as e:
-            logger.exception("outreach_status failed")
-            return ToolResult(success=False, error=str(e))
+        if is_mcp_transport(self):
+            # The backend owns the settings table and the cadence counters;
+            # this process has neither a database session nor the backend's
+            # environment, and would report its own defaults as the answer.
+            try:
+                payload = request_json("GET", "/api/social-outreach/status").data
+            except BackendError as e:
+                return ToolResult(
+                    success=False,
+                    error=f"Could not read the outreach status: {e}",
+                    metadata={"backend_error": e.kind},
+                )
+            if not isinstance(payload, dict):
+                return ToolResult(success=False, error="The backend returned no outreach status.")
+        else:
+            try:
+                payload = kill_switch.status_snapshot()
+            except Exception as e:
+                logger.exception("outreach_status failed")
+                return ToolResult(success=False, error=str(e))
+
+        if payload.get("settings_readable") is False:
+            return ToolResult(
+                success=False,
+                error=(
+                    "The backend could not read the outreach settings from its database, so "
+                    "whether outreach is enabled or supervised is unknown. Nothing posts "
+                    "while the settings are unreadable."
+                ),
+                metadata=payload,
+            )
+        return ToolResult(success=True, output=payload, metadata=payload)
 
 
 class OutreachListQueueTool(BaseTool):

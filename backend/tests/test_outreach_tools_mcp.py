@@ -1,7 +1,8 @@
-"""Outreach tools on the MCP path: arguments are checked before anything runs.
+"""Outreach tools on the MCP path: arguments are checked before anything runs,
+and the status comes from the backend or is reported as unknown.
 
-No database, network or model: the backend HTTP client and the persona are
-replaced with recorders.
+No database, network or model: the backend HTTP client, the persona and the
+settings lookup are replaced with stand-ins.
 """
 
 from __future__ import annotations
@@ -9,9 +10,9 @@ from __future__ import annotations
 import pytest
 
 from backend.mcp.tools_adapter import _tool_input_schema
-from backend.services.social_outreach import transitions
+from backend.services.social_outreach import kill_switch, transitions
 from backend.tools import outreach_tools as ot
-from backend.utils.backend_http import BackendResponse
+from backend.utils.backend_http import BackendError, BackendResponse
 
 
 def _mcp(tool):
@@ -144,3 +145,104 @@ def test_list_status_is_published_as_the_real_statuses():
 
     assert schema["properties"]["status"]["enum"] == list(transitions.KNOWN_STATUSES)
     assert schema["properties"]["status"]["default"] == "drafted"
+
+
+# ---- outreach_status ----------------------------------------------------------------
+
+_STATUS = {
+    "enabled": True,
+    "supervised": True,
+    "settings_readable": True,
+    "caps": {"min_gap_seconds": 1800, "daily_cap": 8, "servo_failure_abort_threshold": 2},
+    "cadence": {"reddit": {"posts_in_24h": 1}},
+}
+
+
+def _status_backend(monkeypatch, answer):
+    calls = []
+
+    def request(method, path, **kwargs):
+        calls.append((method, path))
+        if isinstance(answer, BackendError):
+            raise answer
+        return BackendResponse(status=200, body=answer, data=answer)
+
+    def local(*args, **kwargs):
+        raise AssertionError("the MCP process must not read the database or Redis itself")
+
+    monkeypatch.setattr(ot, "request_json", request)
+    for name in ("is_enabled", "is_supervised", "cadence_status", "status_snapshot"):
+        monkeypatch.setattr(ot.kill_switch, name, local)
+    return calls
+
+
+def test_status_over_mcp_is_the_backends_answer(monkeypatch):
+    calls = _status_backend(monkeypatch, _STATUS)
+
+    result = _mcp(ot.OutreachStatusTool()).execute()
+
+    assert result.success, result.error
+    assert result.output == _STATUS
+    assert calls == [("GET", "/api/social-outreach/status")]
+
+
+def test_status_over_mcp_says_the_backend_is_not_answering(monkeypatch):
+    down = BackendError("unreachable", "The Guaardvark backend is not answering at http://127.0.0.1:5000.")
+    _status_backend(monkeypatch, down)
+
+    result = _mcp(ot.OutreachStatusTool()).execute()
+
+    assert not result.success
+    assert "not answering" in result.error
+    assert result.output is None  # no "disabled, unsupervised" made up from defaults
+    assert result.metadata["backend_error"] == "unreachable"
+
+
+def test_status_with_unreadable_settings_is_unknown_not_off(monkeypatch):
+    _status_backend(monkeypatch, {**_STATUS, "enabled": False, "supervised": True, "settings_readable": False})
+
+    result = _mcp(ot.OutreachStatusTool()).execute()
+
+    assert not result.success
+    assert "unknown" in result.error
+    assert result.output is None
+
+
+def test_status_from_a_backend_without_the_readable_flag_is_accepted(monkeypatch):
+    older = {key: value for key, value in _STATUS.items() if key != "settings_readable"}
+    _status_backend(monkeypatch, older)
+
+    result = _mcp(ot.OutreachStatusTool()).execute()
+
+    assert result.success
+    assert result.output == older
+
+
+# ---- what the backend reports (kill_switch) ---------------------------------------------
+
+def test_snapshot_reads_the_stored_settings(monkeypatch):
+    stored = {"social_outreach_enabled": "true"}  # supervised never set
+    monkeypatch.setattr(kill_switch, "_lookup_setting", stored.get)
+    monkeypatch.setattr(kill_switch, "cadence_status", lambda: {})
+
+    snapshot = kill_switch.status_snapshot()
+
+    assert (snapshot["enabled"], snapshot["supervised"], snapshot["settings_readable"]) == (True, False, True)
+    assert kill_switch.is_enabled() is True
+    assert kill_switch.is_supervised() is False
+
+
+def test_unreadable_settings_fail_closed_and_are_flagged(monkeypatch):
+    def unreadable(key):
+        raise RuntimeError("database is down")
+
+    monkeypatch.setattr(kill_switch, "_lookup_setting", unreadable)
+    monkeypatch.setattr(kill_switch, "cadence_status", lambda: {})
+
+    snapshot = kill_switch.status_snapshot()
+
+    assert snapshot["settings_readable"] is False
+    # The posting paths see "off" and "supervised": nothing posts on a guess.
+    assert kill_switch.is_enabled() is False
+    assert kill_switch.is_supervised() is True
+    assert (snapshot["enabled"], snapshot["supervised"]) == (False, True)
