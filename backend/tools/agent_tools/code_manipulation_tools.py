@@ -25,8 +25,10 @@ from backend.tools.llama_code_tools import (
 )
 from backend.models import db, Folder
 from backend.utils.backend_http import is_mcp_transport
+from backend.utils.display_paths import display_text
 import json
 import ast
+from datetime import datetime
 from backend.services.guarded_code_service import (
     GuardedCodeError,
     apply_exact_replacement,
@@ -135,15 +137,123 @@ def _is_edit_forbidden(filepath: str) -> tuple[bool, str | None]:
     return False, None
 
 
+# The most file text one read_code call returns. MCP clients cap the size of a
+# tool result: the Claude Code CLI defaults to 25,000 tokens. Measured with the
+# cl100k_base tokenizer, this repository's twelve largest source files run 3.6
+# to 5.3 characters per token, so 60,000 characters is at most about 17,000
+# tokens. 43 of its 1,964 tracked source files are longer and come back in pages.
+READ_CODE_PAGE_CHARS = 60_000
+
+_CONTENT_START = "========== FILE CONTENT START ==========\n"
+_CONTENT_END = "\n========== FILE CONTENT END =========="
+
+
+def _line_number(value, name: str) -> int | None:
+    """start_line or end_line as an integer of 1 or more; None when not given."""
+    if value is None or value == "":
+        return None
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{name} must be a whole number, got {value!r}")
+    if number < 1:
+        raise ValueError(f"{name} must be 1 or more (lines are numbered from 1), got {number}")
+    return number
+
+
+def _page_of_file(result: str, filepath: str, start_line: int | None, end_line: int | None,
+                  max_chars: int | None = None) -> tuple[str, dict]:
+    """Cut read_code()'s whole-file result down to the lines asked for and to
+    one page of text. Returns (result, facts about the page).
+
+    Lines are split on "\n", the numbering search_code reports. A whole file
+    that fits in a page, asked for without a range, is returned unchanged. A
+    page ends on a line boundary; one line longer than a page is cut. Raises
+    ValueError for a range outside the file."""
+    max_chars = READ_CODE_PAGE_CHARS if max_chars is None else max_chars
+    head, marker, rest = result.partition(_CONTENT_START)
+    if not marker or not rest.endswith(_CONTENT_END):
+        return result, {}
+    content = rest[:-len(_CONTENT_END)]
+    lines = content.split("\n")
+    if content.endswith("\n"):
+        lines.pop()
+    total = len(lines) if content else 0
+
+    if start_line is None and end_line is None and len(content) <= max_chars:
+        return result, {"total_lines": total, "complete": True}
+
+    first = start_line or 1
+    if end_line is not None and end_line < first:
+        raise ValueError(f"end_line ({end_line}) is before start_line ({first})")
+    if first > max(total, 1):
+        raise ValueError(f"start_line {first} is past the end of '{filepath}', which has {total} lines")
+    if total == 0:
+        return result, {"total_lines": 0, "complete": True}
+    wanted_last = min(end_line or total, total)
+
+    taken: list[str] = []
+    used = 0
+    cut_line = False
+    for line in lines[first - 1:wanted_last]:
+        cost = len(line) + 1
+        if taken and used + cost > max_chars:
+            break
+        if not taken and len(line) > max_chars:
+            line, cut_line = line[:max_chars], True
+        taken.append(line)
+        used += cost
+        if cut_line:
+            break
+    last = first + len(taken) - 1 if taken else first - 1
+    text = "\n".join(taken)
+    whole_file = first == 1 and last == total and not cut_line
+    if whole_file and content.endswith("\n"):
+        text += "\n"
+
+    showing = f"Showing lines {first}-{last} of {total} ({len(text):,} characters)."
+    footer = ""
+    if cut_line:
+        showing += (
+            f" Line {first} is {len(lines[first - 1]):,} characters long and is cut at {max_chars:,};"
+            " read_code pages by line, so the rest of that line is not available through it."
+        )
+        if last < total:
+            showing += f" The next line is start_line={last + 1}."
+    elif last < wanted_last:
+        more = f"start_line={last + 1}" + (f", end_line={end_line}" if end_line is not None else "")
+        showing += (
+            f" One call returns at most {max_chars:,} characters; continue with {more}."
+        )
+        footer = f"\n[Lines {first}-{last} of {total}. Next page: read_code(filepath='{filepath}', {more})]"
+    elif last < total:
+        showing += f" The file continues at start_line={last + 1}."
+    if not whole_file:
+        showing += " The header above describes the whole file."
+
+    page = f"{head.rstrip()}\n{showing}\n\n{_CONTENT_START}{text}{_CONTENT_END}{footer}"
+    return page, {
+        "total_lines": total,
+        "start_line": first,
+        "end_line": last,
+        "complete": whole_file,
+        "next_start_line": last + 1 if last < total else None,
+    }
+
+
 class ReadCodeTool(BaseTool):
     """Tool to read source code files"""
 
     name = "read_code"
     read_only = True
     description = (
-        "Read one UTF-8 text file (up to 10 MB) from this Guaardvark install's own checkout, in full. "
-        "Returns a header (path, line and character counts, SHA-256 of the text, mtime) and the content "
-        "between START/END markers, without line numbers. Paths are relative to the checkout root; an "
+        "Read one UTF-8 text file (up to 10 MB) from this Guaardvark install's own checkout, whole or by line range. "
+        "Returns a header (path, line and character counts, SHA-256 of the whole file's text, mtime) and the content "
+        "between START/END markers, without line numbers. One call returns at most 60,000 characters of "
+        "content, in whole lines: a longer file comes back as its first page with a 'Showing lines A-B of N' "
+        "line naming the start_line of the next page. Pass start_line and end_line (1-based, inclusive, "
+        "the line numbers search_code reports) to read part of a file; a range past the end of the file "
+        "is an error. Paths are relative to the checkout root; an "
         "absolute path works when it lies inside the checkout. Refused: git-ignored local data (files "
         "under data/uploads and data/outputs stay readable), .env and credential or key files (*.pem, "
         "*.key, id_rsa, .netrc, credentials.* and similar), and anything under .git, venv, node_modules, "
@@ -157,6 +267,20 @@ class ReadCodeTool(BaseTool):
             type="string",
             required=True,
             description="File to read, relative to the checkout root, e.g. 'backend/app.py' or 'frontend/src/App.jsx'. A relative path may not leave the checkout."
+        ),
+        "start_line": ToolParameter(
+            name="start_line",
+            type="int",
+            required=False,
+            minimum=1,
+            description="First line to return, counting from 1. Default: the first line. Use the 'path:line' numbers from search_code, or the start_line a previous page named."
+        ),
+        "end_line": ToolParameter(
+            name="end_line",
+            type="int",
+            required=False,
+            minimum=1,
+            description="Last line to return, inclusive. Default: as far as one call reaches (60,000 characters). A value past the end of the file reads to the end."
         )
     }
 
@@ -170,6 +294,12 @@ class ReadCodeTool(BaseTool):
             )
 
         try:
+            try:
+                start_line = _line_number(kwargs.get("start_line"), "start_line")
+                end_line = _line_number(kwargs.get("end_line"), "end_line")
+            except ValueError as e:
+                return ToolResult(success=False, error=f"ERROR reading '{filepath}': {e}", metadata={"filepath": filepath})
+
             result = read_code(filepath, allow_external=not is_mcp_transport(self))
 
             # Check if result indicates an error
@@ -180,16 +310,21 @@ class ReadCodeTool(BaseTool):
                     metadata={"filepath": filepath}
                 )
 
+            try:
+                result, page = _page_of_file(result, filepath, start_line, end_line)
+            except ValueError as e:
+                return ToolResult(success=False, error=f"ERROR reading '{filepath}': {e}", metadata={"filepath": filepath})
+
             return ToolResult(
                 success=True,
                 output=result,
-                metadata={"filepath": filepath}
+                metadata={"filepath": filepath, **page}
             )
         except Exception as e:
             logger.error(f"ReadCodeTool failed: {e}", exc_info=True)
             return ToolResult(
                 success=False,
-                error=f"Failed to read file: {str(e)}",
+                error=display_text(f"Failed to read file: {str(e)}"),
                 metadata={"filepath": filepath}
             )
 
@@ -548,7 +683,7 @@ class ListCodeFilesTool(BaseTool):
             logger.error(f"ListCodeFilesTool failed: {e}", exc_info=True)
             return ToolResult(
                 success=False,
-                error=f"List files failed: {str(e)}",
+                error=display_text(f"List files failed: {str(e)}"),
                 metadata={"directory": directory}
             )
 
@@ -665,6 +800,22 @@ def _repository_folder(tool: BaseTool, folder_id, with_physical_path: bool = Fal
     return info, None
 
 
+def _analysis_stamp(metadata: dict) -> str:
+    """When the stored analysis ran and how many files it covered, as one
+    sentence for a result that reflects that analysis rather than the folder
+    as it is now."""
+    raw = str(metadata.get("analyzed_at") or "").strip()
+    try:
+        when = datetime.fromisoformat(raw).strftime("%Y-%m-%d %H:%M") + " (server local time)"
+    except ValueError:
+        when = raw
+    count = metadata.get("file_count")
+    files = f", {count} files" if isinstance(count, int) else ""
+    if not when:
+        return f"Analysis time not recorded{files}. Files added or changed since the analysis are not reflected."
+    return f"Analysed {when}{files}. Files added or changed since then are not reflected."
+
+
 class GetRepositoryMapTool(BaseTool):
     """Tool to get the PageRank-based repository map of a Code Repository folder."""
 
@@ -675,7 +826,8 @@ class GetRepositoryMapTool(BaseTool):
         "its files by PageRank, each with up to 10 top-ranked classes, functions and methods, cut off at "
         "about 4,096 tokens. Take folder_id from list_code_repositories, using an entry with "
         "has_metadata=true. Read-only; needs the Guaardvark backend running, and shows the folder as of "
-        "its last analysis, not later edits. Fails with a message if the folder is not a Code Repository "
+        "its last analysis, not later edits: the first line says when that analysis ran (server local "
+        "time) and how many files it covered. Fails with a message if the folder is not a Code Repository "
         "or not analysed yet, and says so when the analysis found no code symbols. For import edges use "
         "get_dependency_graph; for one Python symbol's source, read_ast_node; for Guaardvark's own "
         "checkout, map_codebase."
@@ -711,19 +863,22 @@ class GetRepositoryMapTool(BaseTool):
                 if "repository_map" in folder["metadata"]:
                     return ToolResult(
                         success=True,
-                        output="The analysis found no classes or functions to map in this folder.",
+                        output=(
+                            "The analysis found no classes or functions to map in this folder. "
+                            + _analysis_stamp(folder["metadata"])
+                        ),
                         metadata={"folder_id": folder_id},
                     )
                 return ToolResult(success=False, error="No repository map found in the metadata. It may still be generating.")
 
             return ToolResult(
                 success=True,
-                output=repo_map,
-                metadata={"folder_id": folder_id}
+                output=f"{_analysis_stamp(folder['metadata'])}\n\n{repo_map}",
+                metadata={"folder_id": folder_id, "analyzed_at": folder["metadata"].get("analyzed_at")}
             )
         except Exception as e:
             logger.error(f"GetRepositoryMapTool failed: {e}", exc_info=True)
-            return ToolResult(success=False, error=f"Failed to get repository map: {str(e)}")
+            return ToolResult(success=False, error=display_text(f"Failed to get repository map: {str(e)}"))
 
 
 class GetDependencyGraphTool(BaseTool):
@@ -733,11 +888,13 @@ class GetDependencyGraphTool(BaseTool):
     read_only = True
     description = (
         "Return the file-level import graph of an uploaded Code Repository folder as JSON "
-        "{file: [in-repository files it imports]}, paths starting with the folder's own path. Only "
+        "{analyzed_at, file_count, graph}, where graph is {file: [in-repository files it imports]} with "
+        "paths starting with the folder's own path. Only "
         "Python and JavaScript/TypeScript imports are parsed; third-party imports and files that import "
-        "nothing in the repository are left out, and a repository with no internal imports returns {}. "
+        "nothing in the repository are left out, and a repository with no internal imports has an empty graph. "
         "Take folder_id from list_code_repositories. Read-only; needs the Guaardvark backend running, "
-        "reflects the last analysis, and fails with a message if the folder is not analysed. For a "
+        "reflects the last analysis (analyzed_at is when it ran, in server local time; later edits are "
+        "not in the graph), and fails with a message if the folder is not analysed. For a "
         "ranked symbol overview use get_repository_map; for import cycles in Guaardvark's own checkout, "
         "map_codebase."
     )
@@ -774,12 +931,16 @@ class GetDependencyGraphTool(BaseTool):
 
             return ToolResult(
                 success=True,
-                output=json.dumps(dep_graph, indent=2),
+                output=json.dumps({
+                    "analyzed_at": folder["metadata"].get("analyzed_at"),
+                    "file_count": folder["metadata"].get("file_count"),
+                    "graph": dep_graph,
+                }, indent=2),
                 metadata={"folder_id": folder_id, "node_count": len(dep_graph)}
             )
         except Exception as e:
             logger.error(f"GetDependencyGraphTool failed: {e}", exc_info=True)
-            return ToolResult(success=False, error=f"Failed to get dependency graph: {str(e)}")
+            return ToolResult(success=False, error=display_text(f"Failed to get dependency graph: {str(e)}"))
 
 
 class ReadASTNodeTool(BaseTool):
@@ -903,7 +1064,26 @@ class ReadASTNodeTool(BaseTool):
             
         except Exception as e:
             logger.error(f"ReadASTNodeTool failed: {e}", exc_info=True)
-            return ToolResult(success=False, error=f"Failed to read AST node: {str(e)}")
+            return ToolResult(success=False, error=display_text(f"Failed to read AST node: {str(e)}"))
+
+
+# Guaardvark's own source is always listed, although it is not a Library folder:
+# it has no folder id and cannot be marked as a Code Repository, so the folder
+# tools do not apply to it. Its path is "." because read_code, search_code and
+# list_code_files take paths relative to the checkout root; where the checkout
+# sits on disk is not something a client needs.
+LIVE_CHECKOUT_ENTRY = {
+    "id": "live",
+    "name": "Guaardvark's own source (live checkout)",
+    "path": ".",
+    "has_metadata": False,
+    "description": (
+        "The source of this Guaardvark install, not a Library folder: 'live' is not a folder_id, and "
+        "get_repository_map, get_dependency_graph and read_ast_node do not work on it. Explore it "
+        "with search_code, search_codebase, list_code_files and read_code, using paths relative to "
+        "the checkout root, or map_codebase for an overview."
+    ),
+}
 
 
 class ListCodeRepositoriesTool(BaseTool):
@@ -916,7 +1096,8 @@ class ListCodeRepositoriesTool(BaseTool):
         "has_metadata, description}. Call it first to get the integer folder_id that get_repository_map, "
         "get_dependency_graph and read_ast_node take. Marking a folder on the Documents page also marks "
         "each subfolder, listed separately; only entries with has_metadata=true have been analysed (the "
-        "map and graph are built at the end of that analysis), so use the top folder's id for those. The last entry, id 'live', is Guaardvark's own source root, "
+        "map and graph are built at the end of that analysis), so use the top folder's id for those. The last entry, id 'live', is Guaardvark's own source root "
+        "(path '.', the root that read_code and search_code paths are relative to), "
         "not a folder id: explore it with search_code, read_code or map_codebase. Read-only; needs the "
         "Guaardvark backend running. Folders are marked on the Documents page or by bulk indexing."
     )
@@ -940,20 +1121,7 @@ class ListCodeRepositoriesTool(BaseTool):
                         "description": (f.description or "")[:200] if f.description else ""
                     })
 
-            # Always surface the live main source root (GUAARDVARK_ROOT) even if not a DB-indexed Code Repo.
-            # Agent can use read_code / search_code / list_code_files with absolute or relative paths from here.
-            # For full map/graph, the folder should be marked is_repository and analyzed.
-            try:
-                root = os.environ.get("GUAARDVARK_ROOT") or os.getcwd()
-                result.append({
-                    "id": "live",
-                    "name": "Live main codebase (GUAARDVARK_ROOT)",
-                    "path": root,
-                    "has_metadata": False,
-                    "description": "The running Guaardvark source root. Use file tools (read_code etc.) directly with this path for exploration. Mark as Code Repo in Documents for map tools."
-                })
-            except Exception:
-                pass
+            result.append(dict(LIVE_CHECKOUT_ENTRY))
 
             return ToolResult(
                 success=True,
@@ -962,7 +1130,7 @@ class ListCodeRepositoriesTool(BaseTool):
             )
         except Exception as e:
             logger.error(f"ListCodeRepositoriesTool failed: {e}", exc_info=True)
-            return ToolResult(success=False, error=f"Failed to list code repos: {str(e)}")
+            return ToolResult(success=False, error=display_text(f"Failed to list code repos: {str(e)}"))
 
 
 # Tool instances for registration
