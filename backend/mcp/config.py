@@ -151,9 +151,11 @@ SHARED_TIMEOUT_ENV = "GUAARDVARK_MCP_TIMEOUT"
 
 
 def _as_bool(value: Any) -> bool | None:
-    """True or False for a JSON boolean or a flag string; None for anything else."""
+    """True or False for a JSON boolean, 0 or 1, or a flag string; None for anything else."""
     if isinstance(value, bool):
         return value
+    if isinstance(value, int) and value in (0, 1):
+        return bool(value)
     if isinstance(value, str):
         flag = value.strip().lower()
         if flag in ("true", "1", "yes", "on"):
@@ -161,6 +163,130 @@ def _as_bool(value: Any) -> bool | None:
         if flag in ("false", "0", "no", "off"):
             return False
     return None
+
+
+# The smallest per-call timeout accepted. Zero or less makes every call report
+# a timeout at once (``asyncio.wait_for`` does not wait at all) while the tool
+# runs on, and there is no "no limit" value, so such a setting is refused.
+MIN_TIMEOUT_SECONDS = 1
+
+
+def _flag(value: Any, where: str) -> bool | None:
+    """``value`` as a boolean; None, with a warning, when it is not one."""
+    flag = _as_bool(value)
+    if flag is None:
+        logger.warning("%s=%r is not true or false; ignored", where, value)
+    return flag
+
+
+def _timeout(value: Any, where: str, current: int) -> int | None:
+    """``value`` as a per-call timeout in seconds; None, with a warning, when it
+    is not a whole number or is below ``MIN_TIMEOUT_SECONDS``."""
+    try:
+        if isinstance(value, bool):
+            raise ValueError
+        seconds = int(value)
+    except (TypeError, ValueError):
+        logger.warning("%s=%r is not a whole number of seconds; keeping %d s", where, value, current)
+        return None
+    if seconds < MIN_TIMEOUT_SECONDS:
+        logger.warning(
+            "%s=%r is below the %d s minimum, and there is no 'no limit' value; keeping %d s",
+            where, value, MIN_TIMEOUT_SECONDS, current,
+        )
+        return None
+    return seconds
+
+
+def _table(parent: dict, key: str, where: str) -> dict:
+    """``parent[key]`` when it is an object. Null, a list or a scalar there is
+    reported and read as nothing set."""
+    if key not in parent:
+        return {}
+    value = parent[key]
+    if isinstance(value, dict):
+        return value
+    logger.warning("%s in mcp.json is %s, not an object; using defaults for it",
+                   where, "null" if value is None else f"a {type(value).__name__}")
+    return {}
+
+
+def _names(value: Any, where: str) -> List[str] | None:
+    """``value`` as a list of names; None, with a warning, when it is not one.
+    A single string is one name, never its characters."""
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, (list, tuple)):
+        return [str(item) for item in value]
+    logger.warning("%s in mcp.json is %s, not a list; keeping the default",
+                   where, "null" if value is None else f"a {type(value).__name__}")
+    return None
+
+
+def _apply_file(cfg: MCPConfig, raw: Any) -> None:
+    """Write the settings of a parsed mcp.json over ``cfg``. A value of the
+    wrong type is reported and skipped; the rest of the file still applies."""
+    if not isinstance(raw, dict):
+        logger.warning("mcp.json is a %s, not an object; using defaults", type(raw).__name__)
+        return
+    server = _table(raw, "server", "server")
+    if "enabled" in server:
+        flag = _flag(server["enabled"], "server.enabled in mcp.json")
+        if flag is not None:
+            cfg.enabled = flag
+            cfg.disabled_by = "" if flag else "server.enabled in data/config/mcp.json"
+    if "name" in server:
+        cfg.server_name = str(server["name"])
+    if "timeout_seconds" in server:
+        seconds = _timeout(server["timeout_seconds"], "server.timeout_seconds in mcp.json",
+                           cfg.timeout_seconds)
+        if seconds is not None:
+            cfg.timeout_seconds = seconds
+
+    tools = _table(server, "tools", "server.tools")
+    # Per tool, the file's values go over the built-in ones. A file that sets a
+    # default for one tool leaves every other tool's defaults in place.
+    for tool, values in _table(tools, "argument_defaults", "server.tools.argument_defaults").items():
+        if isinstance(values, dict):
+            cfg.tools.argument_defaults[str(tool)] = {
+                **cfg.tools.argument_defaults.get(str(tool), {}), **values}
+        else:
+            logger.warning("server.tools.argument_defaults.%s in mcp.json is not an object; ignored", tool)
+    for key in ("deny_categories", "allow", "deny"):
+        if key in tools:
+            names = _names(tools[key], f"server.tools.{key}")
+            if names is not None:
+                setattr(cfg.tools, key, names)
+    for key in ("hide_dangerous", "hide_approval_required"):
+        if key in tools:
+            flag = _flag(tools[key], f"server.tools.{key} in mcp.json")
+            if flag is not None:
+                setattr(cfg.tools, key, flag)
+
+    resources = _table(server, "resources", "server.resources")
+    for key in ("outputs_enabled", "outputs_root_files"):
+        if key in resources:
+            flag = _flag(resources[key], f"server.resources.{key} in mcp.json")
+            if flag is not None:
+                setattr(cfg.resources, key, flag)
+    if "outputs_root" in resources:
+        if isinstance(resources["outputs_root"], str) and resources["outputs_root"].strip():
+            cfg.resources.outputs_root = resources["outputs_root"]
+        else:
+            logger.warning("server.resources.outputs_root in mcp.json is not a path; keeping the default")
+    if "outputs_folders" in resources:
+        folders = _names(resources["outputs_folders"], "server.resources.outputs_folders")
+        if folders is not None:
+            cfg.resources.outputs_folders = folders
+    if "max_inline_bytes" in resources:
+        limit = resources["max_inline_bytes"]
+        try:
+            if isinstance(limit, bool) or int(limit) < 0:
+                raise ValueError
+            cfg.resources.max_inline_bytes = int(limit)
+        except (TypeError, ValueError):
+            logger.warning("server.resources.max_inline_bytes=%r in mcp.json is not a byte count; "
+                           "keeping the default", limit)
 
 
 def load_config() -> MCPConfig:
@@ -177,69 +303,36 @@ def load_config() -> MCPConfig:
     path = _config_path()
 
     if path.exists():
+        # A broken config file must not stop the server: whatever cannot be
+        # read falls back to its default, with a warning that names it.
         try:
             with path.open("r") as fh:
                 raw = json.load(fh)
-            server = raw.get("server", {})
-            if "enabled" in server:
-                cfg.enabled = bool(server["enabled"])
-                cfg.disabled_by = "" if cfg.enabled else "server.enabled in data/config/mcp.json"
-            if "name" in server:
-                cfg.server_name = str(server["name"])
-            if "timeout_seconds" in server:
-                cfg.timeout_seconds = int(server["timeout_seconds"])
-
-            tools = server.get("tools", {})
-            if isinstance(tools.get("argument_defaults"), dict):
-                cfg.tools.argument_defaults = {
-                    str(k): dict(v) for k, v in tools["argument_defaults"].items() if isinstance(v, dict)
-                }
-            if "deny_categories" in tools:
-                cfg.tools.deny_categories = list(tools["deny_categories"])
-            if "allow" in tools:
-                cfg.tools.allow = list(tools["allow"])
-            if "deny" in tools:
-                cfg.tools.deny = list(tools["deny"])
-            if "hide_dangerous" in tools:
-                cfg.tools.hide_dangerous = bool(tools["hide_dangerous"])
-            if "hide_approval_required" in tools:
-                cfg.tools.hide_approval_required = bool(tools["hide_approval_required"])
-
-            resources = server.get("resources", {})
-            if "outputs_enabled" in resources:
-                cfg.resources.outputs_enabled = bool(resources["outputs_enabled"])
-            if "outputs_root" in resources:
-                cfg.resources.outputs_root = str(resources["outputs_root"])
-            if isinstance(resources.get("outputs_folders"), list):
-                cfg.resources.outputs_folders = [str(f) for f in resources["outputs_folders"]]
-            if "outputs_root_files" in resources:
-                cfg.resources.outputs_root_files = bool(resources["outputs_root_files"])
-            if "max_inline_bytes" in resources:
-                cfg.resources.max_inline_bytes = int(resources["max_inline_bytes"])
-
-            logger.info("Loaded MCP config from %s", path)
-        except (json.JSONDecodeError, OSError, ValueError) as exc:
-            # Don't let a broken config file kill the whole server; fall back
-            # to defaults and tell whoever's listening.
+        except (json.JSONDecodeError, OSError) as exc:
             logger.warning("Could not parse %s (%s); using defaults", path, exc)
+        else:
+            try:
+                _apply_file(cfg, raw)
+                logger.info("Loaded MCP config from %s", path)
+            except Exception as exc:  # noqa: BLE001 - a half-applied file is worse than none
+                logger.warning("Could not apply %s (%s: %s); using defaults",
+                               path, exc.__class__.__name__, exc)
+                cfg = MCPConfig()
 
     env_enabled = os.environ.get(SERVER_ENABLED_ENV)
     if env_enabled is not None:
-        flag = _as_bool(env_enabled)
-        if flag is None:
-            logger.warning("%s=%r is not true or false; ignored", SERVER_ENABLED_ENV, env_enabled)
-        else:
+        flag = _flag(env_enabled, SERVER_ENABLED_ENV)
+        if flag is not None:
             cfg.enabled = flag
             cfg.disabled_by = "" if flag else SERVER_ENABLED_ENV
     for name in (SERVER_TIMEOUT_ENV, SHARED_TIMEOUT_ENV):
         env_timeout = os.environ.get(name)
         if env_timeout is None:
             continue
-        try:
-            cfg.timeout_seconds = int(env_timeout)
-        except ValueError:
-            logger.warning("%s=%r is not a whole number of seconds; ignored", name, env_timeout)
+        seconds = _timeout(env_timeout, name, cfg.timeout_seconds)
+        if seconds is None:
             continue
+        cfg.timeout_seconds = seconds
         break
 
     return cfg
