@@ -58,7 +58,7 @@ def _celery_task_modules(root: Path, extra_excludes: frozenset[str]) -> set[str]
     """
     reached: set[str] = set()
     for py in root.rglob("*.py"):
-        if is_excluded(py, extra_excludes):
+        if is_excluded(py, extra_excludes, root=root):
             continue
         try:
             rel = py.relative_to(root)
@@ -99,7 +99,7 @@ def _blueprint_modules(root: Path, extra_excludes: frozenset[str]) -> set[str]:
     """
     reached: set[str] = set()
     for py in root.rglob("*.py"):
-        if is_excluded(py, extra_excludes):
+        if is_excluded(py, extra_excludes, root=root):
             continue
         try:
             rel = py.relative_to(root)
@@ -168,7 +168,7 @@ def _tool_modules(root: Path, extra_excludes: frozenset[str]) -> set[str]:
     if not tools_root.is_dir():
         return reached
     for py in tools_root.rglob("*.py"):
-        if is_excluded(py, extra_excludes):
+        if is_excluded(py, extra_excludes, root=root):
             continue
         try:
             rel = py.relative_to(root)

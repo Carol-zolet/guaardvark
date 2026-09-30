@@ -204,7 +204,7 @@ def analyze(root: Path, extra_excludes: frozenset[str] = frozenset()) -> dict[st
         all_exports: set[str] = set()
 
         for py in root.rglob("*.py"):
-            if is_excluded(py, extra_excludes):
+            if is_excluded(py, extra_excludes, root=root):
                 continue
             try:
                 rel = str(py.relative_to(root))

@@ -40,9 +40,10 @@ def _backend_routes(root: Path, extra_excludes: frozenset[str]) -> list[dict]:
 
     out: list[dict] = []
     for py in backend_dir.rglob("*.py"):
-        if is_excluded(py, extra_excludes):
+        if is_excluded(py, extra_excludes, root=root):
             continue
-        rel_str = str(py)
+        # Relative to root, so a checkout under a folder named tests keeps its routes.
+        rel_str = "/" + py.relative_to(root).as_posix()
         if any(s in rel_str for s in ("/_archive/", "/backs/", "/tests/")) or \
            "_BACK" in py.name or "BACKUP" in py.name or py.name.startswith("test_"):
             continue  # don't conflate dead code, tests, or mocks with live routes
@@ -177,7 +178,7 @@ def _frontend_callers(root: Path, extra_excludes: frozenset[str]) -> list[dict]:
     for jsf in fe.rglob("*"):
         if not jsf.is_file() or jsf.suffix not in JS_EXTS:
             continue
-        if is_excluded(jsf, extra_excludes):
+        if is_excluded(jsf, extra_excludes, root=root):
             continue
         try:
             text = jsf.read_text(encoding="utf-8", errors="ignore")
