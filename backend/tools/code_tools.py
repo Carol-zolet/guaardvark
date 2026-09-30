@@ -137,6 +137,14 @@ def _extract_code(reply: str, filename: str) -> str:
     return (parsed[0] if parsed else candidates[0]).strip("\n")
 
 
+def _active_llm():
+    """An Ollama client for the chat model that is active now. Built on every
+    call: the MCP server process outlives a model switch in Settings, and a
+    client kept from the first call would go on asking for the old model."""
+    from backend.utils.llm_service import get_default_llm
+    return get_default_llm()
+
+
 def _estimated_tokens(text: str) -> int:
     return int(len(text) / PROMPT_CHARS_PER_TOKEN) + 1
 
@@ -359,15 +367,8 @@ class CodeGeneratorTool(BaseTool):
         '.bash': 'bash',
     }
 
-    def __init__(self):
-        super().__init__()
-        self._llm = None
-
     def _get_llm(self):
-        if self._llm is None:
-            from backend.utils.llm_service import get_default_llm
-            self._llm = get_default_llm()
-        return self._llm
+        return _active_llm()
 
     def _detect_language(self, filename: str) -> str:
         """Detect programming language from file extension"""
@@ -627,16 +628,23 @@ class CodeAnalysisTool(BaseTool):
     """
 
     name = "analyze_code"
-    read_only = True
+    # It writes nothing, but every call is a local model run of up to 180 s.
+    # Declared not read-only so MCP callers are offered an idempotency_key and a
+    # timed-out call is not described as safe to repeat, which would queue a
+    # second run behind the first.
+    read_only = False
+    destructive = False
     description = (
         "Review one text file with Guaardvark's local LLM (Ollama) and return its written findings; "
-        "nothing is changed or written, and an empty reply is an error. The model is told to cite a line number for each finding, "
+        "no file is changed or written, and an empty reply is an error. The model is told to cite a line number for each finding, "
         "which is not checked. analysis_type picks the focus. A file over 48,000 characters is not "
         "sent whole: the model gets its first 28,800 and last 14,400 characters plus an outline of "
         "imports, classes and function lines, and the result has truncated=true. Returns file, "
         "language, analysis_type, analysis, line_count, char_count, truncated and visible_lines. The "
         "model call stops after 180 s; over MCP a call that outlasts its timeout (120 s by default) "
-        "returns an error. To read the file yourself use read_code (for an upload, 'data/uploads/<path>'); "
+        "returns an error while the review keeps running, and its answer is then only reachable by "
+        "repeating the call with the same idempotency_key, which waits for that run instead of "
+        "starting another. To read the file yourself use read_code (for an upload, 'data/uploads/<path>'); "
         "for a changed copy, codegen."
     )
 
@@ -657,15 +665,8 @@ class CodeAnalysisTool(BaseTool):
         )
     }
 
-    def __init__(self):
-        super().__init__()
-        self._llm = None
-
     def _get_llm(self):
-        if self._llm is None:
-            from backend.utils.llm_service import get_default_llm
-            self._llm = get_default_llm()
-        return self._llm
+        return _active_llm()
 
     def _extract_structure(self, content: str, language: str) -> str:
         """Extract code structure summary for large files"""

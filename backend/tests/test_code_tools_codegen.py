@@ -202,3 +202,32 @@ def test_a_readme_for_a_new_project_is_written(llm, guard, tmp_path):
     result = guard.execute(output_filename="README.md", instructions="Generate a README.md for a to-do list web app")
     assert result.success, result.error
     assert (tmp_path / "outputs" / "code" / "README.md").read_text() == "# Todo"
+
+
+# --- which model a call uses, and what MCP clients are told ---------------
+
+def test_each_call_uses_the_model_that_is_active_now(llm, tmp_path):
+    """A tool instance lives as long as the MCP server; the active model can
+    change under it."""
+    (tmp_path / "uploads" / "mod.py").write_text("x = 1\n")
+    generator, reviewer = ct.CodeGeneratorTool(), ct.CodeAnalysisTool()
+
+    first = llm(StubLLM("x = 1", model="model-a"))
+    assert generator.execute(output_filename="a.py", instructions="write a greeting script").success
+    assert reviewer.execute(file_path="mod.py").success
+    assert len(first.prompts) == 2
+
+    second = llm(StubLLM("x = 1", model="model-b"))
+    assert generator.execute(output_filename="b.py", instructions="write a greeting script").success
+    assert reviewer.execute(file_path="mod.py").success
+    assert len(first.prompts) == 2 and len(second.prompts) == 2
+
+
+def test_the_tools_that_run_the_model_are_not_declared_read_only():
+    """The MCP adapter offers an idempotency_key only to tools that are not
+    read_only, and tells the caller of a timed-out read_only tool that calling
+    again is safe. Neither fits a call that runs the model for minutes
+    (backend/mcp/tests/test_tools_adapter_contract.py covers the adapter)."""
+    reviewer, generator = ct.CodeAnalysisTool(), ct.CodeGeneratorTool()
+    assert (reviewer.read_only, reviewer.destructive) == (False, False)
+    assert (generator.read_only, generator.destructive) == (False, True)
