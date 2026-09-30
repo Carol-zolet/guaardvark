@@ -1,6 +1,7 @@
 from flask import Blueprint, request
 
 from backend.utils.response_utils import success_response, error_response
+from backend.utils.settings_utils import get_web_access
 
 command_bp = Blueprint("command_api", __name__, url_prefix="/api/command")
 
@@ -51,6 +52,13 @@ def websearch_command():
                 "Please provide a search query.",
                 status_code=400,
                 error_code="NO_QUERY",
+            )
+
+        if not get_web_access():
+            return error_response(
+                "Web search is disabled in system settings",
+                status_code=403,
+                error_code="WEB_ACCESS_DISABLED",
             )
 
         logger.info(f"/websearch command: '{query}'")

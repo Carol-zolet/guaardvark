@@ -170,15 +170,20 @@ def test_a_failed_search_says_why(monkeypatch, transport, raised, expected, atte
     assert transport == []
 
 
-def test_the_command_route_names_the_engine_and_says_when_nothing_is_found(engine, transport):
+def test_the_command_route_searches_only_with_web_access_on(engine, transport, monkeypatch):
     from flask import Flask
     from backend.routes import command_api
 
-    _, state = engine
+    asked, state = engine
     app = Flask(__name__)
     app.register_blueprint(command_api.command_bp)
     client = app.test_client()
 
+    monkeypatch.setattr(command_api, "get_web_access", lambda: False)
+    refused = client.post("/api/command/websearch", json={"query": "rust vs go"})
+    assert refused.status_code == 403 and asked == []
+
+    monkeypatch.setattr(command_api, "get_web_access", lambda: True)
     found = client.post("/api/command/websearch", json={"query": "rust vs go"}).get_json()
     assert found["data"]["response"].startswith(f"Search results from {SEARCH_ENGINE}:")
     state["rows"] = 0
