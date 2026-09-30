@@ -135,15 +135,123 @@ def _is_edit_forbidden(filepath: str) -> tuple[bool, str | None]:
     return False, None
 
 
+# The most file text one read_code call returns. MCP clients cap the size of a
+# tool result: the Claude Code CLI defaults to 25,000 tokens. Measured with the
+# cl100k_base tokenizer, this repository's twelve largest source files run 3.6
+# to 5.3 characters per token, so 60,000 characters is at most about 17,000
+# tokens. 43 of its 1,964 tracked source files are longer and come back in pages.
+READ_CODE_PAGE_CHARS = 60_000
+
+_CONTENT_START = "========== FILE CONTENT START ==========\n"
+_CONTENT_END = "\n========== FILE CONTENT END =========="
+
+
+def _line_number(value, name: str) -> int | None:
+    """start_line or end_line as an integer of 1 or more; None when not given."""
+    if value is None or value == "":
+        return None
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{name} must be a whole number, got {value!r}")
+    if number < 1:
+        raise ValueError(f"{name} must be 1 or more (lines are numbered from 1), got {number}")
+    return number
+
+
+def _page_of_file(result: str, filepath: str, start_line: int | None, end_line: int | None,
+                  max_chars: int | None = None) -> tuple[str, dict]:
+    """Cut read_code()'s whole-file result down to the lines asked for and to
+    one page of text. Returns (result, facts about the page).
+
+    Lines are split on "\n", the numbering search_code reports. A whole file
+    that fits in a page, asked for without a range, is returned unchanged. A
+    page ends on a line boundary; one line longer than a page is cut. Raises
+    ValueError for a range outside the file."""
+    max_chars = READ_CODE_PAGE_CHARS if max_chars is None else max_chars
+    head, marker, rest = result.partition(_CONTENT_START)
+    if not marker or not rest.endswith(_CONTENT_END):
+        return result, {}
+    content = rest[:-len(_CONTENT_END)]
+    lines = content.split("\n")
+    if content.endswith("\n"):
+        lines.pop()
+    total = len(lines) if content else 0
+
+    if start_line is None and end_line is None and len(content) <= max_chars:
+        return result, {"total_lines": total, "complete": True}
+
+    first = start_line or 1
+    if end_line is not None and end_line < first:
+        raise ValueError(f"end_line ({end_line}) is before start_line ({first})")
+    if first > max(total, 1):
+        raise ValueError(f"start_line {first} is past the end of '{filepath}', which has {total} lines")
+    if total == 0:
+        return result, {"total_lines": 0, "complete": True}
+    wanted_last = min(end_line or total, total)
+
+    taken: list[str] = []
+    used = 0
+    cut_line = False
+    for line in lines[first - 1:wanted_last]:
+        cost = len(line) + 1
+        if taken and used + cost > max_chars:
+            break
+        if not taken and len(line) > max_chars:
+            line, cut_line = line[:max_chars], True
+        taken.append(line)
+        used += cost
+        if cut_line:
+            break
+    last = first + len(taken) - 1 if taken else first - 1
+    text = "\n".join(taken)
+    whole_file = first == 1 and last == total and not cut_line
+    if whole_file and content.endswith("\n"):
+        text += "\n"
+
+    showing = f"Showing lines {first}-{last} of {total} ({len(text):,} characters)."
+    footer = ""
+    if cut_line:
+        showing += (
+            f" Line {first} is {len(lines[first - 1]):,} characters long and is cut at {max_chars:,};"
+            " read_code pages by line, so the rest of that line is not available through it."
+        )
+        if last < total:
+            showing += f" The next line is start_line={last + 1}."
+    elif last < wanted_last:
+        more = f"start_line={last + 1}" + (f", end_line={end_line}" if end_line is not None else "")
+        showing += (
+            f" One call returns at most {max_chars:,} characters; continue with {more}."
+        )
+        footer = f"\n[Lines {first}-{last} of {total}. Next page: read_code(filepath='{filepath}', {more})]"
+    elif last < total:
+        showing += f" The file continues at start_line={last + 1}."
+    if not whole_file:
+        showing += " The header above describes the whole file."
+
+    page = f"{head.rstrip()}\n{showing}\n\n{_CONTENT_START}{text}{_CONTENT_END}{footer}"
+    return page, {
+        "total_lines": total,
+        "start_line": first,
+        "end_line": last,
+        "complete": whole_file,
+        "next_start_line": last + 1 if last < total else None,
+    }
+
+
 class ReadCodeTool(BaseTool):
     """Tool to read source code files"""
 
     name = "read_code"
     read_only = True
     description = (
-        "Read one UTF-8 text file (up to 10 MB) from this Guaardvark install's own checkout, in full. "
-        "Returns a header (path, line and character counts, SHA-256 of the text, mtime) and the content "
-        "between START/END markers, without line numbers. Paths are relative to the checkout root; an "
+        "Read one UTF-8 text file (up to 10 MB) from this Guaardvark install's own checkout, whole or by line range. "
+        "Returns a header (path, line and character counts, SHA-256 of the whole file's text, mtime) and the content "
+        "between START/END markers, without line numbers. One call returns at most 60,000 characters of "
+        "content, in whole lines: a longer file comes back as its first page with a 'Showing lines A-B of N' "
+        "line naming the start_line of the next page. Pass start_line and end_line (1-based, inclusive, "
+        "the line numbers search_code reports) to read part of a file; a range past the end of the file "
+        "is an error. Paths are relative to the checkout root; an "
         "absolute path works when it lies inside the checkout. Refused: git-ignored local data (files "
         "under data/uploads and data/outputs stay readable), .env and credential or key files (*.pem, "
         "*.key, id_rsa, .netrc, credentials.*), and anything under .git, venv, node_modules, dist, logs "
@@ -157,6 +265,20 @@ class ReadCodeTool(BaseTool):
             type="string",
             required=True,
             description="File to read, relative to the checkout root, e.g. 'backend/app.py' or 'frontend/src/App.jsx'. A relative path may not leave the checkout."
+        ),
+        "start_line": ToolParameter(
+            name="start_line",
+            type="int",
+            required=False,
+            minimum=1,
+            description="First line to return, counting from 1. Default: the first line. Use the 'path:line' numbers from search_code, or the start_line a previous page named."
+        ),
+        "end_line": ToolParameter(
+            name="end_line",
+            type="int",
+            required=False,
+            minimum=1,
+            description="Last line to return, inclusive. Default: as far as one call reaches (60,000 characters). A value past the end of the file reads to the end."
         )
     }
 
@@ -170,6 +292,12 @@ class ReadCodeTool(BaseTool):
             )
 
         try:
+            try:
+                start_line = _line_number(kwargs.get("start_line"), "start_line")
+                end_line = _line_number(kwargs.get("end_line"), "end_line")
+            except ValueError as e:
+                return ToolResult(success=False, error=f"ERROR reading '{filepath}': {e}", metadata={"filepath": filepath})
+
             result = read_code(filepath, allow_external=not is_mcp_transport(self))
 
             # Check if result indicates an error
@@ -180,10 +308,15 @@ class ReadCodeTool(BaseTool):
                     metadata={"filepath": filepath}
                 )
 
+            try:
+                result, page = _page_of_file(result, filepath, start_line, end_line)
+            except ValueError as e:
+                return ToolResult(success=False, error=f"ERROR reading '{filepath}': {e}", metadata={"filepath": filepath})
+
             return ToolResult(
                 success=True,
                 output=result,
-                metadata={"filepath": filepath}
+                metadata={"filepath": filepath, **page}
             )
         except Exception as e:
             logger.error(f"ReadCodeTool failed: {e}", exc_info=True)
