@@ -257,10 +257,11 @@ def task_diff(swarm_id, task_id):
 
 @swarm_bp.route("/<swarm_id>/bus/state", methods=["GET", "POST"])
 def bus_state(swarm_id):
-    if flask_request.method == "GET":
-        data, status = _proxy_get(f"/swarm/{swarm_id}/bus/state")
-    else:
+    # Only an explicit POST writes: Flask also routes HEAD here.
+    if flask_request.method == "POST":
         data, status = _proxy_post(f"/swarm/{swarm_id}/bus/state", flask_request.get_json() or {})
+    else:
+        data, status = _proxy_get(f"/swarm/{swarm_id}/bus/state")
     if status >= 400:
         return error_response(_extract_error(data, "Bus state unavailable"), status)
     return success_response(data=data, message="Bus state updated" if flask_request.method == "POST" else "Bus state retrieved")

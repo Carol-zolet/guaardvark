@@ -790,12 +790,20 @@ def download_batch(batch_id: str):
 
         tmp_fd, tmp_path = tempfile.mkstemp(suffix=".zip")
         os.close(tmp_fd)
-        with zipfile.ZipFile(tmp_path, "w", zipfile.ZIP_DEFLATED) as zipf:
-            for file_path in batch_dir.rglob("*"):
-                if file_path.is_file():
-                    arcname = file_path.relative_to(batch_dir)
-                    zipf.write(file_path, arcname)
-        return send_file(tmp_path, as_attachment=True, download_name=f"{batch_id}.zip")
+        try:
+            with zipfile.ZipFile(tmp_path, "w", zipfile.ZIP_DEFLATED) as zipf:
+                for file_path in batch_dir.rglob("*"):
+                    if file_path.is_file():
+                        arcname = file_path.relative_to(batch_dir)
+                        zipf.write(file_path, arcname)
+            # The open handle keeps the data readable after the name is gone,
+            # so every download leaves nothing behind in the temp directory
+            # (tmpfs on many systems), whether or not the client reads it all.
+            archive = open(tmp_path, "rb")
+        finally:
+            os.unlink(tmp_path)
+        return send_file(archive, as_attachment=True, download_name=f"{batch_id}.zip",
+                         mimetype="application/zip")
     except Exception as e:
         logger.error(f"Failed to download batch: {e}")
         return error_response(str(e), 500)

@@ -25,6 +25,12 @@ the page being refused. Requests with neither Origin nor Sec-Fetch-Site (the
 CLI, the MCP server, curl, the Interconnector's and the cluster's calls
 between machines) pass untouched, as do pages served from the address they
 call, whatever name the machine was reached by.
+
+GET and HEAD always pass, since any page can send them (an <img>, a link, a
+no-cors fetch), so a route must never change anything on either. Flask sends
+HEAD to the GET rule's view: a view that also takes POST or DELETE acts only
+when request.method names that method, never in an "else" after checking for
+GET (backend/tests/test_get_requests_change_nothing.py).
 """
 
 from __future__ import annotations

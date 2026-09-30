@@ -306,7 +306,7 @@ export const runSelfTest = async (options = {}) => {
 
 export const testLLM = async () => {
   try {
-    const response = await fetch(`${BASE_URL}/meta/test-llm`);
+    const response = await fetch(`${BASE_URL}/meta/test-llm`, { method: "POST" });
     const data = await handleResponse(response);
     if (typeof data === "object" && data !== null && data.error)
       throw new Error(data.error);
