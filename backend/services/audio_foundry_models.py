@@ -30,7 +30,13 @@ _DOWNLOAD_STALL_SECONDS = 180
 _HF_XET_ENV = "HF_HUB_DISABLE_XET"
 _PIP_TIMEOUT_SECONDS = 600
 
-PLUGIN_DIR = Path(__file__).resolve().parents[2] / "plugins" / "audio_foundry"
+# Two roots that coincide on a real install but mean different things. The
+# voice catalog is tracked source shipped in the same checkout as this module,
+# so it is always read from there. PLUGIN_DIR is where the plugin's venv lives
+# (untracked, created on this machine at first start); only venv lookups and
+# pip use it.
+PLUGIN_SOURCE_DIR = Path(__file__).resolve().parents[2] / "plugins" / "audio_foundry"
+PLUGIN_DIR = PLUGIN_SOURCE_DIR
 
 # MiniMax Music 3 lives in the video registry (ComfyUI/models). One Install
 # click here forwards to that downloader so Audio Studio is self-contained.
@@ -155,7 +161,7 @@ def is_hub_cached(repo_id: str, probe_file: str) -> bool:
 
 def load_voice_catalog(relpath: str) -> Dict[str, Any]:
     """A voice list shipped with the plugin (e.g. backends/kokoro_voices.json)."""
-    with (PLUGIN_DIR / relpath).open("r", encoding="utf-8") as fh:
+    with (PLUGIN_SOURCE_DIR / relpath).open("r", encoding="utf-8") as fh:
         return json.load(fh)
 
 
