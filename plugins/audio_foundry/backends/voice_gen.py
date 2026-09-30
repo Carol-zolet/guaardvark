@@ -4,11 +4,16 @@ Behaves like a single AudioBackend to the dispatcher above it. Internally
 routes per-call based on the requested backend and degrades to Kokoro if
 Chatterbox runs out of VRAM (16 GB cards on a busy day).
 
-Routing rules:
+Routing rules (``route``), the same for every caller (Audio Studio, the
+backend's voice API, the Film Crew Editor, MCP's generate_speech):
+
   backend="chatterbox" -> Chatterbox only; raises if Chatterbox fails
   backend="kokoro"     -> Kokoro only; raises if Kokoro fails
-  backend="auto"       -> Try Chatterbox first; on any error, retry with Kokoro
-                         (logs the original error so the cause isn't swallowed)
+  backend="auto"       -> decided by what the request names:
+      a reference clip  -> Chatterbox cloning that clip; no fallback, since
+                           Kokoro cannot speak in that voice
+      no clip           -> Chatterbox's stock voice, falling back to Kokoro's
+                           default voice on any error (logged), as before
 
 vram_mb_estimate is the *max* of the inner backends, not the sum — both are
 never expected to be loaded simultaneously in steady state. The dispatcher's
@@ -27,6 +32,19 @@ from backends.voice_gen_chatterbox import ChatterboxBackend
 from backends.voice_gen_kokoro import KokoroBackend
 
 logger = logging.getLogger(__name__)
+
+AUTO = "auto"
+
+
+def route(params: dict[str, Any]) -> str:
+    """The engine this request asks for: 'chatterbox', 'kokoro', or AUTO
+    (Chatterbox's stock voice with the Kokoro fallback)."""
+    requested = str(params.get("backend") or AUTO).lower()
+    if requested in ("chatterbox", "kokoro"):
+        return requested
+    if params.get("reference_clip_path"):
+        return "chatterbox"
+    return AUTO
 
 
 class VoiceGenBackend(AudioBackend):
@@ -72,15 +90,14 @@ class VoiceGenBackend(AudioBackend):
         self._kokoro.unload()
 
     def generate(self, **params: Any) -> GenerationResult:
-        requested = (params.get("backend") or "auto").lower()
-
-        if requested == "chatterbox":
+        engine = route(params)
+        if engine == "chatterbox":
             return self._gen_with(self._chatterbox, params)
-        if requested == "kokoro":
+        if engine == "kokoro":
             return self._gen_with(self._kokoro, params)
 
-        # auto: prefer Chatterbox, fall back to Kokoro on any runtime error —
-        # but NOT on a user cancel.
+        # No clip: prefer Chatterbox, fall back to Kokoro on any runtime
+        # error — but NOT on a user cancel.
         try:
             return self._gen_with(self._chatterbox, params)
         except GenerationCancelled:

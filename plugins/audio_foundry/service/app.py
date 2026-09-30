@@ -17,6 +17,7 @@ from pydantic import BaseModel, Field, ConfigDict
 # here does not pull the ML stack into service startup.
 from backends.voice_gen_chatterbox import EMOTION_PRESETS
 from backends.kokoro_voices import UnknownVoice
+from backends.voice_consent import ConsentRequired, require_consent
 from service.bootstrap import bootstrap
 from service.config_loader import load_config, resolve_backend_url
 from service.dispatcher import BackendUnavailable, Dispatcher, Intent, NotWired
@@ -280,7 +281,11 @@ def list_voices() -> dict[str, Any]:
         "kokoro": {"default": catalog["default"], "groups": groups},
         "chatterbox": {
             "type": "reference_clip",
-            "description": "Zero-shot voice cloning from a 5-10s reference clip. Pass `reference_clip_path` in the /generate/voice request.",
+            "description": (
+                "Zero-shot voice cloning from a 5-10s reference clip imported in Audio Studio "
+                "with consent recorded. Pass its path as `reference_clip_path` in the "
+                "/generate/voice request; a clip without a consent record is refused (403)."
+            ),
         },
     }
 
@@ -290,9 +295,22 @@ def generate_fx(req: FxRequest) -> Any:
     return _dispatch(Intent.FX, req)
 
 
+def _checked_voice_request(req: VoiceRequest) -> VoiceRequest:
+    """Refuse a reference clip without a consent record before any job is
+    queued or model loaded; ChatterboxBackend checks again when it clones.
+    The clip travels on as the real path that was checked."""
+    if not req.reference_clip_path:
+        return req
+    try:
+        clip = require_consent(req.reference_clip_path)
+    except ConsentRequired as e:
+        raise HTTPException(status_code=403, detail=str(e))
+    return req.model_copy(update={"reference_clip_path": str(clip)})
+
+
 @app.post("/generate/voice")
 def generate_voice(req: VoiceRequest) -> Any:
-    return _dispatch(Intent.VOICE, req)
+    return _dispatch(Intent.VOICE, _checked_voice_request(req))
 
 
 @app.post("/generate/voice/stream")
@@ -303,7 +321,7 @@ def generate_voice_stream(req: VoiceRequest) -> Any:
     playable immediately (header included per chunk).
     """
     from starlette.responses import StreamingResponse
-    params = req.model_dump(exclude_none=True)
+    params = _checked_voice_request(req).model_dump(exclude_none=True)
     # Force inline load for stream path (chat texts are short)
     with _dispatcher._intent_locks[Intent.VOICE]:
         with _dispatcher._state_lock:
@@ -368,10 +386,10 @@ def clear_jobs() -> dict[str, Any]:
 def _run(intent: Intent, params: dict[str, Any]) -> dict[str, Any]:
     """Synchronous generate (short inputs / async not requested).
 
-    Translates NotWired to 501, an unknown Kokoro voice id to 400, real errors
-    to 500. Registration of the output as a Document happens in _finalize
-    (shared with the async worker) and is non-fatal — a failure there doesn't
-    kill the response; the file is on disk.
+    Translates NotWired to 501, an unknown Kokoro voice id to 400, a clip
+    without consent to 403, real errors to 500. Registration of the output as
+    a Document happens in _finalize (shared with the async worker) and is
+    non-fatal — a failure there doesn't kill the response; the file is on disk.
     """
     # progress_cb/cancel_event are popped if a caller ever sent them by mistake.
     params.pop("progress_cb", None)
@@ -385,6 +403,8 @@ def _run(intent: Intent, params: dict[str, Any]) -> dict[str, Any]:
         raise HTTPException(status_code=503, detail=str(e))
     except UnknownVoice as e:
         raise HTTPException(status_code=400, detail=str(e))
+    except ConsentRequired as e:
+        raise HTTPException(status_code=403, detail=str(e))
     except Exception as e:
         logger.exception("Generation failed for intent=%s", intent.value)
         raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")

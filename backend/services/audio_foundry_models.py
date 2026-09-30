@@ -165,6 +165,31 @@ def load_voice_catalog(relpath: str) -> Dict[str, Any]:
         return json.load(fh)
 
 
+_voice_consent_module = None
+
+
+def voice_consent():
+    """The plugin's voice-consent rules (plugins/audio_foundry/backends/voice_consent.py).
+
+    Loaded from the checkout by path, like the voice catalog, so the backend
+    proxy and the plugin that clones decide consent with the same code. The
+    module is standard-library only.
+    """
+    global _voice_consent_module
+    if _voice_consent_module is None:
+        import importlib.util
+        import sys
+
+        name = "guaardvark_audio_foundry_voice_consent"
+        spec = importlib.util.spec_from_file_location(
+            name, PLUGIN_SOURCE_DIR / "backends" / "voice_consent.py")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module
+        spec.loader.exec_module(module)
+        _voice_consent_module = module
+    return _voice_consent_module
+
+
 def kokoro_catalog() -> Dict[str, Any]:
     entry = next(e for e in AUDIO_FOUNDRY_MODELS if e["id"] == "kokoro")
     return load_voice_catalog(entry["voice_catalog"])

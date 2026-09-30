@@ -17,6 +17,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+from backends import voice_consent
 from backends.base import AudioBackend, GenerationResult
 
 logger = logging.getLogger(__name__)
@@ -134,6 +135,10 @@ class ChatterboxBackend(AudioBackend):
         # Injected by the dispatcher for async jobs; absent (None) on the inline path.
         progress_cb = params.get("progress_cb")
         cancel_event = params.get("cancel_event")
+        if reference_clip:
+            # The clone happens here, so consent is checked here as well as in
+            # the backend proxy: any process on this machine can call the plugin.
+            reference_clip = voice_consent.require_consent(reference_clip)
 
         import torch
         import soundfile as sf

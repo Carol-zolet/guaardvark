@@ -3,7 +3,8 @@
 Both tools call the backend's Audio Foundry routes, the same ones the Studio's
 Audio page uses, so a song or a voice line made from an agent lands in the
 library like any other. Voice cloning is not offered here: it needs a consent
-record for the reference clip, which only the Studio's upload path creates.
+record for the reference clip, which only the Audio Studio's consent step
+writes, after the person confirms they have the right to clone that voice.
 """
 
 from __future__ import annotations
@@ -154,7 +155,8 @@ class GenerateSpeechTool(BaseTool):
         "refused. A model or voice pack that is not installed is refused with a pointer to Audio "
         "Studio → Manage models; nothing is downloaded. Needs the Audio Foundry plugin running. "
         "Cloning a real person's voice (a Chatterbox reference clip) is not available here; it "
-        "needs consent recorded in the Studio. For a song use generate_music."
+        "needs the person to confirm in Audio Studio that they have the right to clone that "
+        "voice. For a song use generate_music."
     )
     parameters = {
         "text": ToolParameter(
