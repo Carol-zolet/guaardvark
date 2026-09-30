@@ -17,9 +17,23 @@
 - **Running tools and automation needs the Guaardvark machine or the API key.**
   `/api/tools/execute`, `/api/tools/jobs/` and `/api/automation/*` answered every device on the
   network. They now answer the Guaardvark machine itself, or a client that sends
-  `GUAARDVARK_API_KEY`. In a browser on another device the Tools page cannot run a tool and the MCP
-  Servers page does not load; both say where the action works. `GUAARDVARK_PROTECT_TOOL_ENDPOINTS=false`
-  brings back the old behaviour.
+  `GUAARDVARK_API_KEY`. `GUAARDVARK_PROTECT_TOOL_ENDPOINTS=false` brings back the old behaviour.
+- **API key in Settings.** Settings → API key keeps this install's key in the browser and sends it
+  with every request to this Guaardvark, never to another host. On the Guaardvark machine it creates
+  the key (shown once, saved in `.env`, working at once without a restart); with the key it replaces
+  or removes it. Once a key exists every device needs it, the Guaardvark machine included. Pages
+  that are refused (Tools, MCP Servers, and the rest through one notice) say what to do and link
+  there.
+- **Agent screenshots are served by signed links.** `/api/tools/screenshots/` answered any device
+  that guessed a capture's name. Chat now shows each capture through a link signed for that one
+  file, which works on every device; anything else needs the Guaardvark machine or the key.
+  Deleting `data/.screenshot_url_secret` revokes every link; saved chats keep their pictures.
+- **The CLI and MCP server on the Guaardvark machine find the key in `.env`.** A key created or
+  replaced in Settings works for them at once, without copying it into their environment.
+- **Docker: the first `./start-docker.sh` creates the API key** in `.env` next to
+  `docker-compose.yml` and prints it for Settings → API key, since under Docker no browser counts
+  as the Guaardvark machine. API URLs ending in `.png`, `.svg` and the like now reach the backend
+  instead of nginx's static files.
 
 ## 2.9.3 — The command line does what it says, agents make music and voice, outpaint fills the frame
 

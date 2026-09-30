@@ -133,12 +133,11 @@ terminal (`--json`, pipes) it refuses unless the tool matches
 - Config writes start programs, so `PUT/DELETE /servers/<name>` and
   `/reload-config` always need a local caller or the `X-API-Key` header.
 - All of `/api/automation/`, `/api/tools/execute` and `/api/tools/jobs/` are
-  behind the same rule. The web UI sends no API key, so in a browser on
-  another device the MCP Servers page does not load and the Tools page cannot
-  run a tool; both say that the action belongs on the Guaardvark machine.
-  A browser on the Guaardvark machine itself is a local caller. Once
-  `GUAARDVARK_API_KEY` is set, every caller needs the key, that browser
-  included.
+  behind the same rule. A browser on another device uses them once this
+  install's API key is entered in Settings → API key; until then the MCP
+  Servers page and the Tools page say so and link there. A browser on the
+  Guaardvark machine itself is a local caller. Once `GUAARDVARK_API_KEY` is
+  set, every caller needs the key, that browser included.
 - `GUAARDVARK_PROTECT_TOOL_ENDPOINTS=false` in `.env` (then restart the
   backend) opens those routes to every host that can reach the backend. Config
   writes stay closed.
