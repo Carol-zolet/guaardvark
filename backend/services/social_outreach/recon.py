@@ -269,7 +269,7 @@ class RecondAgent:
                 "skipped_dedupe": int,
                 "skipped_irrelevant": int,
                 "skipped_by_llm": int,
-                "skipped_non_video": int,    # DDG sometimes returns channels / search pages
+                "skipped_non_video": int,    # the search engine sometimes returns channels / search pages
                 "reason": Optional[str],
             }
 
@@ -323,7 +323,7 @@ class RecondAgent:
         already_touched = audit.recent_thread_ids(
             "youtube", statuses=CANDIDATE_DEDUPE_STATUSES,
         )
-        # Track ids emitted in THIS pass too — DDG can return the same
+        # Track ids emitted in THIS pass too — the search engine can return the same
         # video under two URL shapes (e.g. youtu.be/X and youtube.com/watch?v=X)
         # which both map to the same video_id but bypass the persistent
         # dedupe set since neither is in audit yet. (Caught in review.)
@@ -338,7 +338,7 @@ class RecondAgent:
             raw_url = (result.get("url") or "").strip()
             video_id = _extract_youtube_video_id(raw_url)
             if not video_id:
-                # DDG occasionally surfaces channel pages, playlists, or the
+                # The search engine occasionally surfaces channel pages, playlists, or the
                 # YouTube search-results page itself. None of those are
                 # commentable videos, so skip cleanly.
                 report["skipped_non_video"] += 1
@@ -347,7 +347,7 @@ class RecondAgent:
                 report["skipped_dedupe"] += 1
                 continue
 
-            # Canonicalize the URL we store. Trusting DDG's raw URL string
+            # Canonicalize the URL we store. Trusting the search engine's raw URL string
             # would let a malicious/compromised search response inject XSS
             # (javascript:..., data:...) into target_url, which the UI
             # later renders as <a href>. Reconstructing from the regex-
@@ -359,7 +359,7 @@ class RecondAgent:
             haystack = f"{title}\n{snippet}"
             feature_hint = persona.find_relevant_feature(haystack)
             if feature_hint is None:
-                # site: filter trusts DDG to keep us on YouTube but the
+                # site: filter trusts the search engine to keep us on YouTube but the
                 # keyword filter still has to confirm the video is about
                 # something we can credibly comment on. False positives
                 # ("LocalLLaMA" matching a non-AI gaming clip titled
@@ -370,7 +370,7 @@ class RecondAgent:
             # Relevance grader is reddit-shaped in its system prompt but
             # the judgment ("would commenting here be a good fit?")
             # generalizes. Pass the snippet as the body and an empty
-            # comments list since DDG doesn't expose comments.
+            # comments list since a search result carries no comments.
             relevance = external_grader.score_thread_relevance(
                 title=title,
                 selftext=snippet,
@@ -387,7 +387,7 @@ class RecondAgent:
                 )
                 continue
 
-            # Rank-decay scoring — DDG's first result is the strongest
+            # Rank-decay scoring — the search engine's first result is the strongest
             # signal we have at recon time (no view counts from the
             # search API). Content agent's grade overwrites this.
             rank_score = max(0.1, 1.0 - (idx / max(1, len(results))))
@@ -397,7 +397,7 @@ class RecondAgent:
                 "snippet": snippet[:600],
                 # Phase 2's _build_thread_context reads `selftext_preview`
                 # to fill the "OP BODY" slot of the LLM draft prompt. The
-                # DDG snippet is the closest YouTube equivalent (the visible
+                # search snippet is the closest YouTube equivalent (the visible
                 # video description preview), so alias it here. Without
                 # this, YouTube candidates would draft from title alone and
                 # the prompt's "OP BODY" line would default to "(link-only
@@ -421,7 +421,7 @@ class RecondAgent:
             )
             if audit_id is not None:
                 report["candidates"] += 1
-                # In-pass dedupe: a future result in the same DDG response
+                # In-pass dedupe: a future result in the same search response
                 # might be a different URL shape for the same video — adding
                 # the id here keeps the next iteration from emitting a
                 # duplicate row.
