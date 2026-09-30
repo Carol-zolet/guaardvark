@@ -357,4 +357,5 @@ jobs:
             backend/tests/integration/test_plugins_system.py \
             backend/tests/unit/test_unified_progress_system.py \
             backend/tests/test_interconnector_exclude.py \
-            backend/tests/test_knowledge_tools_no_section.py
+            backend/tests/test_knowledge_tools_no_section.py \
+            backend/tests/test_generate_file_modify_guard.py

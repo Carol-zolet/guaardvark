@@ -179,6 +179,16 @@ class FileGeneratorTool(BaseTool):
         "rewrite", "clean up", "cleanup", "improved version", "better version",
         "fix the", "update the", "based on the existing", "based on the uploaded",
     )
+    # Wording that points at a file the caller already has.
+    _EXISTING_REFERENCES = (
+        "the existing", "the uploaded", "the attached", "the current", "the original",
+        "my existing", "my current", "my uploaded", "our existing",
+    )
+    # How many words before a file's mention may hold the verb or reference
+    # that targets it ("improve the uploaded quality_gate.py" is two apart).
+    _TARGET_WINDOW_WORDS = 6
+    # A modify verb aimed at the output file without naming it: "improve it".
+    _PRONOUN_TARGET = re.compile(r"\s*(?:the |this |that )?(?:it|this|that|file|code)\b")
 
     parameters = {
         "filename": ToolParameter(
@@ -237,6 +247,42 @@ class FileGeneratorTool(BaseTool):
             return "config"
         return "unknown"
 
+    def _targets(self, desc_l: str, mention: str) -> bool:
+        """True when a modify verb or a reference to an existing file sits in
+        the few words just before a mention of ``mention`` in the description."""
+        cues = self._MODIFY_VERBS + self._EXISTING_REFERENCES
+        pattern = r"(?<![\w.-])" + re.escape(mention.lower()) + r"(?![\w-])"
+        for m in re.finditer(pattern, desc_l):
+            window = " ".join(desc_l[:m.start()].split()[-self._TARGET_WINDOW_WORDS:])
+            if any(cue in window for cue in cues):
+                return True
+        return False
+
+    def _verb_on_pronoun(self, desc_l: str) -> bool:
+        """True for "improve it", "refactor this file" and the like."""
+        for verb in self._MODIFY_VERBS:
+            for m in re.finditer(re.escape(verb), desc_l):
+                if self._PRONOUN_TARGET.match(desc_l, m.end()):
+                    return True
+        return False
+
+    @staticmethod
+    def _resolves(name: str) -> bool:
+        """True when ``name`` is real content this tool would not read: an
+        uploaded or indexed document, or a file in the Guaardvark checkout."""
+        try:
+            from backend.utils.uploaded_file_resolver import find_uploaded_file
+            if find_uploaded_file(name):
+                return True
+        except Exception:
+            pass
+        try:
+            from backend.services.guarded_code_service import read_repo_file
+            read_repo_file(name)
+            return True
+        except Exception:
+            return False
+
     def _detect_modify_existing(self, filename, content_description):
         """Detect a request to improve/modify a file that already exists.
 
@@ -245,43 +291,40 @@ class FileGeneratorTool(BaseTool):
         of a file it never saw. When that's what's being asked, return the
         referenced filename so the caller can refuse and redirect. Returns
         None when this is a legitimate new-file request.
+
+        A name that merely exists somewhere is not a request to change it:
+        every install has a README.md, LICENSE and start.sh at its root, and
+        a new file of that name is written to the outputs folder, not over
+        them. A file counts as targeted only when the description aims a
+        modify verb or an existing-file reference at it.
         """
         desc = content_description or ""
         desc_l = desc.lower()
 
-        # Candidate filenames: the output basename plus any file-looking
-        # tokens named in the description.
-        candidates = []
-        if filename:
-            candidates.append(os.path.basename(str(filename)))
-        candidates += re.findall(r"[\w./-]+\.[A-Za-z0-9]+", desc)
-
-        has_verb = any(v in desc_l for v in self._MODIFY_VERBS)
-
-        # Strongest signal: a named file actually resolves to real content we
-        # are NOT reading (uploaded chat file or in-repo source).
-        for cand in candidates:
-            cand = cand.strip()
-            if not cand:
-                continue
-            try:
-                from backend.utils.uploaded_file_resolver import find_uploaded_file
-                if find_uploaded_file(cand):
-                    return cand
-            except Exception:
-                pass
-            try:
-                from backend.services.guarded_code_service import read_repo_file
-                read_repo_file(cand)
+        # Files named in the description, then the output file itself, which
+        # the description may name by its stem ("improve the README").
+        named = [c.strip() for c in re.findall(r"[\w./-]+\.[A-Za-z0-9]+", desc) if c.strip()]
+        for cand in named:
+            if self._targets(desc_l, cand) and self._resolves(cand):
                 return cand
-            except Exception:
-                pass
+
+        if filename:
+            base = os.path.basename(str(filename).strip())
+            stem = os.path.splitext(base)[0]
+            aimed = (
+                (base and self._targets(desc_l, base))
+                # A one- or two-letter stem would match ordinary words.
+                or (len(stem) >= 3 and self._targets(desc_l, stem))
+                or self._verb_on_pronoun(desc_l)
+            )
+            if base and aimed and self._resolves(base):
+                return base
 
         # Weaker signal: the wording explicitly targets an existing file even
         # if we can't resolve it right now. Still ungrounded here.
+        has_verb = any(v in desc_l for v in self._MODIFY_VERBS)
         if has_verb and re.search(r"\b(this|the existing|the uploaded|the current)\b[\w\s]*\bfile\b", desc_l):
-            named = next((c for c in candidates if c), filename)
-            return named
+            return next(iter(named), filename)
 
         return None
 
