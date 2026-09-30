@@ -1,7 +1,8 @@
 """Fetch one web page, bounded in size and time, and decode it to text.
 
 Used by extract_website_content (fetch_url, analyze_website, a URL in a
-web_search query, the CSV generators and web research).
+web_search query, the CSV generators), read_sitemap, and scrape_website when a
+research task reads a page.
 """
 
 from __future__ import annotations

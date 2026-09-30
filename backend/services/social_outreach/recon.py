@@ -30,6 +30,7 @@ from backend.services.social_outreach.reddit_outreach import (
     is_self_promo_banned,
     thread_is_relevant,
 )
+from backend.utils.settings_utils import web_access_block_reason
 
 logger = logging.getLogger(__name__)
 
@@ -274,7 +275,10 @@ class RecondAgent:
             }
 
         No servo, no posting. Safe to run on cron — same kill-switch gate
-        as scout_reddit so a single env flip pauses all phases.
+        as scout_reddit so a single env flip pauses all phases. The query goes
+        to the web search engine, so the pass also needs web access on in
+        Settings (off by default), as the web_search tool does; with it off
+        the report's reason is "web_access_off" and nothing is sent.
         """
         report = {
             "platform": "youtube",
@@ -289,6 +293,12 @@ class RecondAgent:
 
         if not kill_switch.is_enabled():
             report["reason"] = "kill_switch_off"
+            return report
+
+        blocked = web_access_block_reason("scout YouTube for outreach")
+        if blocked:
+            logger.info("recon: youtube pass skipped: %s", blocked)
+            report["reason"] = "web_access_off"
             return report
 
         # Lazy import — web_search lives in the API layer and pulling it at

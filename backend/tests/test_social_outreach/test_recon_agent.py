@@ -13,7 +13,7 @@ from unittest.mock import patch
 
 import pytest
 
-from backend.models import SocialOutreachLog, db
+from backend.models import Setting, SocialOutreachLog, db
 from backend.services.social_outreach.recon import (
     CANDIDATE_DEDUPE_STATUSES,
     RecondAgent,
@@ -44,6 +44,10 @@ def app():
     db.init_app(app)
     with app.app_context():
         db.create_all()
+        # scout_youtube searches only with web access on (Settings, off by
+        # default); backend/tests/unit/test_web_research_guards.py covers it off.
+        db.session.add(Setting(key="allow_web_search", value="true"))
+        db.session.commit()
         yield app
         db.session.remove()
         db.drop_all()

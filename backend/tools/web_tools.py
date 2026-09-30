@@ -390,24 +390,10 @@ class WebAnalysisTool(BaseTool):
 
 
 def _web_access_block_reason(action: str) -> str | None:
-    """None when web access is enabled; otherwise the error the tool returns."""
-    disabled = f"Web access is disabled. Enable it in Settings to {action}."
-    try:
-        from flask import has_app_context
-        from backend.utils.settings_utils import get_web_access
-        if has_app_context():
-            return None if get_web_access() else disabled
-    except Exception:
-        pass
-    from backend.utils.backend_http import BackendError, in_mcp_process, request_json
-    if in_mcp_process():
-        # The MCP server has no Flask app; the backend owns the setting.
-        try:
-            data = request_json("GET", "/api/settings/web_access").data or {}
-        except BackendError as e:
-            return f"Could not check whether web access is enabled: {e}"
-        return None if data.get("allow_web_search") else disabled
-    return disabled
+    """None when web access is enabled; otherwise the error the tool returns.
+    The check is the one research tasks and the outreach recon make too."""
+    from backend.utils.settings_utils import web_access_block_reason
+    return web_access_block_reason(action)
 
 
 def _is_web_access_allowed() -> bool:
