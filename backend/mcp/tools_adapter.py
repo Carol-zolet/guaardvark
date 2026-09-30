@@ -221,10 +221,12 @@ def _timeout_message(name: str, timeout: float, read_only: bool = False, key: st
             f" Call again with the same {IDEMPOTENCY_KEY} ('{key}') to wait for this run; "
             "that will not start a second one."
         )
+    # A call that timed out never handed back a batch or job id, so there is
+    # nothing to poll; say where the result will turn up instead.
     return head + (
-        " Calling it again would start a second run. A render lands in Studio and "
-        "data/outputs when it completes; for a queued generation, poll "
-        "get_generation_status with its batch id. Send an "
+        " Calling it again would start a second run. This call returned no job id, so there "
+        "is nothing to poll with get_generation_status; anything it writes lands in Studio "
+        "and data/outputs when it completes (resources/list shows generated files). Send an "
         f"{IDEMPOTENCY_KEY} next time so a retry waits for the first run."
     )
 
