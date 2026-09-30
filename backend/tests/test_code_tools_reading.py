@@ -96,3 +96,19 @@ def test_one_line_longer_than_a_page_is_cut_and_said_so(checkout, monkeypatch):
     assert result.success
     assert _body(result.output) == "x" * 50
     assert "is cut at 50" in result.output and "start_line=2" in result.output
+
+
+# --- list_code_files ------------------------------------------------------
+
+def test_a_private_folder_gets_the_same_answer_whether_or_not_it_exists(checkout):
+    (checkout / "docs" / "local-workspace-only" / "plans").mkdir(parents=True)
+    (checkout / "src").mkdir()
+    (checkout / "src" / "a.py").write_text("x = 1\n")
+
+    existing = lct.list_files("docs/local-workspace-only/plans")
+    missing = lct.list_files("docs/local-workspace-only/zz-no-such-folder")
+    assert existing.replace("plans", "NAME") == missing.replace("zz-no-such-folder", "NAME")
+    assert "git-ignored local data" in missing
+
+    assert "does not exist" in lct.list_files("zz-no-such-folder")
+    assert "a.py" in lct.list_files("src")
