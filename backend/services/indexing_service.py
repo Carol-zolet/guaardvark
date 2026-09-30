@@ -542,14 +542,19 @@ def _adaptive_alpha(query: str, base_alpha: float) -> float:
 
 
 def _mmr_rerank(results: list, top_k: int = 8, lambda_: float = 0.7) -> list:
-    """CPU-only MMR reranker over the already-retrieved top candidates. Balances relevance
-    against diversity (token-Jaccard overlap) to demote near-redundant chunks. Zero VRAM,
-    no model — safe on CPU/Pi. On any failure returns `results` as-is.
+    """CPU-only MMR over the top retrieval candidates: retrieval score against
+    token-Jaccard overlap, to demote near-redundant chunks. Zero VRAM, no model — safe
+    on CPU/Pi. On any failure returns `results` as-is.
 
-    Relevance is the cross-encoder score when one is present, else the retrieval score:
-    ranking on the weaker signal would silently undo the reranker that just ran."""
+    Candidates the cross-encoder scored are returned unchanged: its order is final. No
+    diversity reordering measured after it improved on that order (graded nDCG@5 and
+    alpha-nDCG@5, three embedding models), and min-max-normalised MMR put related
+    passages below unrelated ones. Near-copies are removed before the cross-encoder, by
+    deduplicate_chunks."""
     try:
         if not results or len(results) <= 2:
+            return results
+        if any(isinstance(r, dict) and r.get("rerank_score") is not None for r in results[:top_k]):
             return results
         import re as _re
         working = results[:top_k]
@@ -558,10 +563,7 @@ def _mmr_rerank(results: list, top_k: int = 8, lambda_: float = 0.7) -> list:
         def _rel_score(r):
             if not isinstance(r, dict):
                 return 0.0
-            v = r.get("rerank_score")
-            if v is None:
-                v = r.get("score", 0.0)
-            return float(v or 0.0)
+            return float(r.get("score", 0.0) or 0.0)
 
         scores = [_rel_score(r) for r in working]
         lo, hi = min(scores), max(scores)
@@ -2164,9 +2166,8 @@ def search_with_llamaindex(
         trace["dedup_removed"] = _pre_dedup - len(results)
 
         # Cross-encoder rerank: re-score query+passage together, which the bi-encoder
-        # and BM25 legs cannot do. Runs before MMR on purpose -- this decides what is
-        # relevant, MMR then decides what is diverse. Never raises; if it did not run,
-        # the trace says why.
+        # and BM25 legs cannot do. When it runs, its order is final. Never raises; if it
+        # did not run, the trace says why.
         try:
             from backend.utils.reranker import rerank as _ce_rerank
             if prof_params.get("rerank") is False:
@@ -2183,10 +2184,12 @@ def search_with_llamaindex(
         except Exception as e:
             trace["rerank"] = {"applied": False, "reason": f"import failed: {e}"}
 
-        # CPU-only MMR rerank of the top candidates (relevance × diversity). Zero VRAM.
-        # Env var is the operator's master allow; the tunable param decides per-query
-        # (defaults on, matching pre-layer behavior).
-        if (os.environ.get("GUAARDVARK_RERANK_ENABLED", "true").lower() == "true"
+        # CPU-only MMR (relevance x diversity), only when the cross-encoder did not order
+        # the candidates; see _mmr_rerank. Env var is the operator's master allow; the
+        # tunable param decides per query (defaults on).
+        _ce_ordered = bool((trace.get("rerank") or {}).get("applied"))
+        if (not _ce_ordered
+                and os.environ.get("GUAARDVARK_RERANK_ENABLED", "true").lower() == "true"
                 and overlay.get("reranking_enabled", True)):
             results = _mmr_rerank(results)
             trace["mmr_applied"] = True
