@@ -766,7 +766,8 @@ class GenerationStatusTool(BaseTool):
         "(a 32-character job id) from generate_music, or a tool job (tooljob_...) from edit_image, "
         "inpaint_image, outpaint_image, remove_background or generate_animation called over MCP. "
         "Returns status (a tool job is queued, running, done or failed, with the time since it "
-        "started), progress while running, and each finished file (URL for images, video and "
+        "started), progress while running (a video batch names its pipeline stage, such as gpu_wait "
+        "or generate, with the share of clips finished), and each finished file (URL for images, video and "
         "animations; for a CSV, its path and how many rows it holds; for a song, its download "
         "link), or the error of a failed job. Use after a queued generate call, or when the user "
         "asks whether a render is done. Read-only; an unknown id is an error, and so is a backend "
@@ -880,6 +881,7 @@ class GenerationStatusTool(BaseTool):
                     for r in (d.get("results") or []) if not r.get("success")]
         return {
             "kind": "video", "batch_id": batch_id, "status": d.get("status"), "stage": d.get("stage"),
+            "progress": d.get("progress_pct"), "current_item": d.get("current_item"),
             "completed": d.get("completed_videos"), "failed": len(failed), "total": d.get("total_videos"),
             "error": d.get("error"), "errors": failed, "files": files,
             "failure": d.get("failure"), "failures": failures,
@@ -910,6 +912,8 @@ class GenerationStatusTool(BaseTool):
             "batch_id": batch_id,
             "status": status.status,
             "stage": getattr(status, "stage", None),
+            "progress": getattr(status, "progress_pct", None),
+            "current_item": getattr(status, "current_item", None),
             "completed": completed,
             "failed": len(failed),
             "total": getattr(status, "total_videos", None),
@@ -1136,7 +1140,9 @@ class GenerationStatusTool(BaseTool):
             wait_seconds = 0
         deadline = time.monotonic() + wait_seconds
         info, unreachable = self._read(batch_id)
-        while (info is not None and unreachable is None
+        # A reader that found the job running is enough to wait on, whatever an
+        # earlier reader for another kind of job answered.
+        while (info is not None
                and str(info.get("status")).lower() in _ACTIVE_JOB_STATUSES
                and time.monotonic() + STATUS_POLL_S < deadline):
             time.sleep(STATUS_POLL_S)
@@ -1192,8 +1198,14 @@ class GenerationStatusTool(BaseTool):
                 lines.append(f"Error: {info['error']}")
             for err in info.get("errors") or []:
                 lines.append(f"Failed item: {err}")
+        # A video batch names its pipeline stage (gpu_wait, keyframe, generate, post, ...);
+        # its percentage counts finished clips, so the stage is what moves during one clip.
+        stage = info.get("stage") if str(info["status"]).lower() in _ACTIVE_JOB_STATUSES else None
         if info.get("progress") is not None and info["status"] == "running":
-            lines.append(f"Progress: {info['progress']}% — {info.get('message') or ''}".rstrip(" —"))
+            detail = f"stage: {stage}" if stage else (info.get("message") or "")
+            lines.append(f"Progress: {info['progress']}% — {detail}".rstrip(" —"))
+        elif stage:
+            lines.append(f"Stage: {stage}")
         if info.get("elapsed_s") is not None:
             lines.append(f"Elapsed: {info['elapsed_s']:.0f} s")
         if info.get("note"):
