@@ -45,7 +45,7 @@ class LlxStreamer:
 
     def _connect_headers(self) -> dict[str, str]:
         headers: dict[str, str] = {}
-        api_key = get_api_key()
+        api_key = get_api_key(self.server_url)
         if api_key:
             headers["X-API-Key"] = api_key
         return headers
