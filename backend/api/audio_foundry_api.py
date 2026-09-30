@@ -191,6 +191,9 @@ def generate_voice():
         consent = p.with_name(p.name + ".consent")
         if not p.exists() or not consent.exists():
             return {"error": "Invalid or unconsented reference_clip_path (upload via UI for consent)"}, 403
+        # Forward the path that was checked. A relative value would otherwise
+        # be read against the sidecar's working directory, not voice_references.
+        data = {**data, "reference_clip_path": str(p)}
     body, status_code = _proxy_generate("/generate/voice", data)
     return body, status_code
 
