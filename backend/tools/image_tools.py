@@ -1038,9 +1038,11 @@ class AnimationGeneratorTool(BaseTool):
     destructive = False
     description = (
         "Generate a short looping GIF or frame-morph MP4 from a text prompt with "
-        "motion description, via Stable Diffusion img2img. Use when the user asks "
-        "to animate, create a GIF, or make a looping frame morph. For a cinema "
-        "clip from a video model use generate_video instead."
+        "motion description: frame 1 from the prompt, each later frame by img2img on "
+        "a downloaded image model that supports it (Z-Image Turbo, SDXL or Stable "
+        "Diffusion, picked automatically). Use when the user asks to animate, create "
+        "a GIF, or make a looping frame morph. For a cinema clip from a video model "
+        "use generate_video instead."
     )
     parameters = {
         "prompt": ToolParameter(
