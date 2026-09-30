@@ -1042,9 +1042,10 @@ def register_node():
         return error_response(f"Failed to register node: {str(e)}", 500)
 
 
-@interconnector_bp.route("/nodes/<node_id>/heartbeat", methods=["GET", "POST"])
+@interconnector_bp.route("/nodes/<node_id>/heartbeat", methods=["POST"])
 def node_heartbeat(node_id):
-    """Update heartbeat for a registered node."""
+    """Update heartbeat for a registered node. POST only: it writes the node's
+    row, and a GET can be sent by any page (an <img>) without asking first."""
     try:
         logger.debug(f"[SYNC] Heartbeat received for node: {node_id}")
         config = _get_config()

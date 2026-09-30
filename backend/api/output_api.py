@@ -372,18 +372,15 @@ def get_merged_csv(filename):
         # Convert merged active rows to CSV format
         csv_content = convert_merged_rows_to_csv(merged_active_rows)
         
-        # Create temporary CSV file
-        import tempfile
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.csv', delete=False, encoding='utf-8') as temp_file:
-            temp_file.write(csv_content)
-            temp_file_path = temp_file.name
-        
+        # Sent from memory: a file written for each download would be left behind.
+        import io
+
         # Generate download filename
         base_name = filename.replace('_tracking_', '_merged_').replace('.json', '.csv')
-        
+
         logger.info(f"Generated merged CSV with {len(merged_active_rows)} rows")
         return send_file(
-            temp_file_path,
+            io.BytesIO(csv_content.encode('utf-8')),
             as_attachment=True,
             download_name=base_name,
             mimetype='text/csv'

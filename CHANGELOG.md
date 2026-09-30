@@ -2,6 +2,31 @@
 
 ## Unreleased
 
+- **The backend answers only to this install's names.** A site can point its DNS name at the
+  Guaardvark machine's address after its page has loaded (DNS rebinding). The browser then treats
+  the backend as that site's own, so the page could read every reply and, from the Guaardvark
+  machine, use the routes that trust it. The frontend port already refused unknown names; the
+  backend port now does too. A request addressed to anything but an IP address, `localhost`, this
+  machine's hostname (its first part, `<first part>.local`), a name in `VITE_ALLOWED_HOSTS`, or the
+  host of `VITE_FRONTEND_URL` or of an origin in `GUAARDVARK_CORS_ORIGINS` is refused with HTTP 421
+  `host_not_allowed` before any route or Socket.IO sees it. The web UI, the CLI, the MCP server,
+  plugins, and Interconnector and cluster calls by IP address are unaffected. Reaching the backend
+  by another DNS name (`gpubox.lan`, a Tailscale name, an Interconnector master URL written with
+  such a name, Docker opened at a name) needs that address in `GUAARDVARK_CORS_ORIGINS`, and the
+  refusal says which. Under Docker the backend also answers to `backend`, its name on the compose
+  network.
+- **A GET or HEAD request no longer changes anything.** Any web page can make a browser send
+  either without asking, and both are let through by design. `HEAD /api/enhanced-chat/history/all`
+  deleted all chat history; only `DELETE` does now. Settings → Test LLM
+  (`/api/meta/test-llm`), the diagnostics export, the quality scorecard (`llx quality scorecard`,
+  `scripts/quality_gate.py --mode full`) and `/api/simple-chat/health` ran the model on a GET and now
+  take POST. The three under `/api/meta` then need the Guaardvark machine or the API key, like other
+  `/api/meta` actions; the script sends `GUAARDVARK_API_KEY` from its environment. The
+  Interconnector heartbeat takes POST
+  only, as its callers already sent. Opening a chat no longer creates an empty session (its first
+  message does), the memory recall debug view no longer counts as a recall, video batch and merged
+  CSV downloads no longer leave a file in the temp directory each time, and the System Map reads an
+  uploaded code repository without running its code.
 - **Cast: a character's voice is picked from a list.** The Overview's free-text "Voice ID" let a
   typo become an id that renders drop. It is now a list of Audio Foundry's voices, grouped as in
   the Audio Studio, with "Default voice" first; voices that are not installed say so and link to

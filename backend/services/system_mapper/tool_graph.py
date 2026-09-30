@@ -49,6 +49,20 @@ except Exception as exc:
 """
 
 
+def _is_uploaded(root: Path) -> bool:
+    """True when root lies in Guaardvark's uploads directory, where Code
+    Repository folders people upload are kept."""
+    try:
+        from backend.config import UPLOAD_DIR
+    except Exception:
+        return False
+    try:
+        Path(root).resolve().relative_to(Path(UPLOAD_DIR).resolve())
+        return True
+    except ValueError:
+        return False
+
+
 def _probe_runtime_registry(root: Path, timeout: float = 20.0) -> tuple[set[str], dict]:
     """Run the real tool registry in a subprocess and return its registered names.
 
@@ -389,7 +403,12 @@ def _analyze(root: Path, extra_excludes: frozenset[str] = frozenset()) -> dict[s
 
     # Prefer the live registry when it can be probed: it sees loop-registered
     # tools the AST pass may miss. Fall back to AST-only when the probe fails.
-    runtime_names, probe_info = _probe_runtime_registry(root)
+    # The probe imports the mapped tree's own code, so a repository someone
+    # uploaded is read, never run.
+    if _is_uploaded(root):
+        runtime_names, probe_info = set(), {"error": "uploaded code is not run"}
+    else:
+        runtime_names, probe_info = _probe_runtime_registry(root)
     if runtime_names:
         tool_registry_source = "runtime"
         # Synthesize graph entries for runtime-only names not seen by the AST.

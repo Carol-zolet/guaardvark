@@ -4787,32 +4787,14 @@ def get_chat_history(session_id: str):
     """Get chat history for a session"""
     try:
         from flask import request
-        from backend.models import db, LLMMessage, LLMSession
+        from backend.models import db, LLMMessage
 
         # Get query parameters
         limit = int(request.args.get('limit', 50))
         before_id = request.args.get('before_id')
 
-        # Ensure session exists
-        session = db.session.get(LLMSession, session_id)
-        if not session:
-            try:
-                # Create session if it doesn't exist
-                session = LLMSession(id=session_id, user="default")
-                db.session.add(session)
-                db.session.commit()
-                logger.info(f"Created new session: {session_id}")
-            except Exception as e:
-                # Handle race condition where session was created between check and insert
-                db.session.rollback()
-                session = db.session.get(LLMSession, session_id)
-                if not session:
-                    # If still no session, re-raise the error
-                    logger.error(f"Failed to create session {session_id}: {e}")
-                    raise
-                logger.warning(f"Session {session_id} already existed during creation attempt")
-
-        # Query messages from database
+        # Reading creates nothing: a session that does not exist yet has no
+        # messages, and whatever saves its first message creates it.
         query = db.session.query(LLMMessage).filter(
             LLMMessage.session_id == session_id
         ).order_by(LLMMessage.timestamp.desc())
@@ -4895,7 +4877,9 @@ def get_chat_history(session_id: str):
 
 @enhanced_chat_bp.route("/history/all", methods=["GET", "DELETE"])
 def clear_all_chat_history():
-    """GET: return counts of chat data.  DELETE: clear all chat history."""
+    """GET (and the HEAD Flask adds to it): counts of chat data. DELETE:
+    clear all chat history. Only an explicit DELETE deletes: a page on any
+    site can make a browser send HEAD without asking first."""
     from backend.models import db, LLMMessage, LLMSession
     from backend.config import CONTEXT_PERSISTENCE_DIR, STORAGE_DIR
     import glob as glob_mod
@@ -4906,7 +4890,7 @@ def clear_all_chat_history():
             return len(glob_mod.glob(os.path.join(d, "*.json")))
         return 0
 
-    if request.method == "GET":
+    if request.method != "DELETE":
         try:
             message_count = db.session.query(LLMMessage).count()
             session_count = db.session.query(LLMSession).count()

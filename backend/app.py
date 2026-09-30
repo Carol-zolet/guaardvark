@@ -521,6 +521,11 @@ def _initialize_app_components(app):
 
     socketio.init_app(app)
     app.logger.info("CORS and SocketIO configured with secure origins")
+    # Only requests addressed to one of this install's names reach Socket.IO
+    # or any view (backend/utils/host_check.py). Wraps Socket.IO's middleware,
+    # so it must come after socketio.init_app.
+    from backend.utils.host_check import HostCheckMiddleware
+    app.wsgi_app = HostCheckMiddleware(app.wsgi_app)
 
     try:
         from backend.utils.unified_progress_system import get_unified_progress
