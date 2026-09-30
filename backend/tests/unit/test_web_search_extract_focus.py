@@ -22,7 +22,7 @@ class _Page:
 
 @pytest.fixture
 def page(monkeypatch):
-    monkeypatch.setattr(web_search_api.requests, "get", lambda *args, **kwargs: _Page())
+    monkeypatch.setattr(web_search_api.requests.Session, "get", lambda *args, **kwargs: _Page())
 
 
 def test_without_a_query_the_content_is_the_head_of_the_page(page):

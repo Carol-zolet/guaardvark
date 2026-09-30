@@ -176,13 +176,18 @@ class ImageGenerationResult:
 
 
 def normalize_zimage_lora_state_dict(state_dict: Dict[str, Any]) -> Dict[str, Any]:
-    """Rewrite PEFT-wrapped Z-Image LoRA keys to Diffusers ``load_lora_weights`` form.
+    """Rewrite Z-Image LoRA keys to the form Diffusers ``load_lora_weights`` accepts.
 
-    Our early peft_zimage trainer saved keys like
-    ``transformer.base_model.model.layers.*.attention.to_q.lora_A.weight``.
-    ZImagePipeline expects ``transformer.layers.*.attention.to_q.lora_A.weight``
-    (no PEFT ``base_model.model`` wrapper). Without this remap, PEFT raises
-    "Target modules {...} not found in the base model".
+    Two layouts need help:
+
+    - Our early peft_zimage trainer saved keys like
+      ``transformer.base_model.model.layers.*.attention.to_q.lora_A.weight``.
+      ZImagePipeline expects ``transformer.layers.*.attention.to_q.lora_A.weight``
+      (no PEFT ``base_model.model`` wrapper). Without this remap, PEFT raises
+      "Target modules {...} not found in the base model".
+    - LoRAs trained against ComfyUI's Z-Image module tree name the attention
+      projections ``attention.qkv`` (fused) and ``attention.out``. See
+      ``_split_fused_zimage_attention``.
     """
     out: Dict[str, Any] = {}
     for key, value in state_dict.items():
@@ -194,6 +199,54 @@ def normalize_zimage_lora_state_dict(state_dict: Dict[str, Any]) -> Dict[str, An
         elif ".base_model.model." in nk:
             nk = nk.replace(".base_model.model.", ".", 1)
         out[nk] = value
+    return _split_fused_zimage_attention(out)
+
+
+# ComfyUI's Z-Image attention block ("<block>.attention.qkv" / ".out", or the kohya
+# spelling "<block>_attention_qkv"). Diffusers 0.40 drops the qkv delta and then fails
+# on the orphaned out alpha ("`state_dict` should be empty at this point").
+_ZIMAGE_FUSED_ATTN_KEY = re.compile(
+    r"^(?P<block>.*?(?:layers|context_refiner|noise_refiner)[._]\d+[._]attention)"
+    r"(?P<sep>[._])(?P<proj>qkv|out)"
+    r"\.(?P<suffix>lora_A\.weight|lora_B\.weight|lora_down\.weight|lora_up\.weight|alpha)$"
+)
+_ZIMAGE_SPLIT_ATTN_KEY = re.compile(
+    r"^(?P<block>.*?(?:layers|context_refiner|noise_refiner)[._]\d+[._]attention)[._]to[._]"
+)
+
+
+def _split_fused_zimage_attention(state_dict: Dict[str, Any]) -> Dict[str, Any]:
+    """Rename ComfyUI-layout Z-Image attention LoRA keys to the Diffusers module names.
+
+    ``out`` becomes ``to_out.0``. The fused ``qkv`` projection stacks q, k and v
+    rows (``dim`` each, Z-Image has as many kv heads as heads), so its update
+    ``B @ A`` splits exactly into ``B_q @ A``, ``B_k @ A`` and ``B_v @ A``: the down
+    matrix and alpha are shared, the up matrix is cut into thirds. Blocks that also
+    carry split ``to_*`` keys are left alone; Diffusers treats the fused copy there
+    as redundant.
+    """
+    split_blocks = {
+        m.group("block") for m in map(_ZIMAGE_SPLIT_ATTN_KEY.match, state_dict) if m
+    }
+    out: Dict[str, Any] = {}
+    for key, value in state_dict.items():
+        m = _ZIMAGE_FUSED_ATTN_KEY.match(key)
+        if not m or m.group("block") in split_blocks:
+            out[key] = value
+            continue
+        block, sep, proj, suffix = m.group("block", "sep", "proj", "suffix")
+        if proj == "out":
+            out[f"{block}{sep}to_out{sep}0.{suffix}"] = value
+            continue
+        if suffix in ("lora_B.weight", "lora_up.weight"):
+            if value.shape[0] % 3:
+                out[key] = value
+                continue
+            parts = [chunk.contiguous() for chunk in value.chunk(3, dim=0)]
+        else:
+            parts = [value, value, value]
+        for name, part in zip("qkv", parts):
+            out[f"{block}{sep}to_{name}.{suffix}"] = part
     return out
 
 
@@ -3017,18 +3070,16 @@ Negative Prompt: {negative_prompt}""",
             try:
                 # Prefer an in-memory remapped dict so PEFT-prefixed saves
                 # (transformer.base_model.model.*) from early peft_zimage trains
-                # still load. Diffusers accepts a state-dict dict here.
+                # and ComfyUI-layout attention keys still load. Diffusers accepts a
+                # state-dict dict here.
                 from safetensors.torch import load_file as _load_st
 
                 raw = _load_st(str(p), device="cpu")
                 remapped = normalize_zimage_lora_state_dict(raw)
-                n_rewritten = sum(
-                    1 for old_k, new_k in zip(raw.keys(), remapped.keys()) if old_k != new_k
-                )
+                n_rewritten = sum(1 for k in remapped if k not in raw)
                 if n_rewritten:
                     logger.info(
-                        "Z-Image LoRA %s: stripped PEFT base_model.model prefix from "
-                        "%d/%d keys for Diffusers",
+                        "Z-Image LoRA %s: rewrote %d of %d keys to Diffusers names",
                         p.name,
                         n_rewritten,
                         len(remapped),
