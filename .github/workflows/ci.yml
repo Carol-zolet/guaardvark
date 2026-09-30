@@ -311,6 +311,7 @@ jobs:
           source backend/venv/bin/activate
           python -m pytest --timeout=900 -q \
             backend/tests/test_profiles.py \
+            backend/tests/test_system_mapper_git_listing.py \
             backend/tests/utils/test_path_safety_sensitive_names.py \
             backend/tests/test_extensions_loader.py \
             backend/tests/test_knowledge_tools_no_section.py \

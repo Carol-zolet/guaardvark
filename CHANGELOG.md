@@ -9,6 +9,11 @@
 - **More credential files are off limits to the agent's file and code tools.** Added to the names
   they refuse to read, list or grep: `*.env`, `.npmrc`, `.pypirc`, `*.ppk`, `*.jks`, `*.keystore`,
   `*.secret`, `client_secret*.json` and dot-files with "secret" in the name.
+- **The System Mapper maps what git lists.** In a git checkout `map_codebase` and the System Map
+  page survey tracked files plus untracked files git does not ignore, and no longer count ignored
+  local folders such as scratch copies and worktrees. On a workstation holding about 49,000 such
+  `.py` copies the static analysis of the whole checkout went from 270 s to 9 s; a fresh clone
+  maps the same files as before. Outside a git checkout the folder is walked as before.
 
 ## 2.9.3 — The command line does what it says, agents make music and voice, outpaint fills the frame
 
