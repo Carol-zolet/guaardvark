@@ -11,6 +11,7 @@ import json
 import os
 import re
 from pathlib import Path
+from urllib.parse import unquote
 
 # Weight names the inspector will list. GGUF is a ComfyUI UNET, not a
 # diffusers snapshot, so it is in the union used for both domains.
@@ -370,6 +371,9 @@ def parse_hf_url(url: str) -> dict:
     if not raw:
         raise ValueError("Paste a Hugging Face URL or org/repo.")
     raw = raw.split("?")[0].split("#")[0].rstrip("/")
+    # A URL copied from the browser escapes spaces and brackets in file names
+    # (%20, %28); the Hub API and hf_hub_download take the plain name.
+    raw = unquote(raw)
     raw = _HF_HOST.sub("", raw)
     if "://" in raw or raw.lower().startswith("www."):
         raise ValueError("Only Hugging Face URLs or org/repo ids are accepted.")

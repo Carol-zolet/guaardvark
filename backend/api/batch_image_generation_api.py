@@ -1041,6 +1041,18 @@ def add_user_image_model():
         has_model_index = bool(inspected.get("has_model_index"))
     else:
         return error_response("Paste a Hugging Face URL or org/repo.", 400)
+    # Z-Image LoRAs load through Diffusers, which takes plain LoRA files only. Read
+    # the file's header now so a LoKr file or a full checkpoint is turned away with a
+    # reason before its download starts.
+    if (data.get("role") or "").strip() == "lora" and (data.get("family") or "").strip() == "zimage":
+        from backend.services.zimage_lora_check import hf_lora_problem
+        srcs = [f.get("src") if isinstance(f, dict) else f for f in files]
+        if len(srcs) == 1 and srcs[0]:
+            problem = hf_lora_problem(hf_repo, srcs[0], revision)
+            if problem:
+                return error_response(
+                    f"{Path(srcs[0]).name} can't be added as a Z-Image LoRA. {problem}", 400
+                )
     generator = get_batch_image_generator()
     if not generator.image_generator:
         return error_response("Image generator not initialized", 503)
