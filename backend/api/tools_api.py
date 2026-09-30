@@ -261,8 +261,12 @@ def execute_tool():
         # A person invoking a tool directly (Tools page / API, behind auth_guard)
         # is the approval, so confirmation-gated tools run without a prompt.
         from backend.services.tool_confirmation import trusted_caller
+        from backend.utils.backend_http import CALLER_TRANSPORT_FIELD, calls_for_mcp_client
 
-        with trusted_caller("rest:tools_api"):
+        # The MCP server forwards some tools here (run_tool_in_backend); they
+        # keep the input rules they have for MCP clients.
+        for_mcp = data.get(CALLER_TRANSPORT_FIELD) == "mcp"
+        with trusted_caller("rest:tools_api"), calls_for_mcp_client(for_mcp):
             result = registry.execute_tool(tool_name, **parameters)
 
         return jsonify({
