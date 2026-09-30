@@ -385,6 +385,10 @@ class BulkCSVGenerator:
 
         # Cancellation flag for stopping generation
         self.cancelled = False
+
+        # Why web research was asked for and not done (web access off); the
+        # statistics of generate_bulk_csv_with_web_research carry it.
+        self.web_research_skipped: Optional[str] = None
         
         # Initialize logging context
         self.log_context = {
@@ -2090,9 +2094,35 @@ Generate the CSV row now:"""
         
         return results
 
+    def _web_research_allowed(self) -> bool:
+        """Whether web research may reach the internet now: web access on in
+        Settings (off by default), the check the web tools make. The first
+        refusal is recorded in ``web_research_skipped`` and reported; the rows
+        are still generated, without research."""
+        from backend.utils.settings_utils import web_access_block_reason
+
+        if web_access_block_reason("add web research to generated rows") is None:
+            return True
+        if self.web_research_skipped is None:
+            self.web_research_skipped = (
+                "Web research was skipped because web access is off; rows generated "
+                "while it is off have none. Turn on web access in Settings to add it."
+            )
+            self._log_info(self.web_research_skipped)
+            self._update_progress(self.web_research_skipped)
+        return False
+
     def _gather_web_research(self, topic: str, max_sources: int = 3) -> str:
-        """Gather web research for a topic to enhance content generation"""
+        """Gather web research for a topic to enhance content generation.
+
+        Reads the three fixed sites of _generate_research_urls
+        (datacenterknowledge.com, datacenterjournal.com, datacenterdynamics.com),
+        and only with web access on. The check is made for every task, so
+        turning web access off during a long job stops it for the rows to come.
+        """
         if not WEB_SEARCH_AVAILABLE:
+            return ""
+        if not self._web_research_allowed():
             return ""
         
         try:
@@ -2159,6 +2189,8 @@ Generate the CSV row now:"""
         Supports chunking for overnight processing and web research enhancement
         """
         total_tasks = len(tasks)
+        if enable_web_research and not self._web_research_allowed():
+            enable_web_research = False
         self._log_info(f"Starting large-scale CSV generation: {total_tasks} tasks with web research: {enable_web_research}")
         
         if total_tasks > 500:
@@ -2188,10 +2220,13 @@ Generate the CSV row now:"""
                     time.sleep(2)
             
             # Write final CSV
-            return self._write_enhanced_csv(all_results, output_filename)
+            output_path, stats = self._write_enhanced_csv(all_results, output_filename)
         else:
             # For smaller operations, use standard processing with optional research
-            return self.generate_bulk_csv(tasks, output_filename)
+            output_path, stats = self.generate_bulk_csv(tasks, output_filename)
+        if self.web_research_skipped:
+            stats = {**stats, "web_research_enabled": False, "web_research_skipped": self.web_research_skipped}
+        return output_path, stats
 
     def _process_chunk_with_research(self, 
                                    tasks: List[GenerationTask], 

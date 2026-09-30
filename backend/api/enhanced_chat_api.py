@@ -2128,7 +2128,12 @@ Context: {context_info.get('total_contexts', 0)} conversation contexts available
             }
 
     def _handle_website_analysis_request(self, session_id: str, message: str, project_id: int = None) -> Dict[str, Any]:
-        """Handle website analysis requests using web search API"""
+        """Handle website analysis requests using web search API.
+
+        The page is fetched only with web access on in Settings (off by
+        default), the check the web tools make, and only from a public address
+        (see enhanced_web_search).
+        """
         start_time = datetime.now()
         try:
             # Import web search functionality
@@ -2168,16 +2173,29 @@ Context: {context_info.get('total_contexts', 0)} conversation contexts available
             if not url.startswith(('http://', 'https://')):
                 url = 'https://' + url
 
+            from backend.utils.settings_utils import web_access_block_reason
+            blocked = web_access_block_reason("analyze websites")
+            if blocked:
+                return {
+                    "success": False,
+                    "error": blocked,
+                    "response": f"I can't read {url}: {blocked}",
+                    "response_time": (datetime.now() - start_time).total_seconds()
+                }
+
             logger.info(f"Analyzing website: {url}")
 
             # Use web search API to get website content
             search_result = enhanced_web_search(url)
 
             if not search_result.get("success"):
+                # A refused address or an unreachable site says which; fall back
+                # to the general wording only when no reason came back.
+                reason = search_result.get("error") or "The website might be unavailable or blocked."
                 return {
                     "success": False,
                     "error": "Website analysis failed",
-                    "response": f"Sorry, I couldn't analyze the website {url}. The website might be unavailable or blocked.",
+                    "response": f"Sorry, I couldn't analyze the website {url}. {reason}",
                     "response_time": (datetime.now() - start_time).total_seconds()
                 }
 

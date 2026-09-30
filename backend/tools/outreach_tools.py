@@ -642,7 +642,8 @@ class OutreachRunPassTool(BaseTool):
         "(pass topics or keyword_profile for YouTube scout). For freeform requests "
         "like 'comment on YouTube videos about Offline AI', prefer "
         "outreach_execute_intent instead. Cadence + kill switch still apply; "
-        "never auto-posts while supervised."
+        "a YouTube scout also needs web access on in Settings (off by default). "
+        "Never auto-posts while supervised."
     )
     requires_approval = True
     parameters = {
