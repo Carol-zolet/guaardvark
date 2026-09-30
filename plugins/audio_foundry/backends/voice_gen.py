@@ -12,8 +12,14 @@ backend's voice API, the Film Crew Editor, MCP's generate_speech):
   backend="auto"       -> decided by what the request names:
       a reference clip  -> Chatterbox cloning that clip; no fallback, since
                            Kokoro cannot speak in that voice
-      no clip           -> Chatterbox's stock voice, falling back to Kokoro's
+      a voice_id        -> Kokoro speaking that built-in voice; no fallback,
+                           since Chatterbox has no built-in voices
+      neither           -> Chatterbox's stock voice, falling back to Kokoro's
                            default voice on any error (logged), as before
+
+A request that names nothing therefore sounds exactly as it always did; a
+named voice or clip is either honoured or refused, never swapped for another
+voice.
 
 vram_mb_estimate is the *max* of the inner backends, not the sum — both are
 never expected to be loaded simultaneously in steady state. The dispatcher's
@@ -44,6 +50,8 @@ def route(params: dict[str, Any]) -> str:
         return requested
     if params.get("reference_clip_path"):
         return "chatterbox"
+    if params.get("voice_id"):
+        return "kokoro"
     return AUTO
 
 
@@ -96,7 +104,7 @@ class VoiceGenBackend(AudioBackend):
         if engine == "kokoro":
             return self._gen_with(self._kokoro, params)
 
-        # No clip: prefer Chatterbox, fall back to Kokoro on any runtime
+        # Nothing named: prefer Chatterbox, fall back to Kokoro on any runtime
         # error — but NOT on a user cancel.
         try:
             return self._gen_with(self._chatterbox, params)

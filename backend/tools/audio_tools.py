@@ -204,8 +204,9 @@ class GenerateSpeechTool(BaseTool):
                     f"Chatterbox has no built-in voices, so voice {voice!r} cannot be used with "
                     "engine 'chatterbox'. Use engine 'kokoro' (or 'auto') for that voice, or omit "
                     "voice to hear Chatterbox's stock voice."))
-            # The plugin's auto mode tries Chatterbox first, and Chatterbox
-            # ignores voice ids, so a named voice must go to Kokoro explicitly.
+            # A named voice is Kokoro's (Chatterbox has none); Audio Foundry's
+            # auto mode routes it there too, but naming the engine keeps the
+            # request unambiguous.
             engine = "kokoro"
         payload: dict[str, Any] = {"text": text, "backend": engine}
         if voice:

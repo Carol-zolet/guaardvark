@@ -200,6 +200,24 @@ def kokoro_voice_ids() -> List[str]:
     return [v["id"] for g in kokoro_catalog()["groups"] for v in g["voices"]]
 
 
+def kokoro_voice_choices(installed_only: bool = True) -> List[Dict[str, str]]:
+    """The Kokoro voices as ``{id, label, group}``, for a caller choosing one.
+
+    With ``installed_only`` only voices whose pack is on this machine are
+    listed: Audio Foundry refuses a voice that is not installed rather than
+    download it mid-generation.
+    """
+    cat = kokoro_catalog()
+    choices = []
+    for group in cat["groups"]:
+        for voice in group["voices"]:
+            if installed_only and not is_hub_cached(
+                    cat["hf_repo"], cat["voice_file"].format(voice=voice["id"])):
+                continue
+            choices.append({"id": voice["id"], "label": voice["label"], "group": group["label"]})
+    return choices
+
+
 def required_hub_files(entry: Dict[str, Any]) -> List[str]:
     """Every file of ``entry['hf_repo']`` that generation reads."""
     if entry.get("voice_catalog"):
