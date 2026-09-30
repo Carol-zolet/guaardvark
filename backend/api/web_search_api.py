@@ -5,8 +5,9 @@ import re
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any, List
 import requests
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, urlsplit
 from bs4 import BeautifulSoup
+from xml.etree import ElementTree as ET
 
 from flask import Blueprint, current_app, jsonify, request
 from backend.utils.response_utils import success_response, error_response
@@ -116,6 +117,130 @@ def extract_website_content(url: str, query: Optional[str] = None, public_only: 
             "url": url,
             "error": f"Failed to extract content: {str(e)}"
         }
+
+# Entries a sitemap report lists by name; its counts cover every entry read.
+SITEMAP_LISTED_ENTRIES = 20
+# Top-level pages (one path segment) a sitemap report names as landing pages.
+SITEMAP_LANDING_PAGES = 5
+
+
+def _local_name(tag: str) -> str:
+    return tag.rsplit("}", 1)[-1] if isinstance(tag, str) else ""
+
+
+def _sitemap_entries(body: bytes):
+    """Parse a sitemap body as far as it is well-formed.
+
+    Returns ``(kind, entries, stopped)``: kind is the root element's name
+    ("urlset" or "sitemapindex"), or None when the body is not a sitemap;
+    entries are dicts of the child elements of each <url> or <sitemap>; stopped
+    is None, or the parse error that ended reading early (a body cut at the size
+    limit ends that way).
+    """
+    parser = ET.XMLPullParser(events=("start", "end"))
+    kind = None
+    entry_name = None
+    entries = []
+    stopped = None
+    try:
+        parser.feed(body)
+        parser.close()
+    except ET.ParseError as e:
+        stopped = e
+    try:
+        for event, element in parser.read_events():
+            name = _local_name(element.tag)
+            if event == "start":
+                if kind is None:
+                    kind = name
+                    if kind not in ("urlset", "sitemapindex"):
+                        return None, [], None
+                    entry_name = "url" if kind == "urlset" else "sitemap"
+                continue
+            if name == entry_name:
+                entry = {}
+                for child in element:
+                    field = _local_name(child.tag)
+                    if field in ("loc", "lastmod", "changefreq", "priority") and child.text:
+                        entry[field] = child.text.strip()
+                if entry.get("loc"):
+                    entries.append(entry)
+                element.clear()
+    except ET.ParseError as e:
+        stopped = stopped or e
+    return kind, entries, stopped
+
+
+def _path_depth(url: str) -> int:
+    return len([part for part in urlsplit(url).path.split("/") if part])
+
+
+def read_sitemap(url: str) -> Dict[str, Any]:
+    """Fetch one sitemap and summarise it: its kind (a list of pages, or an
+    index of other sitemaps), how many entries it has, the first
+    ``SITEMAP_LISTED_ENTRIES`` of them, and for a list of pages, how many sit at
+    each path depth and which top-level pages it gives a priority above 0.5.
+
+    The fetch is the one fetch_url makes: public addresses only, on every
+    redirect; no ~/.netrc logins; bounded in size and time. The sitemaps an
+    index names are listed, not fetched. A sitemap cut at the size limit is
+    read up to the cut, and ``page_cut`` says so.
+    """
+    url = (url or "").strip()
+    scheme = re.match(r"^([A-Za-z][A-Za-z0-9+.-]*)://", url)
+    if scheme and scheme.group(1).lower() not in ("http", "https"):
+        return {"success": False, "url": url, "error": "Refused: only http and https URLs can be fetched"}
+    if not scheme:
+        url = "https://" + url
+
+    try:
+        page = fetch_page(url, headers={"User-Agent": "Guaardvark-Sitemap/1.0"}, public_only=True)
+    except (FetchRefused, FetchFailed) as e:
+        return {"success": False, "url": url, "error": str(e)}
+    except requests.RequestException as e:
+        return {"success": False, "url": url, "error": f"Failed to access the sitemap: {e}"}
+
+    kind, entries, stopped = _sitemap_entries(page.body)
+    if kind is None:
+        return {
+            "success": False,
+            "url": url,
+            "error": (f"Not a sitemap: {page.url} is not a sitemap XML document "
+                      "(its root element is not <urlset> or <sitemapindex>)."),
+        }
+
+    report: Dict[str, Any] = {
+        "success": True,
+        "url": url,
+        "final_url": page.url,
+        "type": kind,
+        "total": len(entries),
+        "entries": entries[:SITEMAP_LISTED_ENTRIES],
+    }
+    if kind == "urlset":
+        by_depth: Dict[int, int] = {}
+        landing_pages = []
+        for entry in entries:
+            depth = _path_depth(entry["loc"])
+            by_depth[depth] = by_depth.get(depth, 0) + 1
+            try:
+                priority = float(entry.get("priority") or 0)
+            except ValueError:
+                priority = 0.0
+            if depth == 1 and priority > 0.5 and len(landing_pages) < SITEMAP_LANDING_PAGES:
+                landing_pages.append(entry)
+        report["by_depth"] = dict(sorted(by_depth.items()))
+        report["landing_pages"] = landing_pages
+    if page.cut:
+        report["page_cut"] = page.cut
+    elif stopped is not None:
+        read = f"{len(entries)} entry" if len(entries) == 1 else f"{len(entries)} entries"
+        report["incomplete"] = (
+            f"The sitemap stops being well-formed XML after {read} ({stopped}); "
+            "the counts cover only those."
+        )
+    return report
+
 
 def get_weather_info(location: str) -> Dict[str, Any]:
     try:
@@ -678,6 +803,28 @@ def web_search():
     except Exception as e:
         logger.error(f"Error in enhanced web search: {e}", exc_info=True)
         return error_response(f"Search failed: {str(e)}", status_code=500)
+
+@web_search_bp.route("/sitemap", methods=["POST"])
+def sitemap_report():
+    """Summarise one sitemap (the chat's ``/websearch sitemap:<url>``); see read_sitemap."""
+    try:
+        if not get_web_access():
+            return error_response("Web access is disabled in system settings", status_code=403)
+
+        data = request.get_json(silent=True) or {}
+        url = str(data.get("url") or "").strip()
+        if not url:
+            return error_response("A sitemap URL is required", status_code=400)
+
+        report = read_sitemap(url)
+        if not report["success"]:
+            return error_response(report["error"], status_code=422, error_code="SITEMAP_NOT_READ",
+                                  data={"url": report["url"]})
+        return success_response(report)
+
+    except Exception as e:
+        logger.error(f"Error reading sitemap: {e}", exc_info=True)
+        return error_response(f"Reading the sitemap failed: {str(e)}", status_code=500)
 
 @web_search_bp.route("/status", methods=["GET"])
 def search_status():
