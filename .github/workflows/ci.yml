@@ -324,6 +324,8 @@ jobs:
             backend/tests/test_search_code_budget_and_globs.py \
             backend/tests/test_search_codebase_scope.py \
             backend/tests/api/test_chat_export_api.py \
+            backend/tests/services/test_audio_foundry_offline.py \
+            backend/tests/test_mcp_generate_speech_voices.py \
             backend/tests/test_audit_batch2_security.py \
             backend/tests/utils/test_media_inputs.py \
             backend/tests/test_mcp_media_tools.py \

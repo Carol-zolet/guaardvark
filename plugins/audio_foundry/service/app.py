@@ -10,13 +10,13 @@ import logging
 from typing import Any, Optional
 
 from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, ConfigDict
 
 # Names only — this module keeps torch inside its methods, so importing it
 # here does not pull the ML stack into service startup.
 from backends.voice_gen_chatterbox import EMOTION_PRESETS
+from backends.kokoro_voices import UnknownVoice
 from service.bootstrap import bootstrap
 from service.config_loader import load_config, resolve_backend_url
 from service.dispatcher import BackendUnavailable, Dispatcher, Intent, NotWired
@@ -79,18 +79,13 @@ class MusicRequest(BaseModel):
 
 # ---------- app setup --------------------------------------------------------
 
+# No CORS middleware: browsers never call this service. The Studio goes
+# through the backend's /api/audio-foundry proxy, and every other caller is a
+# process on this machine (scripts/start.sh binds 127.0.0.1).
 app = FastAPI(
     title="Audio Foundry",
     version="0.1.0",
     description="Audio generation plugin for Guaardvark (voiceover, SFX, music).",
-)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
 )
 
 _config = load_config()
@@ -256,64 +251,33 @@ def evict_backend(intent: str) -> dict[str, Any]:
 def list_voices() -> dict[str, Any]:
     """Return the available voice catalog grouped by backend.
 
-    Kokoro voices are listed inline (the IDs are stable per Kokoro release).
-    Chatterbox voices come from reference clips at request-time, so the
-    Chatterbox section just describes the contract — not a list.
+    Kokoro voices come from backends/kokoro_voices.json; each carries
+    ``installed``, true when its voice pack is in the local Hugging Face cache
+    (a voice that is not installed is refused at generation with an Install
+    hint rather than downloaded). Chatterbox voices come from reference clips
+    at request-time, so the Chatterbox section just describes the contract.
 
     Frontend uses this to render the voice picker dropdown so we don't have
-    to redeploy the UI when Kokoro adds voices upstream.
+    to redeploy the UI when the catalog changes.
     """
-    # Kokoro v1.0+ catalog. American and British English are the wired set;
-    # voice_gen_kokoro.py routes lang_code from the voice prefix at runtime.
-    return {
-        "kokoro": {
-            "default": "af_heart",
-            "groups": [
-                {"label": "American Female", "voices": [
-                    {"id": "af_heart",   "label": "Heart (default)"},
-                    {"id": "af_bella",   "label": "Bella"},
-                    {"id": "af_nicole",  "label": "Nicole"},
-                    {"id": "af_sarah",   "label": "Sarah"},
-                    {"id": "af_sky",     "label": "Sky"},
-                    {"id": "af_alloy",   "label": "Alloy"},
-                    {"id": "af_aoede",   "label": "Aoede"},
-                    {"id": "af_jessica", "label": "Jessica"},
-                    {"id": "af_kore",    "label": "Kore"},
-                    {"id": "af_nova",    "label": "Nova"},
-                    {"id": "af_river",   "label": "River"},
-                ]},
-                {"label": "American Male", "voices": [
-                    {"id": "am_adam",    "label": "Adam"},
-                    {"id": "am_michael", "label": "Michael"},
-                    {"id": "am_eric",    "label": "Eric"},
-                    {"id": "am_echo",    "label": "Echo"},
-                    {"id": "am_fenrir",  "label": "Fenrir"},
-                    {"id": "am_liam",    "label": "Liam"},
-                    {"id": "am_onyx",    "label": "Onyx"},
-                    {"id": "am_puck",    "label": "Puck"},
-                    {"id": "am_santa",   "label": "Santa"},
-                ]},
-                {"label": "British Female", "voices": [
-                    {"id": "bf_emma",     "label": "Emma"},
-                    {"id": "bf_isabella", "label": "Isabella"},
-                    {"id": "bf_alice",    "label": "Alice"},
-                    {"id": "bf_lily",     "label": "Lily"},
-                ]},
-                {"label": "British Male", "voices": [
-                    {"id": "bm_george",  "label": "George"},
-                    {"id": "bm_lewis",   "label": "Lewis"},
-                    {"id": "bm_daniel",  "label": "Daniel"},
-                    {"id": "bm_fable",   "label": "Fable"},
-                ]},
-                {"label": "Spanish Female", "voices": [
-                    {"id": "ef_dora",    "label": "Dora"},
-                ]},
-                {"label": "Spanish Male", "voices": [
-                    {"id": "em_alex",    "label": "Alex"},
-                    {"id": "em_santa",   "label": "Santa"},
-                ]},
+    from backends import kokoro_voices
+    from backends.hub_weights import cached_hub_file
+
+    catalog = kokoro_voices.load_catalog()
+    repo = kokoro_voices.hf_repo()
+    groups = [
+        {
+            "label": group["label"],
+            "voices": [
+                {**voice,
+                 "installed": cached_hub_file(repo, kokoro_voices.voice_file(voice["id"])) is not None}
+                for voice in group["voices"]
             ],
-        },
+        }
+        for group in catalog["groups"]
+    ]
+    return {
+        "kokoro": {"default": catalog["default"], "groups": groups},
         "chatterbox": {
             "type": "reference_clip",
             "description": "Zero-shot voice cloning from a 5-10s reference clip. Pass `reference_clip_path` in the /generate/voice request.",
@@ -404,9 +368,10 @@ def clear_jobs() -> dict[str, Any]:
 def _run(intent: Intent, params: dict[str, Any]) -> dict[str, Any]:
     """Synchronous generate (short inputs / async not requested).
 
-    Translates NotWired to 501, real errors to 500. Registration of the output
-    as a Document happens in _finalize (shared with the async worker) and is
-    non-fatal — a failure there doesn't kill the response; the file is on disk.
+    Translates NotWired to 501, an unknown Kokoro voice id to 400, real errors
+    to 500. Registration of the output as a Document happens in _finalize
+    (shared with the async worker) and is non-fatal — a failure there doesn't
+    kill the response; the file is on disk.
     """
     # progress_cb/cancel_event are popped if a caller ever sent them by mistake.
     params.pop("progress_cb", None)
@@ -418,6 +383,8 @@ def _run(intent: Intent, params: dict[str, Any]) -> dict[str, Any]:
         raise HTTPException(status_code=501, detail=str(e))
     except BackendUnavailable as e:
         raise HTTPException(status_code=503, detail=str(e))
+    except UnknownVoice as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         logger.exception("Generation failed for intent=%s", intent.value)
         raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
