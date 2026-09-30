@@ -282,6 +282,28 @@ def execute_tool():
         }), 500
 
 
+@tools_bp.route("/jobs/<job_id>", methods=["GET"])
+def tool_job_status(job_id: str):
+    """A tool job that an MCP call started (backend/services/tool_jobs.py).
+
+    ``?wait_s=N`` holds the answer until the job finishes or N seconds pass,
+    capped at tool_jobs.MAX_WAIT_S. An unknown id answers 404 with ``reason``
+    ``restarted`` (the job belonged to an earlier run of the backend) or
+    ``unknown``.
+    """
+    from backend.services import tool_jobs
+
+    try:
+        wait_s = float(request.args.get("wait_s") or 0)
+    except ValueError:
+        wait_s = 0.0
+    snapshot = tool_jobs.wait(job_id, wait_s) if wait_s > 0 else tool_jobs.get(job_id)
+    if snapshot is None:
+        reason, message = tool_jobs.missing(job_id)
+        return jsonify({"success": False, "error": message, "reason": reason, "job_id": job_id}), 404
+    return jsonify({"success": True, "data": snapshot})
+
+
 @tools_bp.route("/schemas", methods=["GET"])
 def get_all_schemas():
     """
