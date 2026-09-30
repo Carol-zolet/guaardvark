@@ -357,6 +357,8 @@ jobs:
             backend/tests/integration/test_plugins_system.py \
             backend/tests/unit/test_unified_progress_system.py \
             backend/tests/test_interconnector_exclude.py \
+            backend/tests/unit/test_public_only_session_env.py \
+            backend/tests/unit/test_web_search_routing.py \
             backend/tests/test_mcp_output_scope.py \
             backend/tests/test_outputs_download_protection.py \
             backend/tests/test_api_outputs_record_refusal.py
