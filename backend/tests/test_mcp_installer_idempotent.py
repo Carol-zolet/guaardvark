@@ -1,5 +1,5 @@
 """``python -m backend.mcp install`` run more than once, and over entries the
-user has customised.
+user has customised; the ``config`` snippets; doctor's client scan.
 
 Every test runs against a temporary home directory, and the client CLIs are
 replaced by a recorder: nothing here reads or writes a real client config.
@@ -12,7 +12,7 @@ from types import SimpleNamespace
 import pytest
 
 from backend.mcp import cli as snippets
-from backend.mcp import installer
+from backend.mcp import doctor, installer
 
 SECRET = "sk-test-0001"
 STALE = {"command": "sh", "args": ["-c", "cd /old && exec /old/python -m backend.mcp"]}
@@ -306,3 +306,34 @@ def test_every_snippet_launches_the_way_install_does(home, capsys, client):
     command, args = _launch()
     assert [launch.get("path", launch.get("command")), *launch["args"]] == [command, *args]
     assert "cwd" not in launch
+
+
+# ---- doctor scans every client install can set up ------------------------------------------
+_GONE = ["-c", "cd /gone && exec /gone/python -m backend.mcp"]
+
+
+def test_doctor_checks_the_codex_opencode_and_antigravity_entries(home, capsys):
+    _write(home / ".codex/config.toml",
+           f'[mcp_servers.guaardvark]\ncommand = "sh"\nargs = {json.dumps(_GONE)}\n')
+    _write(home / ".config/opencode/opencode.json",
+           {"mcp": {"guaardvark": {"type": "local", "command": ["sh", *_GONE]}}})
+    _write(home / ".gemini/config/mcp_config.json",
+           {"mcpServers": {"guaardvark": {"command": "sh", "args": _GONE}}})
+
+    assert doctor._check_clients() is False
+    out = capsys.readouterr().out
+    for label in ("codex", "opencode", "antigravity"):
+        assert f"[FAIL] client: {label} — missing path: /gone" in out
+
+
+def test_doctor_names_a_config_it_could_not_parse(home, capsys):
+    _write(home / ".config/zed/settings.json", '{\n  // mine\n  "context_servers": {}\n}\n')
+
+    doctor._check_clients()
+    out = capsys.readouterr().out
+    assert "[warn] client: zed" in out and "not checked" in out
+
+
+def test_doctor_covers_every_client_install_supports():
+    labels = " ".join(label for label, _path, _tables in doctor._client_config_sources())
+    assert [client for client in installer.CLIENTS if client not in labels] == []
