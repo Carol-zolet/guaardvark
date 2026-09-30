@@ -333,6 +333,7 @@ jobs:
             backend/tests/test_social_outreach/test_reject_stops_post.py \
             backend/tests/test_social_outreach/test_posters_ask_before_submit.py \
             backend/tests/test_social_outreach/test_share_draft_posts.py \
+            backend/tests/test_outreach_tools_mcp.py \
             backend/tests/services/test_gpu_hard_fit.py \
             backend/tests/services/test_gpu_load_gates.py \
             backend/tests/services/test_gpu_session_wraps_generation.py \

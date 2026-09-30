@@ -23,7 +23,7 @@ import re
 from typing import Any, Dict, List, Optional
 
 from backend.services.agent_tools import BaseTool, ToolParameter, ToolResult
-from backend.services.social_outreach import audit, kill_switch, persona
+from backend.services.social_outreach import audit, kill_switch, persona, transitions
 from backend.utils.backend_http import BackendError, is_mcp_transport, request_json
 
 logger = logging.getLogger(__name__)
@@ -34,6 +34,13 @@ _KNOWN_PLATFORMS = ("reddit", "discord", "facebook", "twitter", "youtube")
 _KNOWN_RUN_PLATFORMS = (
     "reddit", "self_share", "recon", "draft", "youtube", "youtube_recon",
 )
+# Statuses outreach_list_queue lists oldest first: the posting tick takes
+# approved rows in created_at order, so "what posts next" is the oldest.
+_OLDEST_FIRST_STATUSES = ("approved",)
+# What outreach_draft_post can draft. The mode decides both the persona prompt
+# and the queued row's action, so anything else ("reply", "comments") is
+# refused rather than drafted as one thing and queued as another.
+_DRAFT_MODES = ("comment", "share")
 # Platforms a mode='share' draft can be posted to. The posting tick's share
 # branch (tick_process_approved_drafts) submits a link post to the subreddit
 # named in the row's target_url and knows no other destination, so a share
@@ -129,15 +136,20 @@ class OutreachListQueueTool(BaseTool):
     name = "outreach_list_queue"
     read_only = True
     description = (
-        "List social outreach drafts. Defaults to status='drafted' (pending review). "
-        "Pass status='approved' to see what's queued to post next, or status='posted' "
-        "for recent history. Returns up to `limit` rows (default 10)."
+        "List social outreach drafts by status. Defaults to status='drafted' (waiting "
+        "for review). status='approved' lists what is queued to post, oldest first, "
+        "which is the order it posts in; every other status is newest first, e.g. "
+        "status='posted' for recent history. Returns up to `limit` rows (default 10)."
     )
     parameters = {
         "status": ToolParameter(
             name="status", type="string", required=False,
-            description="One of: drafted, approved, posted, rejected",
-            default="drafted",
+            description=(
+                "candidate (found, not drafted yet), drafted (waiting for review), approved "
+                "(queued to post), processing (a poster has picked it up), submitting (being "
+                "published now), posted, rejected, aborted (posting failed)"
+            ),
+            default="drafted", enum=list(transitions.KNOWN_STATUSES),
         ),
         "limit": ToolParameter(
             name="limit", type="int", required=False,
@@ -145,8 +157,25 @@ class OutreachListQueueTool(BaseTool):
         ),
     }
 
+    @staticmethod
+    def _answer(status: str, summary: List[Dict[str, Any]]) -> ToolResult:
+        order = "oldest_first" if status in _OLDEST_FIRST_STATUSES else "newest_first"
+        return ToolResult(
+            success=True,
+            output={"count": len(summary), "status": status, "order": order, "rows": summary},
+            metadata={"count": len(summary), "status": status},
+        )
+
     def execute(self, **kwargs) -> ToolResult:
-        status = (kwargs.get("status") or "drafted").strip().lower()
+        status = str(kwargs.get("status") or "drafted").strip().lower()
+        if status not in transitions.KNOWN_STATUSES:
+            return ToolResult(
+                success=False,
+                error=(
+                    f"status must be one of {transitions.KNOWN_STATUSES}, got '{status}'. "
+                    "Drafts waiting for review are 'drafted'."
+                ),
+            )
         try:
             limit = int(kwargs.get("limit") or 10)
         except (TypeError, ValueError):
@@ -158,16 +187,15 @@ class OutreachListQueueTool(BaseTool):
 
         try:
             from backend.models import SocialOutreachLog
-            q = SocialOutreachLog.query
-            if status:
-                q = q.filter(SocialOutreachLog.status == status)
-            rows = q.order_by(SocialOutreachLog.created_at.desc()).limit(limit).all()
-            summary = [_row_summary(r) for r in rows]
-            return ToolResult(
-                success=True,
-                output={"count": len(summary), "status": status, "rows": summary},
-                metadata={"count": len(summary), "status": status},
+            created = SocialOutreachLog.created_at
+            rows = (
+                SocialOutreachLog.query
+                .filter(SocialOutreachLog.status == status)
+                .order_by(created.asc() if status in _OLDEST_FIRST_STATUSES else created.desc())
+                .limit(limit)
+                .all()
             )
+            return self._answer(status, [_row_summary(r) for r in rows])
         except Exception as e:
             logger.exception("outreach_list_queue failed")
             return ToolResult(success=False, error=str(e))
@@ -187,13 +215,8 @@ class OutreachListQueueTool(BaseTool):
         except BackendError as e:
             return ToolResult(success=False, error=f"Could not list outreach drafts: {e}")
         rows = [r for r in rows if r.get("status") == status]
-        rows.sort(key=lambda r: r.get("created_at") or "", reverse=True)
-        summary = [_row_summary(r) for r in rows[:limit]]
-        return ToolResult(
-            success=True,
-            output={"count": len(summary), "status": status, "rows": summary},
-            metadata={"count": len(summary), "status": status},
-        )
+        rows.sort(key=lambda r: r.get("created_at") or "", reverse=status not in _OLDEST_FIRST_STATUSES)
+        return self._answer(status, [_row_summary(r) for r in rows[:limit]])
 
 
 class OutreachDraftPostTool(BaseTool):
@@ -220,7 +243,8 @@ class OutreachDraftPostTool(BaseTool):
         ),
         "mode": ToolParameter(
             name="mode", type="string", required=False,
-            description="'comment' or 'share'", default="comment",
+            description="'comment' (reply in a thread) or 'share' (new Reddit link post)",
+            default="comment", enum=list(_DRAFT_MODES),
         ),
         "thread_context": ToolParameter(
             name="thread_context", type="string", required=False,
@@ -252,11 +276,12 @@ class OutreachDraftPostTool(BaseTool):
         "include_link": ToolParameter(
             name="include_link", type="bool", required=False,
             description=(
-                "Comment mode only. When true, the persona includes a "
-                "guaardvark.com link where it fits naturally. The persona "
-                "still self-grades and may return grade<0.7 if the link "
-                "would feel forced (the human reviewer would rather hold "
-                "than ship spam). Defaults to false."
+                "Comment mode only. When true, the draft carries a link: the "
+                "GitHub repo for YouTube, guaardvark.com for other platforms. "
+                "The persona is asked to work it in; if it leaves it out, the "
+                "link is appended on its own line. The persona is told to grade "
+                "below 0.7 when the link cannot be made to feel natural; the "
+                "draft is queued either way. Defaults to false."
             ),
             default=False,
         ),
@@ -269,7 +294,12 @@ class OutreachDraftPostTool(BaseTool):
                 success=False,
                 error=f"platform must be one of {_KNOWN_PLATFORMS}, got '{platform}'",
             )
-        mode = (kwargs.get("mode") or "comment").strip().lower()
+        mode = str(kwargs.get("mode") or "comment").strip().lower()
+        if mode not in _DRAFT_MODES:
+            return ToolResult(
+                success=False,
+                error=f"mode must be one of {_DRAFT_MODES}, got '{mode}'",
+            )
         target_url = kwargs.get("target_url")
         target_thread_id = None
 
