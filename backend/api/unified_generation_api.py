@@ -378,20 +378,19 @@ def generate_large_scale_csv():
 
 @unified_gen_bp.route("/status", methods=["GET"])
 def get_generation_status():
-    """Get status of generation jobs"""
+    """Status of one generation job, by the job_id a generation route returned
+    (the progress_url of a bulk job response points here)."""
+    job_id = (request.args.get("job_id") or "").strip()
+    if not job_id:
+        return jsonify({"error": "job_id is required"}), 400
     try:
-        job_id = request.args.get("job_id")
-        if not job_id:
-            return jsonify({"error": "job_id is required"}), 400
-        
-        progress_system = get_unified_progress()
-        status = progress_system.get_job_status(job_id)
-        
-        return jsonify({
-            "job_id": job_id,
-            "status": status
-        }), 200
-        
+        status = get_unified_progress().get_job_status(job_id)
     except Exception as e:
         logger.error(f"Error getting generation status: {e}", exc_info=True)
         return jsonify({"error": str(e)}), 500
+    if status is None:
+        return jsonify({
+            "error": f"No job {job_id}: it never existed here, or its record has been cleaned up.",
+            "job_id": job_id,
+        }), 404
+    return jsonify(status), 200

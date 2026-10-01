@@ -20,6 +20,11 @@
   tool-endpoint protection, the Host and origin checks, debug mode, web access, tool file access,
   and the addresses the backend, web UI, Redis, PostgreSQL and each plugin listen on, with a
   warning for any of the others that other machines can reach.
+- **`GET /api/generate/status?job_id=…` works.** It called a progress method that did not exist and
+  answered 500 every time. It now answers the job's status, progress and message (live while the
+  backend tracks the job, from its progress record otherwise) and 404 for an id nothing knows.
+  `GET /api/jobs/unified:<id>`, which `llx job status` uses, also never found a live progress job;
+  it does now.
 - **The backend answers only to this install's names.** A site can point its DNS name at the
   Guaardvark machine's address after its page has loaded (DNS rebinding). The browser then treats
   the backend as that site's own, so the page could read every reply and, from the Guaardvark
