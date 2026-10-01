@@ -321,6 +321,9 @@ def accept_landed(event: dict) -> None:
     for rel in event.get("paths") or []:
         path = guard.REPO_ROOT / rel
         row = db.session.query(InboundBaseline).filter_by(path=rel).first()
+        if row is not None and row.status == "held" and row.scan_id:
+            guard.mark(row.scan_id, "clear", by="source watch",
+                       note="replaced or removed through a guarded path, which judged the change")
         if not path.is_file():
             if row is not None:
                 db.session.delete(row)
