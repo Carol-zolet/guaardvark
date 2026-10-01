@@ -485,15 +485,18 @@ def list_files(directory: str = "frontend/src/pages", max_depth: int = 5) -> str
         full_path = (PROJECT_ROOT / (directory or ".")).resolve()
         if not full_path.is_relative_to(PROJECT_ROOT):
             return f"ERROR: Path '{directory}' is outside project root"
-        if not full_path.exists():
-            return f"ERROR: Path '{directory}' does not exist"
-        if not full_path.is_dir():
-            return f"ERROR: '{directory}' is a file, not a folder; open it with read_code"
 
+        # Decided from the path alone, before the folder is looked at: the same
+        # answer for a private folder that exists and one that does not.
         rel_dir = full_path.relative_to(PROJECT_ROOT).as_posix()
         prefix = "" if rel_dir == "." else rel_dir + "/"
         if prefix and private_relative_paths([prefix], PROJECT_ROOT):
             return f"ERROR: '{directory}' is git-ignored local data, not source code"
+
+        if not full_path.exists():
+            return f"ERROR: Path '{directory}' does not exist"
+        if not full_path.is_dir():
+            return f"ERROR: '{directory}' is a file, not a folder; open it with read_code"
 
         # Build the tree from the source inventory, so ignored data never shows.
         tree: dict = {}

@@ -5,17 +5,179 @@ Executable tools for bulk and batch file generation operations.
 Wraps existing generation services for agent system integration.
 """
 
+import csv
+import io
 import logging
 import os
 import re
-from pathlib import Path
-from typing import Any, Optional
+from collections import Counter
+from pathlib import Path, PurePosixPath
+from typing import Any, List, Optional, Tuple
 
 from backend.services.agent_tools import BaseTool, ToolParameter, ToolResult
 from backend.utils.backend_http import is_mcp_transport
 
 from backend.utils.path_safety import safe_join
 logger = logging.getLogger(__name__)
+
+_FENCE = "```"
+
+# File types whose own content can hold fenced code blocks, so a fence in the
+# model's reply is not proof of a wrapper; and the fence tags that do mark one.
+_PROSE_EXTENSIONS = {"", ".md", ".markdown", ".mdx", ".txt", ".rst"}
+_PROSE_FENCE_TAGS = {"markdown", "md", "mdx", "text", "txt", "plaintext", "rst"}
+
+
+def _reply_text(response) -> str:
+    """The text of an LLM chat response, whether content or blocks carry it."""
+    if not response.message:
+        return ""
+    try:
+        content = response.message.content
+    except (ValueError, AttributeError):
+        blocks = getattr(response.message, 'blocks', [])
+        return next((getattr(b, 'text', str(b)) for b in blocks if getattr(b, 'text', None)), "").strip()
+    return str(content).strip() if content is not None else ""
+
+
+def _file_body(reply: str, filename: str) -> str:
+    """The file content inside a model reply that wraps it in a code fence,
+    with or without a sentence before or after the fence."""
+    lines = reply.split("\n")
+    fences = [i for i, line in enumerate(lines) if line.strip().startswith(_FENCE)]
+    if not fences:
+        return reply
+    first, last = fences[0], fences[-1]
+    closed = last > first and lines[last].strip() == _FENCE
+    before = any(line.strip() for line in lines[:first])
+    after = any(line.strip() for line in lines[last + 1:])
+    prose = os.path.splitext(str(filename or ""))[1].lower() in _PROSE_EXTENSIONS
+
+    if not before and len(fences) == 1:
+        # An opening fence that never closed.
+        body = lines[first + 1:]
+    elif not before and not after and closed and (prose or len(fences) == 2):
+        # The whole reply is one fenced block. In a Markdown or text file that
+        # wrapper may hold code blocks of its own.
+        body = lines[first + 1:last]
+    elif prose:
+        if lines[first].strip()[len(_FENCE):].strip().lower() not in _PROSE_FENCE_TAGS:
+            # A code block inside a Markdown or text file is the file's own content.
+            return reply
+        # A ```markdown wrapper can hold code blocks of its own: it ends at the last fence.
+        body = lines[first + 1:last if closed else len(lines)]
+    elif len(fences) == 1:
+        # One fence line: an opener with the file after it, or a stray closer
+        # with the file before it.
+        body = lines[first + 1:] if after else lines[:first]
+    else:
+        body = lines[first + 1:fences[1]]
+    return "\n".join(body).strip("\n")
+
+
+def _fenced_blocks(text: str) -> List[str]:
+    """Bodies of the fenced code blocks in a model reply, in order. An opening
+    fence with no closing one runs to the end of the reply."""
+    blocks: List[str] = []
+    body: Optional[List[str]] = None
+    for line in text.split("\n"):
+        if line.strip().startswith(_FENCE):
+            if body is None:
+                body = []
+            else:
+                blocks.append("\n".join(body))
+                body = None
+        elif body is not None:
+            body.append(line)
+    if body is not None:
+        blocks.append("\n".join(body))
+    return blocks
+
+
+def _read_records(text: str) -> List[List[str]]:
+    # strict: a stray quote inside a quoted field is an error, not a silently
+    # mangled field. skipinitialspace: models write '"a", "b"'.
+    return list(csv.reader(io.StringIO(text), strict=True, skipinitialspace=True))
+
+
+def _is_blank(record: List[str]) -> bool:
+    return len(record) <= 1 and not "".join(record).strip()
+
+
+def _table_in(records: List[List[str]]) -> Tuple[List[List[str]], int, Optional[str]]:
+    """(rows, column count, problem) for one run of records with no blank line in it.
+
+    The column count is the one most rows share. A line of prose at either end
+    (a single field beside a wider table, or a leading line ending in ':') is
+    dropped. Any other row of a different width is a problem: dropping it could
+    turn a data row into the header.
+    """
+    rows = list(records)
+    while len(rows) > 1 and rows[0][-1].rstrip().endswith(":"):
+        rows = rows[1:]
+    counts = Counter(len(row) for row in rows)
+    most = max(counts.values())
+    width = max(n for n, seen in counts.items() if seen == most)
+    while rows and width > 1 and len(rows[0]) == 1:
+        rows = rows[1:]
+    while rows and width > 1 and len(rows[-1]) == 1:
+        rows = rows[:-1]
+    for number, row in enumerate(rows, 1):
+        if len(row) != width:
+            return rows, width, f"row {number} has {len(row)} column(s) where most rows have {width}"
+    return rows, width, None
+
+
+def _csv_table(reply: str) -> Tuple[List[List[str]], int, Optional[str]]:
+    """The table in a model's reply, as (rows, column count, problem).
+
+    Looks inside code fences when the reply has any, and otherwise at the text
+    itself, where blank lines separate a table from prose around it. Of several
+    candidates the one with the most rows wins, a table of two or more columns
+    before a single column (which lines of prose also look like).
+    """
+    candidates = [block for block in _fenced_blocks(reply) if block.strip()]
+    if not candidates:
+        candidates = ["\n".join(
+            line for line in reply.split("\n") if not line.strip().startswith(_FENCE)
+        )]
+
+    runs: List[List[List[str]]] = []
+    parse_error = None
+    for text in candidates:
+        try:
+            pieces = [_read_records(text)]
+        except csv.Error as e:
+            # One unparsable line (prose that opens with a quote, say) must not
+            # hide a table elsewhere in the reply: read each paragraph on its own.
+            parse_error = parse_error or str(e)
+            pieces = []
+            for paragraph in re.split(r"\n\s*\n", text):
+                try:
+                    pieces.append(_read_records(paragraph))
+                except csv.Error:
+                    continue
+        for records in pieces:
+            run: List[List[str]] = []
+            for record in records + [[]]:
+                if not _is_blank(record):
+                    run.append(record)
+                elif run:
+                    runs.append(run)
+                    run = []
+
+    best = None
+    for run in runs:
+        rows, width, problem = _table_in(run)
+        rank = (width >= 2, len(rows))
+        if rows and (best is None or rank > best[0]):
+            best = (rank, rows, width, problem)
+    if parse_error and (best is None or best[0] < (True, 2)):
+        # What did parse is a line of prose; the table is the part that did not.
+        return [], 0, f"it is not valid CSV ({parse_error})"
+    if best is None:
+        return [], 0, "it holds no rows"
+    return best[1], best[2], best[3]
 
 
 class BulkCSVGeneratorTool(BaseTool):
@@ -165,7 +327,9 @@ class FileGeneratorTool(BaseTool):
     # Writes to the filename it is given, replacing a file of that name.
     destructive = True
     description = (
-        "Create a brand-NEW output file from a description, written under data/outputs/files. "
+        "Create a brand-NEW output file from a description, written under data/outputs/files "
+        "(a file already at that name there is replaced; an empty model reply is an error and "
+        "writes nothing). "
         "It generates from the description ALONE and never reads any existing file. "
         "Do NOT use it to improve, refactor, modify, or produce a new version of an existing or "
         "uploaded file — it cannot see that file and would fabricate. For that, use `codegen` "
@@ -406,27 +570,21 @@ Generate the file content now:"""
 
             from backend.utils.llm_service import ChatMessage, MessageRole
             messages = [ChatMessage(role=MessageRole.USER, content=prompt)]
-            response = llm.chat(messages)
-
-            if response.message:
-                try:
-                    file_content = str(response.message.content).strip()
-                except (ValueError, AttributeError):
-                    blocks = getattr(response.message, 'blocks', [])
-                    file_content = next((getattr(b, 'text', str(b)) for b in blocks if getattr(b, 'text', None)), "")
-                    file_content = file_content.strip()
-            else:
-                file_content = ""
-
-            # Clean up common artifacts
-            if file_content.startswith("```"):
-                # Remove markdown code fences
-                lines = file_content.split('\n')
-                if lines[0].startswith("```"):
-                    lines = lines[1:]
-                if lines and lines[-1].strip() == "```":
-                    lines = lines[:-1]
-                file_content = '\n'.join(lines)
+            reply = _reply_text(llm.chat(messages))
+            if not reply:
+                return ToolResult(
+                    success=False,
+                    error="The model returned an empty reply, so nothing was written. Try again.",
+                )
+            file_content = _file_body(reply, filename)
+            if not file_content.strip():
+                return ToolResult(
+                    success=False,
+                    error=(
+                        "The model returned no file content (an empty code block), so nothing "
+                        f"was written. Its reply began: {reply[:200]!r}"
+                    ),
+                )
 
             if save_to_disk:
                 with open(output_path, 'w', encoding='utf-8') as f:
@@ -469,33 +627,46 @@ class CSVGeneratorTool(BaseTool):
     read_only = False
     # Writes to the filename it is given, replacing a file of that name.
     destructive = True
-    description = "Generate a CSV file based on user specifications and data structure instructions"
+    description = (
+        "Write one CSV table with Guaardvark's local LLM from a description of the data: which "
+        "columns it has and what the rows hold. The model invents the rows from the description "
+        "alone (it reads no file and no indexed document) and writes the whole table in one reply, "
+        "cut off after 180 s. The reply is parsed as CSV and saved in the outputs folder under "
+        "csv/<filename>, replacing a file of that name. Returns the path, the column count and "
+        "names, and row_count: the data rows written, header not counted, next to rows_requested. "
+        "Nothing is saved and the call is an error when the reply is empty, holds no table, has "
+        "only a header, or has rows of different widths; text and code fences around the table "
+        "are left out. For a WordPress import file with a generated page per row use "
+        "generate_bulk_csv (a background job polled with get_generation_status); for any other "
+        "kind of file, generate_file."
+    )
 
     parameters = {
         "filename": ToolParameter(
             name="filename",
             type="string",
             required=True,
-            description="Output CSV filename"
+            description="Name for the file, e.g. 'fruit-prices.csv'; '.csv' is added when the name has no extension, and another extension is refused. A relative path such as 'reports/q3.csv' creates the folders under csv/. Checked before the model runs."
         ),
         "data_description": ToolParameter(
             name="data_description",
             type="string",
             required=True,
-            description="Description of the data to generate (columns, rows, content type)"
+            description="What the table holds: its columns and the kind of rows, e.g. 'name, country and founding year of European football clubs'."
         ),
         "include_headers": ToolParameter(
             name="include_headers",
             type="bool",
             required=False,
-            description="Whether to include column headers",
+            description="true (default): the first row names the columns. false: data rows only.",
             default=True
         ),
         "row_count": ToolParameter(
             name="row_count",
             type="int",
             required=False,
-            description="Number of data rows to generate",
+            minimum=1,
+            description="Data rows to ask the model for (default 10). An instruction, not enforced: the result reports how many it wrote.",
             default=10
         )
     }
@@ -510,14 +681,63 @@ class CSVGeneratorTool(BaseTool):
             self._llm = get_default_llm()
         return self._llm
 
+    @staticmethod
+    def _target(output_dir: str, filename: Any) -> Tuple[str, str]:
+        """(absolute path, name relative to the csv folder) for a requested file
+        name. Raises ValueError with the reason when the name cannot be used.
+        Creates nothing, so a refused name costs no model call and leaves no folder."""
+        name = str(filename or "").strip().replace("\\", "/")
+        if not name:
+            raise ValueError("filename is required, e.g. 'fruit-prices.csv'")
+        relative = PurePosixPath(name)
+        if relative.is_absolute() or name.endswith("/") or any(
+            part in ("", ".", "..") for part in relative.parts
+        ):
+            raise ValueError(
+                f"filename must be a file name or a relative path inside the csv outputs "
+                f"folder, without '.' or '..' parts, not '{name}'"
+            )
+        if relative.name.startswith("."):
+            raise ValueError(f"filename must not start with a dot: '{relative.name}'")
+        if not relative.suffix:
+            relative = relative.with_name(relative.name + ".csv")
+        elif relative.suffix.lower() != ".csv":
+            raise ValueError(
+                f"generate_csv writes CSV; give a name ending in .csv, not '{relative.suffix}'"
+            )
+        root = Path(output_dir).resolve()
+        try:
+            target = Path(safe_join(str(root), *relative.parts)).resolve()
+            target.relative_to(root)
+        except ValueError:
+            raise ValueError(f"filename leaves the csv outputs folder: '{name}'")
+        if target.is_dir():
+            raise ValueError(f"'{relative}' is a folder in the csv outputs folder, not a file")
+        return str(target), str(relative)
+
     def execute(self, **kwargs) -> ToolResult:
         """Generate CSV file"""
-        filename = kwargs.get("filename")
-        data_description = kwargs.get("data_description")
+        data_description = str(kwargs.get("data_description") or "").strip()
         include_headers = kwargs.get("include_headers", True)
-        row_count = kwargs.get("row_count", 10)
+        if isinstance(include_headers, str):
+            include_headers = include_headers.strip().lower() not in ("false", "no", "0", "off")
+        asked = kwargs.get("row_count")
+        try:
+            row_count = 10 if asked is None else int(asked)
+        except (TypeError, ValueError):
+            return ToolResult(success=False, error="row_count must be a whole number of 1 or more")
+        if row_count < 1:
+            return ToolResult(success=False, error="row_count must be 1 or more")
+        if not data_description:
+            return ToolResult(success=False, error="data_description is required: say what the table holds")
 
         try:
+            from backend.config import OUTPUT_DIR
+            try:
+                output_path, filename = self._target(os.path.join(OUTPUT_DIR, "csv"), kwargs.get("filename"))
+            except ValueError as e:
+                return ToolResult(success=False, error=str(e))
+
             llm = self._get_llm()
 
             prompt = f"""Generate a CSV file based on these specifications.
@@ -537,53 +757,56 @@ Generate the CSV content now:"""
 
             from backend.utils.llm_service import ChatMessage, MessageRole
             messages = [ChatMessage(role=MessageRole.USER, content=prompt)]
-            response = llm.chat(messages)
+            reply = _reply_text(llm.chat(messages))
+            if not reply:
+                return ToolResult(
+                    success=False,
+                    error="The model returned an empty reply, so no CSV was written. Try again.",
+                )
 
-            if response.message:
-                try:
-                    csv_content = str(response.message.content).strip()
-                except (ValueError, AttributeError):
-                    blocks = getattr(response.message, 'blocks', [])
-                    csv_content = next((getattr(b, 'text', str(b)) for b in blocks if getattr(b, 'text', None)), "")
-                    csv_content = csv_content.strip()
-            else:
-                csv_content = ""
+            rows, column_count, problem = _csv_table(reply)
+            if not problem and include_headers and len(rows) < 2:
+                problem = "it holds a single row, where a header and at least one data row are needed"
+            if problem:
+                return ToolResult(
+                    success=False,
+                    error=(
+                        f"The model's reply is not a usable CSV table: {problem}. Nothing was "
+                        f"written. Its reply began: {reply[:200]!r}"
+                    ),
+                )
 
-            # Clean up
-            if csv_content.startswith("```"):
-                lines = csv_content.split('\n')
-                if lines[0].startswith("```"):
-                    lines = lines[1:]
-                if lines and lines[-1].strip() == "```":
-                    lines = lines[:-1]
-                csv_content = '\n'.join(lines)
-
-            # Save to disk
-            from backend.config import OUTPUT_DIR
-            output_dir = os.path.join(OUTPUT_DIR, "csv")
-            os.makedirs(output_dir, exist_ok=True)
-            try:
-                output_path = safe_join(output_dir, filename)
-            except ValueError:
-                return ToolResult(success=False, error=f"Invalid filename: {filename}")
-
-            with open(output_path, 'w', encoding='utf-8') as f:
+            # Written from the parsed rows, not the reply text, so quoting is the
+            # csv module's and the file holds the table and nothing else.
+            buffer = io.StringIO()
+            csv.writer(buffer, lineterminator="\n").writerows(rows)
+            csv_content = buffer.getvalue()
+            os.makedirs(os.path.dirname(output_path), exist_ok=True)
+            with open(output_path, 'w', encoding='utf-8', newline='') as f:
                 f.write(csv_content)
 
-            # Count rows
-            row_count_actual = len([l for l in csv_content.split('\n') if l.strip()])
+            data_rows = len(rows) - (1 if include_headers else 0)
+            output = {
+                "output_path": output_path,
+                "filename": filename,
+                "row_count": data_rows,
+                "rows_requested": row_count,
+                "column_count": column_count,
+                "content_preview": csv_content[:500] + "..." if len(csv_content) > 500 else csv_content
+            }
+            if include_headers:
+                output["columns"] = rows[0]
+            if data_rows != row_count:
+                output["note"] = f"The model wrote {data_rows} data row(s), not the {row_count} asked for."
 
             return ToolResult(
                 success=True,
-                output={
-                    "output_path": output_path,
-                    "filename": filename,
-                    "row_count": row_count_actual,
-                    "content_preview": csv_content[:500] + "..." if len(csv_content) > 500 else csv_content
-                },
+                output=output,
                 metadata={
                     "filename": filename,
-                    "rows_generated": row_count_actual,
+                    "rows_generated": data_rows,
+                    "rows_requested": row_count,
+                    "columns": column_count,
                     "has_headers": include_headers
                 }
             )

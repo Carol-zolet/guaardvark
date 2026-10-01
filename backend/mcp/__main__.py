@@ -131,6 +131,13 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _refuse_to_start(reason: Exception) -> int:
+    """Say on stderr why no server was started. stdout stays empty: it is the
+    JSON-RPC pipe, and a client shows the server's stderr in its MCP log."""
+    print(f"guaardvark mcp: {reason}", file=sys.stderr)
+    return 1
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
@@ -142,8 +149,11 @@ def main(argv: list[str] | None = None) -> int:
         # Import + tool registry boot are loud — quarantine them from stdout
         # so the JSON-RPC pipe stays clean when Claude Desktop pipes us in.
         with _stdout_to_stderr():
-            from backend.mcp.server import build_server, run_stdio
-            prebuilt = build_server()
+            from backend.mcp.server import MCPServerDisabled, build_server, run_stdio
+            try:
+                prebuilt = build_server()
+            except MCPServerDisabled as exc:
+                return _refuse_to_start(exc)
         try:
             asyncio.run(run_stdio(prebuilt=prebuilt))
         except KeyboardInterrupt:
@@ -152,8 +162,11 @@ def main(argv: list[str] | None = None) -> int:
 
     if cmd == "http":
         with _stdout_to_stderr():
-            from backend.mcp.server import build_server, run_http
-            prebuilt = build_server()
+            from backend.mcp.server import MCPServerDisabled, build_server, run_http
+            try:
+                prebuilt = build_server()
+            except MCPServerDisabled as exc:
+                return _refuse_to_start(exc)
         try:
             run_http(host=args.host, port=args.port, prebuilt=prebuilt)
         except KeyboardInterrupt:

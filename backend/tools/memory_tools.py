@@ -143,8 +143,11 @@ class SearchMemoryTool(BaseTool):
     name = "search_memory"
     read_only = True
     description = (
-        "Look up entries in Guaardvark's long-term memory (facts, preferences, notes and lessons saved "
-        "with save_memory or in the app). An entry matches when its content or tags contain any of the "
+        "Look up entries in Guaardvark's long-term memory: facts, preferences and notes saved with "
+        "save_memory or in the app, and the entries Guaardvark keeps itself, which are lessons "
+        "(returned as their stored JSON, a title and steps), lesson summaries, snippets and the "
+        "screen agent's 'belief_update' observations. Every type is searched and each line shows "
+        "its type. An entry matches when its content or tags contain any of the "
         "first eight query words that has three or more characters (case-insensitive text, not "
         "semantic); results are ranked by "
         "importance, match, source trust, confidence and recency. Returns lines "

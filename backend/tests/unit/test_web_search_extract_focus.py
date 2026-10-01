@@ -12,17 +12,19 @@ SPEC = "The model K20 bracket kit fits frames up to 48 inches and needs four M6 
 HTML = f"<html><head><title>K20 bracket kit</title></head><body><div>{MENU}</div><p>{SPEC}</p></body></html>"
 
 
-class _Page:
-    content = HTML.encode("utf-8")
-    url = "https://example.com/k20"
-
-    def raise_for_status(self):
-        return None
+def _page():
+    response = web_search_api.requests.Response()
+    response.status_code = 200
+    response.url = "https://example.com/k20"
+    response.headers["Content-Type"] = "text/html; charset=utf-8"
+    response._content = HTML.encode("utf-8")
+    response._content_consumed = True
+    return response
 
 
 @pytest.fixture
 def page(monkeypatch):
-    monkeypatch.setattr(web_search_api.requests.Session, "get", lambda *args, **kwargs: _Page())
+    monkeypatch.setattr(web_search_api.requests.Session, "get", lambda *args, **kwargs: _page())
 
 
 def test_without_a_query_the_content_is_the_head_of_the_page(page):

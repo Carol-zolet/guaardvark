@@ -49,23 +49,43 @@ class BackendResponse:
     data: Any
 
 
+def _checkout_env_value(key: str, env_file: Optional[Path] = None) -> str:
+    """``key`` from this checkout's ``.env`` (last line wins), or ""."""
+    env_file = env_file or Path(__file__).resolve().parents[2] / ".env"
+    value = ""
+    try:
+        for line in env_file.read_text().splitlines():
+            if line.startswith(f"{key}="):
+                value = line.split("=", 1)[1].strip().strip("'\"")
+    except OSError:
+        pass
+    return value
+
+
 def backend_base_url() -> str:
     """Where the backend answers HTTP. ``GUAARDVARK_URL`` wins; otherwise the
     port ``start.sh`` recorded in ``.env`` (macOS writes 5055); otherwise 5000."""
     url = (os.environ.get("GUAARDVARK_URL") or "").strip()
     if url:
         return url.rstrip("/")
-    port = (os.environ.get("FLASK_PORT") or "").strip()
-    if not port:
-        env_file = Path(__file__).resolve().parents[2] / ".env"
-        try:
-            for line in env_file.read_text().splitlines():
-                if line.startswith("FLASK_PORT="):
-                    port = line.split("=", 1)[1].strip().strip("'\"")
-                    break
-        except OSError:
-            pass
+    port = (os.environ.get("FLASK_PORT") or "").strip() or _checkout_env_value("FLASK_PORT")
     return f"http://127.0.0.1:{port or '5000'}"
+
+
+def backend_api_key() -> str:
+    """The API key to send, or "".
+
+    For this checkout's own backend (no ``GUAARDVARK_URL``), the key in its
+    ``.env`` comes first and is read on every call: that is the key the backend
+    runs with, and Settings → API key rewrites it, so a key created or replaced
+    there works here without restarting the MCP client. Otherwise, and when
+    ``.env`` has none, ``GUAARDVARK_API_KEY`` from this process's environment.
+    """
+    if not (os.environ.get("GUAARDVARK_URL") or "").strip():
+        saved = _checkout_env_value("GUAARDVARK_API_KEY")
+        if saved:
+            return saved
+    return (os.environ.get("GUAARDVARK_API_KEY") or "").strip()
 
 
 def in_mcp_process() -> bool:
@@ -141,7 +161,7 @@ def request_json(
 
     base = backend_base_url()
     send_headers = dict(headers or {})
-    api_key = (os.environ.get("GUAARDVARK_API_KEY") or "").strip()
+    api_key = backend_api_key()
     if api_key:
         send_headers[API_KEY_HEADER] = api_key
 
@@ -175,7 +195,10 @@ def request_json(
         message = _error_message(body, (resp.text or "").strip()[:200] or f"HTTP {resp.status_code}")
         if resp.status_code in (401, 403):
             kind = "auth"
-            message += " (the backend requires GUAARDVARK_API_KEY in this client's environment)"
+            message += (
+                " (the backend needs its API key: set GUAARDVARK_API_KEY in this client's"
+                " environment, or in the .env of the Guaardvark checkout it runs from)"
+            )
         elif resp.status_code == 503:
             kind = "plugin_offline"
             message += " (start the plugin from the Studio Plugins page or POST /api/plugins/<id>/start)"

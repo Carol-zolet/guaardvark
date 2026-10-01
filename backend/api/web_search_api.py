@@ -5,27 +5,40 @@ import re
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any, List
 import requests
-from urllib.parse import quote_plus, urlparse, parse_qs
+from urllib.parse import quote_plus, urlsplit
 from bs4 import BeautifulSoup
+from xml.etree import ElementTree as ET
 
 from flask import Blueprint, current_app, jsonify, request
 from backend.utils.response_utils import success_response, error_response
 from backend.utils.settings_utils import get_web_access
 from backend.utils.safe_math import evaluate_arithmetic
+from backend.utils.hosts import no_netrc_session
 from backend.utils.text_focus import focus_window
+from backend.utils.web_fetch import (
+    LOCAL_FILE_ADVICE, FetchFailed, FetchRefused, decode_page, fetch_page,
+)
+from backend.utils.web_search_sources import (
+    DEFAULT_SEARCH_RESULTS, MAX_SEARCH_RESULTS, SEARCH_ENGINE, WEATHER_SOURCE,
+)
 
 web_search_bp = Blueprint("web_search_api", __name__, url_prefix="/api/web-search")
 logger = logging.getLogger(__name__)
 
-MAX_REDIRECTS = 5
+_NOT_A_WEB_URL = f"Refused: only http and https URLs can be fetched. {LOCAL_FILE_ADVICE}"
 
 
 def extract_website_content(url: str, query: Optional[str] = None, public_only: bool = False) -> Dict[str, Any]:
     """Fetch a page and return its title, description and up to 2,000 characters of its text.
 
     ``public_only`` refuses any address that is not globally routable, on every
-    redirect hop (the fetch_url and analyze_website tools ask for it). Logins
-    saved in ~/.netrc are never sent, with or without it.
+    redirect hop; every fetch of a URL a caller or a model chose asks for it
+    (fetch_url, analyze_website, a URL in a web search, a competitor page).
+    Logins saved in ~/.netrc are never sent, with or without it.
+
+    The fetch is bounded in size and time (:mod:`backend.utils.web_fetch`). A
+    page that was read only in part is still returned, with ``page_cut`` saying
+    what was left out; the key is absent for a page read in full.
 
     With ``query`` the text is the stretch of the page about the query
     (:func:`backend.utils.text_focus.focus_window`); without it, the head of the page.
@@ -34,7 +47,7 @@ def extract_website_content(url: str, query: Optional[str] = None, public_only: 
         url = url.strip()
         scheme = re.match(r"^([A-Za-z][A-Za-z0-9+.-]*)://", url)
         if scheme and scheme.group(1).lower() not in ("http", "https"):
-            return {"success": False, "url": url, "error": "Refused: only http and https URLs can be fetched"}
+            return {"success": False, "url": url, "error": _NOT_A_WEB_URL}
         if scheme:
             url = scheme.group(1).lower() + url[len(scheme.group(1)):]
         else:
@@ -44,46 +57,15 @@ def extract_website_content(url: str, query: Optional[str] = None, public_only: 
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
         }
 
-        current = url
-        if public_only:
-            # Redirects are followed one hop at a time so every hop is checked: a
-            # public page must not be able to bounce the fetch onto this machine.
-            from urllib.parse import urljoin
-            from backend.utils.hosts import (
-                PrivateAddressError, private_address_reason, public_only_session,
-            )
-            with public_only_session() as session:
-                for _hop in range(MAX_REDIRECTS + 1):
-                    refused = private_address_reason(current)
-                    if refused:
-                        return {"success": False, "url": url, "error": f"Refused to fetch {current}: {refused}"}
-                    try:
-                        response = session.get(current, headers=headers, timeout=15, allow_redirects=False)
-                    except requests.exceptions.ConnectionError as e:
-                        # The connect-time check: the name resolved differently from
-                        # the check above, or requests decoded the host differently.
-                        reason = getattr(e.args[0], "reason", None) if e.args else None
-                        if isinstance(reason, PrivateAddressError):
-                            return {"success": False, "url": url,
-                                    "error": f"Refused to fetch {current}: {reason.host_name} resolves "
-                                             f"to a private or local address ({reason.address})"}
-                        raise
-                    location = session.get_redirect_target(response)
-                    if location:
-                        current = urljoin(current, location)
-                        continue
-                    break
-                else:
-                    return {"success": False, "url": url, "error": f"Too many redirects (more than {MAX_REDIRECTS})"}
-        else:
-            from backend.utils.hosts import no_netrc_session
-            with no_netrc_session() as session:
-                response = session.get(url, headers=headers, timeout=15, allow_redirects=True)
-            current = response.url
-        response.raise_for_status()
-        
-        soup = BeautifulSoup(response.content, 'html.parser', from_encoding='utf-8')
-        
+        try:
+            page = fetch_page(url, headers=headers, public_only=public_only)
+        except (FetchRefused, FetchFailed) as e:
+            return {"success": False, "url": url, "error": str(e)}
+        current = page.url
+
+        text, _encoding = decode_page(page.body, page.charset, complete=page.cut is None)
+        soup = BeautifulSoup(text, 'html.parser')
+
         for script in soup(["script", "style", "nav", "footer", "aside"]):
             script.decompose()
         
@@ -113,7 +95,7 @@ def extract_website_content(url: str, query: Optional[str] = None, public_only: 
         page_word_count = len(content_text.split())
         content_text = focus_window(content_text, query, 2000) if query else content_text[:2000]
         
-        return {
+        result = {
             "success": True,
             "url": url,
             "final_url": current,
@@ -123,7 +105,10 @@ def extract_website_content(url: str, query: Optional[str] = None, public_only: 
             "content_length": len(content_text),
             "page_word_count": page_word_count,
         }
-        
+        if page.cut:
+            result["page_cut"] = page.cut
+        return result
+
     except requests.RequestException as e:
         logger.error(f"Website scraping failed for {url}: {e}")
         return {
@@ -139,6 +124,130 @@ def extract_website_content(url: str, query: Optional[str] = None, public_only: 
             "error": f"Failed to extract content: {str(e)}"
         }
 
+# Entries a sitemap report lists by name; its counts cover every entry read.
+SITEMAP_LISTED_ENTRIES = 20
+# Top-level pages (one path segment) a sitemap report names as landing pages.
+SITEMAP_LANDING_PAGES = 5
+
+
+def _local_name(tag: str) -> str:
+    return tag.rsplit("}", 1)[-1] if isinstance(tag, str) else ""
+
+
+def _sitemap_entries(body: bytes):
+    """Parse a sitemap body as far as it is well-formed.
+
+    Returns ``(kind, entries, stopped)``: kind is the root element's name
+    ("urlset" or "sitemapindex"), or None when the body is not a sitemap;
+    entries are dicts of the child elements of each <url> or <sitemap>; stopped
+    is None, or the parse error that ended reading early (a body cut at the size
+    limit ends that way).
+    """
+    parser = ET.XMLPullParser(events=("start", "end"))
+    kind = None
+    entry_name = None
+    entries = []
+    stopped = None
+    try:
+        parser.feed(body)
+        parser.close()
+    except ET.ParseError as e:
+        stopped = e
+    try:
+        for event, element in parser.read_events():
+            name = _local_name(element.tag)
+            if event == "start":
+                if kind is None:
+                    kind = name
+                    if kind not in ("urlset", "sitemapindex"):
+                        return None, [], None
+                    entry_name = "url" if kind == "urlset" else "sitemap"
+                continue
+            if name == entry_name:
+                entry = {}
+                for child in element:
+                    field = _local_name(child.tag)
+                    if field in ("loc", "lastmod", "changefreq", "priority") and child.text:
+                        entry[field] = child.text.strip()
+                if entry.get("loc"):
+                    entries.append(entry)
+                element.clear()
+    except ET.ParseError as e:
+        stopped = stopped or e
+    return kind, entries, stopped
+
+
+def _path_depth(url: str) -> int:
+    return len([part for part in urlsplit(url).path.split("/") if part])
+
+
+def read_sitemap(url: str) -> Dict[str, Any]:
+    """Fetch one sitemap and summarise it: its kind (a list of pages, or an
+    index of other sitemaps), how many entries it has, the first
+    ``SITEMAP_LISTED_ENTRIES`` of them, and for a list of pages, how many sit at
+    each path depth and which top-level pages it gives a priority above 0.5.
+
+    The fetch is the one fetch_url makes: public addresses only, on every
+    redirect; no ~/.netrc logins; bounded in size and time. The sitemaps an
+    index names are listed, not fetched. A sitemap cut at the size limit is
+    read up to the cut, and ``page_cut`` says so.
+    """
+    url = (url or "").strip()
+    scheme = re.match(r"^([A-Za-z][A-Za-z0-9+.-]*)://", url)
+    if scheme and scheme.group(1).lower() not in ("http", "https"):
+        return {"success": False, "url": url, "error": _NOT_A_WEB_URL}
+    if not scheme:
+        url = "https://" + url
+
+    try:
+        page = fetch_page(url, headers={"User-Agent": "Guaardvark-Sitemap/1.0"}, public_only=True)
+    except (FetchRefused, FetchFailed) as e:
+        return {"success": False, "url": url, "error": str(e)}
+    except requests.RequestException as e:
+        return {"success": False, "url": url, "error": f"Failed to access the sitemap: {e}"}
+
+    kind, entries, stopped = _sitemap_entries(page.body)
+    if kind is None:
+        return {
+            "success": False,
+            "url": url,
+            "error": (f"Not a sitemap: {page.url} is not a sitemap XML document "
+                      "(its root element is not <urlset> or <sitemapindex>)."),
+        }
+
+    report: Dict[str, Any] = {
+        "success": True,
+        "url": url,
+        "final_url": page.url,
+        "type": kind,
+        "total": len(entries),
+        "entries": entries[:SITEMAP_LISTED_ENTRIES],
+    }
+    if kind == "urlset":
+        by_depth: Dict[int, int] = {}
+        landing_pages = []
+        for entry in entries:
+            depth = _path_depth(entry["loc"])
+            by_depth[depth] = by_depth.get(depth, 0) + 1
+            try:
+                priority = float(entry.get("priority") or 0)
+            except ValueError:
+                priority = 0.0
+            if depth == 1 and priority > 0.5 and len(landing_pages) < SITEMAP_LANDING_PAGES:
+                landing_pages.append(entry)
+        report["by_depth"] = dict(sorted(by_depth.items()))
+        report["landing_pages"] = landing_pages
+    if page.cut:
+        report["page_cut"] = page.cut
+    elif stopped is not None:
+        read = f"{len(entries)} entry" if len(entries) == 1 else f"{len(entries)} entries"
+        report["incomplete"] = (
+            f"The sitemap stops being well-formed XML after {read} ({stopped}); "
+            "the counts cover only those."
+        )
+    return report
+
+
 def get_weather_info(location: str) -> Dict[str, Any]:
     try:
         
@@ -149,8 +258,9 @@ def get_weather_info(location: str) -> Dict[str, Any]:
         for api_url in weather_apis:
             try:
                 headers = {'User-Agent': 'Guaardvark-Weather/1.0'}
-                response = requests.get(api_url, headers=headers, timeout=10)
-                
+                with no_netrc_session() as session:
+                    response = session.get(api_url, headers=headers, timeout=10)
+
                 if response.ok:
                     data = response.json()
                     
@@ -168,7 +278,7 @@ def get_weather_info(location: str) -> Dict[str, Any]:
                             "temperature_fahrenheit": temp_f,
                             "description": weather_desc,
                             "humidity": humidity,
-                            "source": "wttr.in"
+                            "source": WEATHER_SOURCE
                         }
                         
             except Exception as e:
@@ -189,10 +299,14 @@ def get_weather_info(location: str) -> Dict[str, Any]:
             "error": f"Weather service error: {str(e)}"
         }
 
-def enhanced_web_search(query: str, public_only: bool = False) -> Dict[str, Any]:
-    """Answer ``query`` from the web. A URL in the query is fetched directly;
-    ``public_only`` refuses that fetch for addresses that are not globally
-    routable, as fetch_url does."""
+def enhanced_web_search(query: str, max_results: int = DEFAULT_SEARCH_RESULTS) -> Dict[str, Any]:
+    """Answer ``query`` from the web. A URL in the query is fetched directly,
+    and only from a public address, on every redirect, exactly as fetch_url
+    fetches: the query can come from a model or from a page it read, on any
+    path (chat and MCP tools, the web-search routes, /websearch, research tasks,
+    the outreach recon). ``max_results`` is how many search results to ask for
+    (1 to ``MAX_SEARCH_RESULTS``). ``data["source"]`` names the service that
+    answered."""
 
     results = {
         "query": query,
@@ -213,10 +327,12 @@ def enhanced_web_search(query: str, public_only: bool = False) -> Dict[str, Any]
             url = 'https://' + url
             
         logger.info(f"Direct website access for: {url}")
-        website_data = extract_website_content(url, public_only=public_only)
-        if not website_data["success"] and str(website_data.get("error", "")).startswith("Refused"):
-            # A refused address ends the call: searching the web for the URL's text
-            # would answer a question nobody asked.
+        website_data = extract_website_content(url, public_only=True)
+        if not website_data["success"] and str(website_data.get("error", "")).startswith(
+                ("Refused", "Not a web page")):
+            # A refused address, or a URL that serves a file instead of a page,
+            # ends the call: searching the web for the URL's text would answer a
+            # question nobody asked, and would send the query to the search engine.
             results["error"] = website_data["error"]
             results["data"] = {"message": website_data["error"]}
             return results
@@ -234,36 +350,48 @@ def enhanced_web_search(query: str, public_only: bool = False) -> Dict[str, Any]
                     "snippet": f"Website: {website_data['title']}\n\nDescription: {website_data['description']}\n\nContent: {website_data['content'][:500]}..."
                 }
             })
+            if website_data.get("page_cut"):
+                results["data"]["page_cut"] = website_data["page_cut"]
             return results
         else:
             results["data"]["website_error"] = website_data["error"]
     
-    logger.info(f"Performing DuckDuckGo search for: {query}")
-    ddg_results = perform_duckduckgo_search(query)
-    
-    if ddg_results["success"]:
+    logger.info(f"Performing web search for: {query}")
+    search = perform_duckduckgo_search(query, max_results=max_results)
+
+    # strategy_used "duckduckgo_search" is named after the client package and
+    # is matched on by callers; data["source"] is what names the engine.
+    if search["success"]:
         results.update({
             "strategy_used": "duckduckgo_search",
             "success": True,
             "data": {
                 "type": "search_results",
-                "results": ddg_results["results"],
-                "snippet": ddg_results["snippet"],
-                "total_results": ddg_results["total_results"],
-                "source": "DuckDuckGo"
+                "results": search["results"],
+                "snippet": search["snippet"],
+                "total_results": search["total_results"],
+                "source": search.get("source") or SEARCH_ENGINE
             }
         })
         return results
-    
-    results["data"]["duckduckgo_error"] = ddg_results.get("error", "Unknown error")
+
+    # No results and a failed search both end here, with the engine's own
+    # answer as the message: "no_results" when it found nothing,
+    # "search_failed" when it could not be asked.
+    message = search.get("error") or f"The search could not be completed at {SEARCH_ENGINE}."
+    website_error = results["data"].get("website_error")
+    if website_error:
+        message = f"Could not read {url}: {str(website_error).rstrip('.')}. {message}"
     return {
         "query": query,
         "strategy_used": "failed",
         "success": False,
+        "error": message,
         "data": {
-            "type": "search_failed",
-            "message": f"Unable to find current information for: {query}",
-            "errors": results["data"],
+            "type": "no_results" if search.get("no_results") else "search_failed",
+            "message": message,
+            "source": SEARCH_ENGINE,
+            "errors": {**results["data"], "search_error": search.get("error")},
             "attempted_strategies": ["duckduckgo_search"] + (["direct_website"] if urls else [])
         }
     }
@@ -454,7 +582,7 @@ def handle_special_queries(query: str) -> Dict[str, Any]:
                         "description": description,
                         "humidity": humidity,
                         "snippet": snippet,
-                        "source": "Weather API"
+                        "source": weather_result.get("source") or WEATHER_SOURCE
                     }
                 }
             logger.warning(f"Weather lookup failed for {location}: {weather_result.get('error', 'Unknown error')}")
@@ -487,104 +615,124 @@ def handle_special_queries(query: str) -> Dict[str, Any]:
     }
 
 
-def perform_duckduckgo_search(query: str) -> Dict[str, Any]:
+def search_result_count(value: Any) -> int:
+    """``value`` as a number of results to ask for, within 1..MAX_SEARCH_RESULTS."""
+    try:
+        count = int(value)
+    except (TypeError, ValueError):
+        return DEFAULT_SEARCH_RESULTS
+    return max(1, min(count, MAX_SEARCH_RESULTS))
+
+
+# A search that fails or comes back empty is asked once more, with a new
+# client; one the engine refused is not. With the pinned client every attempt
+# goes to SEARCH_ENGINE (see backend/utils/web_search_sources.py).
+_SEARCH_ATTEMPTS = 2
+
+
+def _search_failure(exc: BaseException) -> tuple[str, bool]:
+    """Why asking the search engine failed, in words a person or a model can act
+    on, and whether the engine refused the search (so asking again at once is
+    pointless).
+
+    The client wraps the error of its last backend in a plain
+    DuckDuckGoSearchException, so the original exception is looked for in its
+    arguments.
+    """
+    inner = exc.args[0] if exc.args and isinstance(exc.args[0], BaseException) else exc
+    text = str(inner)
+    try:
+        from duckduckgo_search.exceptions import RatelimitException, TimeoutException
+    except ImportError:
+        RatelimitException = TimeoutException = ()
+    # The client reports every refusal status (403, 429 and a few others) as
+    # "<url> <status> Ratelimit".
+    refused = re.search(r"\b(\d{3}) Ratelimit\b", text)
+    if refused or isinstance(inner, RatelimitException):
+        status = f" (HTTP {refused.group(1)})" if refused else ""
+        return (f"{SEARCH_ENGINE} refused the search{status}; it limits automated searches. "
+                "Try again in a few minutes."), True
+    if isinstance(inner, TimeoutException):
+        return f"{SEARCH_ENGINE} did not answer in time.", False
+    if " return None." in text:
+        # Any other status that is not 200, a server error say; the client's
+        # message repeats the query and not the status, so it is not passed on.
+        return f"{SEARCH_ENGINE} answered the search with an error.", False
+    return f"The search could not be completed at {SEARCH_ENGINE}: {text[:300]}", False
+
+
+def perform_duckduckgo_search(query: str, max_results: int = DEFAULT_SEARCH_RESULTS) -> Dict[str, Any]:
+    """Search SEARCH_ENGINE for ``query``. The name is the client package's
+    (duckduckgo-search), not the engine's; see web_search_sources.py.
+
+    ``success`` is True when the engine returned results. Otherwise ``error``
+    says why there are none: ``no_results`` is True when the engine answered
+    with nothing, and absent when it could not be asked (refused, timed out,
+    unreachable, or the client is not installed). The query goes nowhere else
+    either way. ``source`` names the engine.
+    """
+    max_results = search_result_count(max_results)
     try:
         from duckduckgo_search import DDGS
+    except ImportError:
+        return {
+            "success": False,
+            "error": "Web search is not available: the duckduckgo-search package is not installed.",
+            "results": [],
+            "snippet": "",
+            "source": SEARCH_ENGINE,
+        }
 
-        results = []
-        search_snippets = []
-        last_error = None
-        for backend in ("lite", "html"):
-            try:
-                with DDGS() as ddgs:
-                    search_rows = ddgs.text(query, backend=backend, max_results=5)
+    results = []
+    search_snippets = []
+    answered_empty = False
+    failure = None
+    for _attempt in range(_SEARCH_ATTEMPTS):
+        try:
+            with DDGS() as ddgs:
+                search_rows = ddgs.text(query, max_results=max_results) or []
+        except Exception as search_error:
+            failure, refused = _search_failure(search_error)
+            logger.warning(f"Web search ({SEARCH_ENGINE}) failed: {search_error}")
+            if refused:
+                break
+            continue
 
-                for row in search_rows:
-                    title = (row.get("title") or "").strip()
-                    url = row.get("href", "")
-                    snippet = (row.get("body") or row.get("snippet") or "").strip()
+        for row in search_rows:
+            title = (row.get("title") or "").strip()
+            url = row.get("href", "")
+            snippet = (row.get("body") or row.get("snippet") or "").strip()
 
-                    if title and (url or snippet):
-                        results.append({
-                            "title": title,
-                            "url": url,
-                            "snippet": snippet[:300]
-                        })
-                        if snippet:
-                            search_snippets.append(f"{title}: {snippet[:200]}")
-
-                if results:
-                    break
-            except Exception as backend_error:
-                last_error = str(backend_error)
-                logger.warning(f"DuckDuckGo {backend} backend failed: {backend_error}")
-                continue
-
-        if not results:
-            try:
-                proxy_url = f"https://r.jina.ai/http://lite.duckduckgo.com/lite/?q={quote_plus(query)}"
-                headers = {"User-Agent": "guaardvark-web-search/1.0"}
-                resp = requests.get(proxy_url, headers=headers, timeout=10)
-                resp.raise_for_status()
-
-                lines = resp.text.splitlines()
-                for idx, line in enumerate(lines):
-                    match = re.match(r"\d+\.\[(.+?)\]\((.+?)\)", line.strip())
-                    if not match:
-                        continue
-
-                    title = match.group(1).strip()
-                    url = match.group(2).strip()
-
-                    parsed = urlparse(url)
-                    query_params = parse_qs(parsed.query)
-                    uddg_target = query_params.get("uddg", [])
-                    if uddg_target:
-                        url = uddg_target[0]
-
-                    snippet = ""
-                    if idx + 1 < len(lines):
-                        candidate = lines[idx + 1].strip()
-                        if candidate and not candidate.startswith("Markdown Content"):
-                            snippet = candidate[:300]
-
-                    results.append({
-                        "title": title,
-                        "url": url,
-                        "snippet": snippet
-                    })
-                    if snippet:
-                        search_snippets.append(f"{title}: {snippet}")
-                    if len(results) >= 5:
-                        break
-            except Exception as proxy_error:
-                last_error = last_error or str(proxy_error)
-                logger.warning(f"DuckDuckGo proxy fallback failed: {proxy_error}")
+            if title and (url or snippet):
+                results.append({
+                    "title": title,
+                    "url": url,
+                    "snippet": snippet[:300]
+                })
+                if snippet:
+                    search_snippets.append(f"{title}: {snippet[:200]}")
 
         if results:
-            combined_snippet = "\n\n".join(search_snippets[:3]) if search_snippets else ""
-            return {
-                "success": True,
-                "results": results,
-                "snippet": f"Search results for '{query}':\n\n{combined_snippet}",
-                "total_results": len(results)
-            }
+            break
+        answered_empty = True
 
+    if results:
+        combined_snippet = "\n\n".join(search_snippets[:3]) if search_snippets else ""
         return {
-            "success": False,
-            "error": last_error or "No search results found",
-            "results": [],
-            "snippet": ""
+            "success": True,
+            "results": results,
+            "snippet": f"Search results for '{query}':\n\n{combined_snippet}",
+            "total_results": len(results),
+            "source": SEARCH_ENGINE,
         }
 
-    except Exception as e:
-        logger.error(f"DuckDuckGo search failed: {e}")
-        return {
-            "success": False,
-            "error": f"DuckDuckGo search error: {str(e)}",
-            "results": [],
-            "snippet": ""
-        }
+    outcome = {"success": False, "results": [], "snippet": "", "source": SEARCH_ENGINE}
+    if answered_empty:
+        outcome["no_results"] = True
+        outcome["error"] = f"{SEARCH_ENGINE} returned no results for this query."
+    else:
+        outcome["error"] = failure or f"The search could not be completed at {SEARCH_ENGINE}."
+    return outcome
 
 @web_search_bp.route("/quick-search", methods=["POST"])
 def quick_search():
@@ -663,14 +811,38 @@ def web_search():
         logger.error(f"Error in enhanced web search: {e}", exc_info=True)
         return error_response(f"Search failed: {str(e)}", status_code=500)
 
+@web_search_bp.route("/sitemap", methods=["POST"])
+def sitemap_report():
+    """Summarise one sitemap (the chat's ``/websearch sitemap:<url>``); see read_sitemap."""
+    try:
+        if not get_web_access():
+            return error_response("Web access is disabled in system settings", status_code=403)
+
+        data = request.get_json(silent=True) or {}
+        url = str(data.get("url") or "").strip()
+        if not url:
+            return error_response("A sitemap URL is required", status_code=400)
+
+        report = read_sitemap(url)
+        if not report["success"]:
+            return error_response(report["error"], status_code=422, error_code="SITEMAP_NOT_READ",
+                                  data={"url": report["url"]})
+        return success_response(report)
+
+    except Exception as e:
+        logger.error(f"Error reading sitemap: {e}", exc_info=True)
+        return error_response(f"Reading the sitemap failed: {str(e)}", status_code=500)
+
 @web_search_bp.route("/status", methods=["GET"])
 def search_status():
     try:
         web_enabled = get_web_access()
 
         # Probe the REAL building blocks — import + callable only, NO network I/O
-        # (a status poll must never hammer DuckDuckGo / weather APIs; see SSRF/DOS
-        # trap). Each of these is a module-level function in this file.
+        # (a status poll must never hammer the search engine or the weather
+        # service; see SSRF/DOS trap). Each of these is a module-level function
+        # in this file. The "duckduckgo_search" keys are named after the client
+        # package and kept for callers that read them.
         probes = {
             "website_scraping": callable(globals().get("extract_website_content")),
             "duckduckgo_search": callable(globals().get("perform_duckduckgo_search")),
@@ -713,7 +885,11 @@ def search_status():
             ],
             "reliability_notes": {
                 "direct_website": "Reliable for specific URLs",
-                "duckduckgo_search": "Primary general search provider"
+                "duckduckgo_search": (
+                    f"General search: {SEARCH_ENGINE} through the duckduckgo-search client. "
+                    "When it finds nothing or cannot be reached the search says so; "
+                    "the query is not sent anywhere else"
+                )
             }
         })
         

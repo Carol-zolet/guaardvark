@@ -202,6 +202,10 @@ echo "Log: $LOG_FILE"
 #                           acts. GUAARDVARK_COMFYUI_PINNED_MEMORY=1 re-enables it.
 #   --listen 127.0.0.1      ComfyUI has no auth; every consumer is on this host.
 #                           GUAARDVARK_COMFYUI_LISTEN overrides for deliberate LAN use.
+#   --extra-model-paths-config guaardvark_model_paths.yaml: Cast Library LoRAs,
+#                           and guaardvark_nodes/, whose Host check refuses a
+#                           request addressed to a name that is not this
+#                           machine's (a page re-pointed at 127.0.0.1).
 #   --preview-method/size   ComfyUI defaults to none, so API runs emit no sampler
 #                           thumbnails. auto → Latent2RGB. Keep in lockstep with
 #                           backend/services/comfyui_launch_flags.py.

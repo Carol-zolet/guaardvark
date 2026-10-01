@@ -70,8 +70,17 @@ def _render(query: str, results: List[Dict[str, Any]], trace: Dict[str, Any]) ->
         src = meta.get("source_filename") or meta.get("file_path") or "unknown source"
         page = meta.get("page_label")
         loc = f" p.{page}" if page else ""
+        # Two numbers with different meanings. When the cross-encoder ran, its
+        # relevance score is what the ranking starts from; the retrieval (fusion)
+        # score is from the step before and does not follow the order shown.
         score = r.get("score")
-        score_s = f" (score {score:.3f})" if isinstance(score, (int, float)) else ""
+        rerank = r.get("rerank_score")
+        shown = []
+        if isinstance(rerank, (int, float)):
+            shown.append(f"rerank {rerank:.3f}")
+        if isinstance(score, (int, float)):
+            shown.append(f"retrieval {score:.3f}" if shown else f"score {score:.3f}")
+        score_s = f" ({' · '.join(shown)})" if shown else ""
         text = (r.get("text") or "").strip()
         if len(text) > _CHUNK_CHARS:
             text = text[:_CHUNK_CHARS].rstrip() + f"… [+{len(r['text']) - _CHUNK_CHARS} chars]"
@@ -92,7 +101,9 @@ class KnowledgeSearchTool(BaseTool):
     description = (
         "Search the user's indexed documents and code repositories (the local knowledge base) by "
         "meaning and keywords. Returns the top passages (the configured number, 3 on a stock install, "
-        "up to 50 via top_k), each with its filename, page when known and a retrieval score; passages "
+        "up to 50 via top_k), each with its filename, page when known and its scores: 'rerank' (the "
+        "reranker's relevance score, which the ranking starts from, shown when it ran) and "
+        "'retrieval' (the earlier search score, which does not follow the order shown); passages "
         "usually open with an index label, e.g. 'Document: <file>. Section: <path>.' for documents or "
         "'[python] File: <path>.' for code, before the source text. Once corpus "
         "summaries have been built, results can include LLM-written summaries named "

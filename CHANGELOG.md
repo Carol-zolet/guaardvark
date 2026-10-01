@@ -2,10 +2,238 @@
 
 ## Unreleased
 
+- **Starting a background task no longer hangs when Redis is down.** A request that hands work to
+  the Celery worker (indexing, a Film Crew or music video step, a training job, Cast samples, a
+  timeline render, a bulk import) waited 19 s and then failed with Celery's "The Celery application
+  must be restarted" when Redis was stopped, and for minutes when Redis's address did not answer.
+  Sending now gives up within about half a second (Redis stopped) or 7 s (no answer), and says which
+  task was not started and that Redis is not reachable. Routes answer 503 `task_queue_unreachable`.
+  Film Crew and music video steps that move a project forward answer as before, with
+  `dispatched: false` and a `warning`, and resume when Guaardvark restarts. A training export,
+  import or resume puts the job back as it was instead of marking a finished job failed; parse and
+  filter jobs are marked failed with the reason instead of sitting at pending; an indexed document
+  is marked ERROR (Resume pending indexing re-queues it) instead of staying INDEXING; Cast sample
+  runs, renders and bulk imports close their progress entry with the reason. Workers still wait for
+  Redis as long as it takes and still retry storing a result for about 20 s.
+- **The web UI says when background work did not start.** A Film Crew or music video step that
+  was saved but not queued shows its warning on that production or music video (creating it,
+  re-dispatching, confirming casting, approving, re-analyzing, re-planning, regenerating a shot);
+  casting stops at a subject whose LoRA training was not queued. Any request Redis did not take
+  shows "Not started: Guaardvark's background queue (Redis) is not reachable", with the advice to
+  run `./start.sh` on the Guaardvark machine, instead of an internal task name.
+- **`flask celery-health` answers in one line.** It prints `up: <answer>`, or `down: <reason>` and
+  exits 1: Redis not reachable, or no worker answered the ping within 5 s. With Redis stopped it
+  printed a traceback.
+- **`GET /api/settings/security/check` works.** It imported a module that does not exist and
+  answered 500 every time. It now reports, without returning any key, whether an API key is set,
+  tool-endpoint protection, the Host and origin checks, debug mode, web access, tool file access,
+  and the addresses the backend, web UI, Redis, PostgreSQL and each plugin listen on, with a
+  warning for any of the others that other machines can reach.
+- **`GET /api/generate/status?job_id=…` works.** It called a progress method that did not exist and
+  answered 500 every time. It now answers the job's status, progress and message (live while the
+  backend tracks the job, from its progress record otherwise) and 404 for an id nothing knows.
+  `GET /api/jobs/unified:<id>`, which `llx job status` uses, also never found a live progress job;
+  it does now.
+- **A failed background task now shows its reason instead of sitting at 0 %.** An earlier release
+  said so, but the worker's handler for it was connected in a way Python discarded at once, so it
+  never ran. It is kept now, as is the worker's runtime-audit flush on shutdown.
+- **The backend answers only to this install's names.** A site can point its DNS name at the
+  Guaardvark machine's address after its page has loaded (DNS rebinding). The browser then treats
+  the backend as that site's own, so the page could read every reply and, from the Guaardvark
+  machine, use the routes that trust it. The frontend port already refused unknown names; the
+  backend port now does too. A request addressed to anything but an IP address, `localhost`, this
+  machine's hostname (its first part, `<first part>.local`), a name in `VITE_ALLOWED_HOSTS`, or the
+  host of `VITE_FRONTEND_URL` or of an origin in `GUAARDVARK_CORS_ORIGINS` is refused with HTTP 421
+  `host_not_allowed` before any route or Socket.IO sees it. The web UI, the CLI, the MCP server,
+  plugins, and Interconnector and cluster calls by IP address are unaffected. Reaching the backend
+  by another DNS name (`gpubox.lan`, a Tailscale name, an Interconnector master URL written with
+  such a name, Docker opened at a name) needs that address in `GUAARDVARK_CORS_ORIGINS`, and the
+  refusal says which. Under Docker the backend also answers to `backend`, its name on the compose
+  network.
+- **Every other server Guaardvark starts answers only to this machine's names too.** A page
+  re-pointed at 127.0.0.1 could drive the plugin ports directly: queue ComfyUI workflows and read
+  its outputs, turn on the Vision Pipeline's camera, run Audio Foundry, Video Editor or upscaling
+  jobs. Audio Foundry, upscaling, swarm, Video Editor, Vision Pipeline, GPU Embedding, the Discord
+  bot's health port, the MCP server's HTTP transport, the reboot log and `llx`'s lite server now
+  apply the backend's Host rule (421 `host_not_allowed`), with the same settings. ComfyUI gets it
+  from a Guaardvark extension in `plugins/comfyui/guaardvark_nodes/`, loaded through
+  `guaardvark_model_paths.yaml`; ComfyUI itself is unchanged and the ComfyUI link on the video
+  page still opens. Restart each plugin to pick this up.
+- **No plugin reply carries a token any more.** Upscaling's and the Vision Pipeline's `/health`
+  replies held the bearer token their protected routes check, and the backend passed the
+  upscaling one on to any browser at `/api/upscaling/health` and `/api/plugins/<id>/health`. The
+  token now lives in `data/.upscaling_internal_secret` and `data/.vision_pipeline_internal_secret`
+  (readable by your user only), which the plugin and the backend both read; health replies report
+  status only. The backend also masks any credential-named field in a plugin health reply it
+  relays. Restart the upscaling and Vision Pipeline plugins after updating, or their protected
+  routes refuse the backend's calls until you do.
+- **Upscaling and the Vision Pipeline answer only the backend.** Every route but `/health` now
+  needs the plugin's token, as the swarm's routes already did: before, only their write routes
+  did, and anything on the machine could list upscale jobs (with their file paths), read the
+  camera's latest frame and scene, or start and stop the camera. The backend sends the token on
+  every call (the Upscaling page, the Plugins page's camera buttons, chat's vision context, the
+  GPU notices), so nothing changes in the UI; no page loads these plugins directly.
+- **Docker publishes PostgreSQL, Redis and Ollama on 127.0.0.1 only.** `docker-compose.yml`
+  published all three on every interface of the Docker host, so anyone on the network could log
+  in to the database with the stock password, queue Celery tasks through Redis, or use Ollama.
+  The backend reaches them inside Docker's network and is unaffected; tools on the host (`psql`,
+  `redis-cli`, `ollama`) still connect at `127.0.0.1`. The Web UI and API ports are unchanged.
+  `GUAARDVARK_POSTGRES_PUBLISH_HOST`, `GUAARDVARK_REDIS_PUBLISH_HOST` and
+  `GUAARDVARK_OLLAMA_PUBLISH_HOST` in `.env` publish one more widely on purpose (INSTALL.md,
+  Docker, "Ports").
+- **The web terminal listens on 127.0.0.1.** `scripts/terminal_server.sh` started ttyd, a writable
+  shell, on every interface. It now listens on `127.0.0.1` (`GUAARDVARK_TERMINAL_INTERFACE` opens
+  it), refuses a websocket opened by a page from another origin (`--check-origin`), and writes its
+  per-install password file unreadable to others from the moment it is created.
+- **The Vision Pipeline, Video Editor and the Discord bot's health port listen on 127.0.0.1.** They
+  listened on every interface with no login, so anyone on the network could start the camera and
+  read its frames, or run editor jobs. Every caller is the backend on the same machine.
+  `GUAARDVARK_VISION_PIPELINE_HOST`, `GUAARDVARK_VIDEO_EDITOR_HOST` and `DISCORD_HEALTH_HOST` open
+  them deliberately (INSTALL.md, "Plugin servers and the network"). The Video Editor also stopped
+  letting any web page read its replies (it answered every origin with CORS).
+- **A GET or HEAD request no longer changes anything.** Any web page can make a browser send
+  either without asking, and both are let through by design. `HEAD /api/enhanced-chat/history/all`
+  deleted all chat history; only `DELETE` does now. Settings → Test LLM
+  (`/api/meta/test-llm`), the diagnostics export, the quality scorecard (`llx quality scorecard`,
+  `scripts/quality_gate.py --mode full`) and `/api/simple-chat/health` ran the model on a GET and now
+  take POST. The three under `/api/meta` then need the Guaardvark machine or the API key, like other
+  `/api/meta` actions; the script sends `GUAARDVARK_API_KEY` from its environment. The
+  Interconnector heartbeat takes POST
+  only, as its callers already sent. Opening a chat no longer creates an empty session (its first
+  message does), the memory recall debug view no longer counts as a recall, video batch and merged
+  CSV downloads no longer leave a file in the temp directory each time, and the System Map reads an
+  uploaded code repository without running its code.
+- **Cast: a character's voice is picked from a list.** The Overview's free-text "Voice ID" let a
+  typo become an id that renders drop. It is now a list of Audio Foundry's voices, grouped as in
+  the Audio Studio, with "Default voice" first; voices that are not installed say so and link to
+  Audio Studio → Manage models. A saved id that is not a voice is shown as invalid until another
+  is picked, and is never changed on its own. Cloned voices are not offered: a Cast member has no
+  reference clip to clone from. `GET /api/audio-foundry/voices` now answers while Audio Foundry is
+  stopped, from the catalog in the checkout, with `plugin_running: false`.
+- **Cast: unsaved edits are no longer wiped by the page's refresh.** The Cast member page reloaded
+  the member every 30 seconds, and every 5 seconds while samples generated or a LoRA trained, and
+  reset the Overview and training-settings forms each time, so a name, description, voice, bible
+  or hyperparameter left unsaved was lost. A refresh now updates only the fields the person has
+  not touched. When a field being edited was saved with another value elsewhere, the page says so
+  and offers *Reload* or *Keep mine* instead of choosing. The Overview's Save sends only the changed
+  fields, and leaving the page with unsaved edits asks first (links, the page's back arrow, closing
+  or reloading the tab; the browser's own Back button is not covered). The page now polls only while training or
+  sample generation is under way, and refreshes when its tab is shown again.
+- **Film Crew: the "Regenerate shot" dialog survives the storyboard refresh.** The refresh that
+  runs for a minute after a shot regen replaced the storyboard with a spinner every 5 seconds,
+  closing a regen dialog opened for the next shot and losing its prompt. It now refreshes in place.
+- **Cast: saving training settings or training keeps the identity sync.** Both replaced the cast
+  member's stored settings with the six hyperparameters, dropping the "grounded from photos" flag,
+  the vision tags and marks, the class token, the manual-edit flag and the post-train smoke score.
+  The Overview then warned that the bible might not match the photos, and every Train re-ran the
+  vision sync from the photos and rewrote the bible. The hyperparameters are now merged into the
+  stored settings. Train also stores the settings it was started with when no identity sync runs.
+- **Music Video: unsaved plan edits survive a change saved elsewhere.** When any cut's prompt or
+  the treatment changed on the server (another tab, an agent), the next 5-second refresh threw
+  away every unsaved prompt and treatment edit. Now only untouched fields update, and an edited
+  field changed elsewhere shows *Reload* / *Keep mine*. Save sends only the changed fields and
+  keeps the edits if it fails. Regenerate asks before discarding edits. Approving, opening
+  another video, or leaving the page with unsaved edits asks first. *Regen this storyboard* uses
+  the cut's edited prompt, as its caption said.
+- **Interconnector: typing in the client settings no longer contacts the master.** On an enabled
+  client node, every keystroke in Node Name, Master Server Address or Master API Key re-registered
+  with the master using the half-typed value, sending the API key to partial addresses such as
+  `ht` or `http://10.0.0`. Registration and the heartbeat now follow the saved configuration and
+  re-register when it is saved.
+- **Interconnector: auto-sync settings take effect on Save, and each registration is sent once.**
+  Turning on Enable Auto-Sync, or changing its interval or entities, started syncing from the
+  form, before Save or Cancel. Auto-sync now follows the saved configuration. Opening the
+  settings registered a client node with the master twice (three times when the master handed
+  back a new node id) and saving registered it twice; each now registers once.
+- **Training → Demonstrations: unsaved steps edits are kept.** Collapsing a row or pressing the
+  list's refresh button discarded the steps being edited, and after *Save Steps* re-opening the
+  row showed the steps from before the save. Edits now stay until saved, a refresh updates only
+  rows without edits, steps changed elsewhere under an edit are reported and the edit is kept,
+  and a save updates the list.
+- **Training → Demonstrations: Save Steps keeps click positions.** The steps editor shows a
+  click's position as `"coordinates": [x, y]`, but saving read only `coordinates_x` /
+  `coordinates_y`, so every save erased the recorded positions (replay finds its targets by
+  vision and was not affected; the stored record of where each click landed was). `PUT
+  /api/agent-control/learn/demonstrations/<id>/steps` now takes either shape, and refuses
+  coordinates that are not `[x, y]` or null without changing anything.
+- **Audio Studio: withdraw consent for a voice clip, or delete it.** "Manage imported clips" under
+  the reference clip lists each clip and whether consent is recorded. *Withdraw consent* removes
+  the record and keeps the clip, which is not cloned again until consent is confirmed; *Delete
+  clip* removes the clip and its record. A clone already running finishes; one still waiting to
+  start is refused. Deleting needs the Guaardvark machine or the API key, like the Cast Library's
+  deletes; withdrawing is as open as giving consent. Deleting `me` no longer also deletes
+  `me.v2.wav`, clips renamed on import (`me (2).wav`) can be played and confirmed, and a new import
+  never inherits the consent of a clip removed under the same name.
+- **Chatterbox's own voice stays its own after a clone.** Chatterbox kept the last cloned voice as
+  its default, so a later voiceover without a reference clip (the Audio Studio's default voice, a
+  Film Crew character without a voice) spoke in that clone's voice, even after its consent was
+  withdrawn, until the model unloaded. The stock voice now comes back after every generation, and
+  a clone reads its clip once rather than once per chunk.
+- **Only Guaardvark's own pages can read its replies.** A web page served from any device on the
+  local network (any 192.168.x, 10.x or 172.16–31.x address, on any port) could call the backend
+  and read what it answered. Browsers are now answered only for this install's own pages: its
+  frontend and backend ports on this machine's names and addresses (`localhost`, its IP addresses,
+  its hostname and `<hostname>.local`), `VITE_FRONTEND_URL`, and origins listed in the new
+  `GUAARDVARK_CORS_ORIGINS` for a reverse proxy or another name. Other local ports (3000, 5175)
+  count only when one is this install's `VITE_PORT`. Socket.IO uses the same list, so the UI
+  opened at the machine's LAN address from a phone or another computer now gets live chat,
+  progress and voice; its connection was refused before. The Interconnector's status, register
+  and heartbeat routes still accept any private-network page, which is how a client node's
+  Settings page reaches its master.
+- **Pages on other sites cannot change anything.** A page on any website open in a browser on
+  the Guaardvark machine (or on any device the backend answers) could make that browser send a
+  form-style POST to the backend, and routes that trust the Guaardvark machine would act on it.
+  Every request other than GET, HEAD and OPTIONS is now refused with `cross_site_request` when the
+  browser says it came from a page that is not this install's (its `Origin`, an `Origin: null`, or
+  `Sec-Fetch-Site: cross-site` with no `Origin`). The web UI under any name it is reached by, the
+  CLI, the MCP server, scripts and calls between machines are unaffected, and a client node's
+  Settings page still registers with its master.
+- **Restarting Guaardvark needs this machine or the API key**, like the other protected actions.
+  From another device the restart dialog says to enter the key in Settings → API key instead of
+  restarting.
+- **A browser preflight no longer needs the API key.** Once a key existed, a UI built with an
+  absolute `VITE_API_BASE_URL` could not call protected routes: the browser's CORS preflight
+  (an OPTIONS request, which never carries a key or cookie) was refused, so the real request was
+  never sent. OPTIONS requests that Flask answers itself now pass; the request that follows still
+  needs the key or a signed-in browser.
+- **The restart log server answers only this install's pages.** During a restart from Settings
+  the log shown on the page came from a small server that listened on every network address,
+  let any web page read the restart log, and had a `/shutdown` link that did not stop it but kept
+  the process from ever exiting. It now listens on this machine only, only Guaardvark's own
+  pages can read the log, and `POST /shutdown` stops it.
 - **`start.sh` stops when run as root.** With `sudo`, the install landed under `/root` and left
   files the normal user could not write. It now says to run it as your normal user; it asks
   for your password itself when it installs system packages. Machines where root is the only
   account set `GUAARDVARK_ALLOW_ROOT=1`.
+- **More credential files are off limits to the agent's file and code tools.** Added to the names
+  they refuse to read, list or grep: `*.env`, `.npmrc`, `.pypirc`, `*.ppk`, `*.jks`, `*.keystore`,
+  `*.secret`, `client_secret*.json` and dot-files with "secret" in the name.
+- **The System Mapper maps what git lists.** In a git checkout `map_codebase` and the System Map
+  page survey tracked files plus untracked files git does not ignore, and no longer count ignored
+  local folders such as scratch copies and worktrees. On a workstation holding about 49,000 such
+  `.py` copies the static analysis of the whole checkout went from 270 s to 9 s; a fresh clone
+  maps the same files as before. Outside a git checkout the folder is walked as before.
+- **Running tools and automation needs the Guaardvark machine or the API key.**
+  `/api/tools/execute`, `/api/tools/jobs/` and `/api/automation/*` answered every device on the
+  network. They now answer the Guaardvark machine itself, or a client that sends
+  `GUAARDVARK_API_KEY`. `GUAARDVARK_PROTECT_TOOL_ENDPOINTS=false` brings back the old behaviour.
+- **API key in Settings.** Pasting this install's key into Settings → API key signs the browser in:
+  the backend answers with an HttpOnly, SameSite=Strict cookie holding a token derived from the key,
+  so the page never keeps the key and a script in it cannot read the sign-in. On the Guaardvark
+  machine the panel creates the key (shown once, saved in `.env`, working at once without a
+  restart); a signed-in browser replaces or removes it, which signs every other browser out. Once a
+  key exists every device needs it, the Guaardvark machine included. Pages that are refused (Tools,
+  MCP Servers, and the rest through one notice) say what to do and link there.
+- **Agent screenshots are served by signed links.** `/api/tools/screenshots/` answered any device
+  that guessed a capture's name. Chat now shows each capture through a link signed for that one
+  file, which works on every device; anything else needs the Guaardvark machine or the key.
+  Deleting `data/.screenshot_url_secret` revokes every link; saved chats keep their pictures.
+- **The CLI and MCP server on the Guaardvark machine find the key in `.env`.** A key created or
+  replaced in Settings works for them at once, without copying it into their environment.
+- **Docker: the first `./start-docker.sh` creates the API key** in `.env` next to
+  `docker-compose.yml` and prints it for Settings → API key, since under Docker no browser counts
+  as the Guaardvark machine. API URLs ending in `.png`, `.svg` and the like now reach the backend
+  instead of nginx's static files.
 
 ## 2.9.3 — The command line does what it says, agents make music and voice, outpaint fills the frame
 

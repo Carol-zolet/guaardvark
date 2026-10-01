@@ -6,3 +6,8 @@
 guaardvark_cast:
     base_path: ${GUAARDVARK_TRAINING_DIR}
     loras: loras
+# Guaardvark's own ComfyUI extensions, kept outside ComfyUI/ so an update of
+# ComfyUI keeps them: the Host check in front of every request
+# (guaardvark_nodes/guaardvark_host_check.py). Relative to this file.
+guaardvark_nodes:
+    custom_nodes: guaardvark_nodes

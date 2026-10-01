@@ -1305,7 +1305,11 @@ class PluginManager:
                 
                 if response.status_code == 200:
                     self._record_health(plugin_id, answering=True)
-                    data = response.json()
+                    # Relayed to browsers (/api/plugins/<id>/health and the
+                    # plugin's info), so a credential in a plugin's reply
+                    # never travels on.
+                    from backend.utils.secret_redaction import redact_fields
+                    data = redact_fields(response.json())
                     data['plugin_id'] = plugin_id
                     return data
                 else:

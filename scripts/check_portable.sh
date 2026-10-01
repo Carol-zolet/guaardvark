@@ -93,7 +93,10 @@ PATTERNS
 # belong in a public file — listing them here would publish the very names the
 # rule exists to keep private. Keep them in an untracked local file instead, one
 # "pattern<TAB>explanation" per line, and this picks them up automatically.
-LOCAL_PATTERNS="${PORTABLE_LOCAL_PATTERNS:-scripts/.portable-local-patterns}"
+# Worktrees have no copy of the untracked lists: they live in the main working
+# tree, whose git directory every worktree shares.
+COMMON_ROOT="$(cd "$(git rev-parse --git-common-dir)/.." && pwd)"
+LOCAL_PATTERNS="${PORTABLE_LOCAL_PATTERNS:-$COMMON_ROOT/scripts/.portable-local-patterns}"
 if [ -f "$LOCAL_PATTERNS" ]; then
     RULES="$RULES"$'\n'"$(grep -vE '^\s*(#|$)' "$LOCAL_PATTERNS")"
 fi
@@ -103,7 +106,7 @@ fi
 # the very names being withheld, so they are kept out of `git add` per-clone via
 # .git/info/exclude and enforced here from an untracked list, one
 # "path-regex<TAB>explanation" per line.
-LOCAL_PATHS="${PORTABLE_LOCAL_PATHS:-scripts/.portable-local-paths}"
+LOCAL_PATHS="${PORTABLE_LOCAL_PATHS:-$COMMON_ROOT/scripts/.portable-local-paths}"
 
 status=0
 

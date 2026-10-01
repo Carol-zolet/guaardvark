@@ -257,9 +257,11 @@ class GPUResourceCoordinator:
     def _notify_vision_pipeline(self, action: str, source: str):
         """Best-effort notification to vision pipeline plugin. Fire and forget."""
         try:
+            from backend.utils.vision_context_utils import vision_pipeline_headers
             requests.post(
                 "http://localhost:8201/gpu/contention",
                 json={"source": source, "action": action},
+                headers=vision_pipeline_headers(),
                 timeout=1
             )
         except Exception:

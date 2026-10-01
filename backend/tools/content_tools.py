@@ -78,10 +78,27 @@ def _csv_row(reply: str, columns: int, row_id: Any) -> Optional[str]:
     if match:
         body = text[match.start():].strip()
         if body.endswith('"'):
-            fields = re.split(r'"\s*,\s*"', body[1:-1])
+            fields = [_undoubled(f) for f in re.split(r'"\s*,\s*"', body[1:-1])]
             if plausible(fields):
                 return quoted(fields)
     return None
+
+
+def _undoubled(field: str) -> str:
+    """A field the model escaped the CSV way ("" for each quote) with its quotes
+    single again; any other field as it is.
+
+    A reply can mix the two styles: bare quotes in the title, escaped ones in the
+    HTML. Re-quoting an escaped field as it stands would double its quotes again.
+    A field is escaped when every run of quotes in it has an even length. An
+    empty attribute written bare (alt="") looks the same and is left alone.
+    """
+    runs = re.findall(r'"+', field)
+    if not runs or any(len(run) % 2 for run in runs):
+        return field
+    if re.search(r'=""(?:\s|/?>|$)', field):
+        return field
+    return field.replace('""', '"')
 
 
 def _generate_row(llm, prompt: str, columns: int, row_id: Any) -> tuple[Optional[str], str]:

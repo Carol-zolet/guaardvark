@@ -11,6 +11,7 @@ from flask import Blueprint, current_app, request, jsonify, send_file
 from werkzeug.utils import secure_filename
 
 from backend.config import STORAGE_DIR
+from backend.celery_dispatch import TaskNotStarted, mark_progress_not_started
 from backend.models import db, Subject, SubjectSample
 from backend.services.media_model_registry import (
     ZIMAGE_TURBO,
@@ -270,8 +271,12 @@ def update_subject(subject_id):
             cfg["bible_manual_override"] = True
             s.training_settings_json = cfg
     if "training_settings" in body:
-        from backend.services.lora_training_settings import normalize_training_settings
-        s.training_settings_json = normalize_training_settings(body["training_settings"])
+        # Merge, not replace: the same JSON holds the identity flags and the
+        # smoke score (see merge_training_settings).
+        from backend.services.lora_training_settings import merge_training_settings
+        s.training_settings_json = merge_training_settings(
+            s.training_settings_json, body["training_settings"],
+        )
     db.session.commit()
     return jsonify(_serialize(s))
 
@@ -681,7 +686,11 @@ def dispatch_generate_samples(subject_id: int):
         f"Character reference sheet generation for subject {subject_id}",
         additional_data={"subject_id": subject_id, "operation": "generate_samples", "kind": "cast_character_gen", "use_trained_lora": use_lora, "append": append},
     )
-    task = celery.send_task("character.generate_samples", args=[subject_id, job_id, use_lora, append])
+    try:
+        task = celery.send_task("character.generate_samples", args=[subject_id, job_id, use_lora, append])
+    except TaskNotStarted as e:
+        mark_progress_not_started(job_id, e)
+        raise
     # Persist celery id so /generate/cancel can revoke the worker without inspect.
     try:
         progress.update_process(
@@ -762,8 +771,12 @@ def dispatch_train(subject_id: int):
 
     body = request.get_json(silent=True) or {}
     if body.get("training_settings"):
-        from backend.services.lora_training_settings import normalize_training_settings
-        s.training_settings_json = normalize_training_settings(body["training_settings"])
+        # Merge, not replace: the same JSON holds bible_vision_grounded (without
+        # it every run re-syncs identity from the photos) and the smoke score.
+        from backend.services.lora_training_settings import merge_training_settings
+        s.training_settings_json = merge_training_settings(
+            s.training_settings_json, body["training_settings"],
+        )
 
     # Gate on media model registry: Z-Image/FLUX train backends land next;
     # only train_ready profiles (currently sdxl-legacy PEFT) may dispatch.
@@ -788,6 +801,10 @@ def dispatch_train(subject_id: int):
     merged = dict(s.training_settings_json or {})
     merged.update(train_cfg)
     s.training_settings_json = merged
+    # Into the transaction now: the refresh after the identity check below
+    # reloads the row, and would otherwise discard these settings whenever no
+    # sync ran (and so nothing committed them).
+    db.session.flush()
 
     # Vision-ground identity before captions/train when refs exist and ungrounded.
     refs = list(s.ref_image_paths or [])
@@ -895,10 +912,14 @@ def dispatch_regen_sample(subject_id: int, sample_id: int):
         f"Regen sample {sample_id} for cast subject {subject_id}",
         additional_data={"subject_id": subject_id, "sample_id": sample_id, "operation": "regen_sample", "kind": "cast_character_gen"},
     )
-    task = celery.send_task(
-        "character.regen_sample",
-        args=[sample_id, prompt_override, seed, job_id],
-    )
+    try:
+        task = celery.send_task(
+            "character.regen_sample",
+            args=[sample_id, prompt_override, seed, job_id],
+        )
+    except TaskNotStarted as e:
+        mark_progress_not_started(job_id, e)
+        raise
     try:
         progress.update_process(
             job_id, 1, "Queued for regen",

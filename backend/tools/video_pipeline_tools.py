@@ -8,6 +8,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import shutil
 from pathlib import Path
 
 from backend.services.agent_tools import BaseTool, ToolParameter, ToolResult
@@ -152,11 +153,143 @@ def _script_body(script_text: str, *, mcp: bool = False):
     return text, None
 
 
+def _comfyui_note(model_id: str):
+    """A line for the result when ``model_id`` renders in ComfyUI and ComfyUI
+    is stopped now, else None. Nothing before the clip renders needs it:
+    storyboards are drawn offline (character_still_pipeline)."""
+    from backend.services.job_types import RenderErrorKind
+    from backend.services.plugin_bridge import job_service_start_enabled
+    from backend.services.video_model_registry import preflight_video_model
+
+    ready, err = preflight_video_model(model_id)
+    if ready or getattr(err, "kind", None) != RenderErrorKind.COMFYUI_DOWN:
+        return None
+    if job_service_start_enabled():
+        return ("ComfyUI is not running now; it is started when the clips render, the last "
+                "stage, which you start from Film Crew.")
+    return ("ComfyUI is not running now. Nothing needs it until the clips render, the last stage, "
+            "which you start from Film Crew: start the ComfyUI plugin (Plugins) before then.")
+
+
+def _dispatch_first_stage(svc, row_id: int, agent: str):
+    """Start a new project's first agent. Returns (started, error text or None).
+
+    The row is created first; when Celery does not take the task (its broker
+    is down, say) the row stays at that stage, and a backend restart resumes
+    unfinished stages (PipelineService.resume_all).
+    """
+    if not svc.advance_if_predecessor(row_id, expected_predecessor="draft"):
+        # Another worker moved the new row first, so the stage is its to run.
+        return False, "another worker already moved the project past its first stage"
+    from backend.celery_dispatch import TaskNotStarted
+
+    try:
+        svc.dispatch_agent(row_id, agent)
+    except TaskNotStarted as e:
+        logger.warning("%s dispatch failed for %s: %s", agent, row_id, e)
+        return False, e.why
+    except Exception as e:  # noqa: BLE001 - reported to the caller, not raised
+        logger.warning("%s dispatch failed for %s: %s", agent, row_id, e)
+        return False, f"the task queue did not take it ({str(e) or type(e).__name__})"
+    return True, None
+
+
+def _looks_like_audio(path: str) -> bool:
+    """True when the file starts like one of the formats _AUDIO_EXT names.
+
+    The extension alone is not enough: a file taken as a song lands in the
+    library, where the download route serves it.
+    """
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(12)
+    except OSError:
+        return False
+    return (
+        (head[:4] == b"RIFF" and head[8:12] == b"WAVE")
+        or head[:3] == b"ID3"                                  # MP3 with tags
+        or (len(head) > 1 and head[0] == 0xFF and (head[1] & 0xE0) == 0xE0)  # MPEG / ADTS frame
+        or head[:4] in (b"fLaC", b"OggS")
+        or head[4:8] == b"ftyp"                                # M4A / AAC in MP4
+    )
+
+
+def _same_bytes(a: Path, b: Path) -> bool:
+    import hashlib
+
+    if a.stat().st_size != b.stat().st_size:
+        return False
+
+    def digest(path: Path) -> str:
+        h = hashlib.sha256()
+        with open(path, "rb") as fh:
+            for chunk in iter(lambda: fh.read(1 << 20), b""):
+                h.update(chunk)
+        return h.hexdigest()
+
+    return digest(a) == digest(b)
+
+
+def _library_song(path: Path):
+    """(Document, None) for a local song file, stored the way the library
+    stores an upload, or (None, error).
+
+    Library rows keep their path relative to UPLOAD_DIR, the form the download
+    route, generate_video's reference_audio and the music-video resolvers read.
+    A song already in uploads gets that row in place, reusing one that exists
+    (and moving a row an earlier version wrote with the absolute path onto the
+    relative one). A song elsewhere (an outputs folder, or in chat the install
+    folder) is copied into uploads/Audio first, as the Studio's Music Video
+    upload puts a song in the library; the same bytes are copied once.
+    """
+    from backend import config
+    from backend.models import Document, db
+    from backend.services.output_registration import register_file
+    from backend.utils.filename_resolver import resolve_filesystem_filename
+
+    real = Path(os.path.realpath(path))
+    if real.suffix.lower() not in _AUDIO_EXT or not _looks_like_audio(str(real)):
+        return None, (f"song '{path.name}' is not an audio file; songs are "
+                      f"{', '.join(e.lstrip('.') for e in _AUDIO_EXT)}.")
+    uploads = Path(os.path.realpath(config.UPLOAD_DIR))
+    refs = uploads / "voice_references"
+    if real.is_relative_to(refs):
+        return None, "a voice reference clip is not a song; pass the song itself."
+
+    if real.is_relative_to(uploads):
+        rel = real.relative_to(uploads).as_posix()
+        existing = Document.query.filter_by(path=rel).first()
+        if existing:
+            return existing, None
+        legacy = Document.query.filter(Document.path.in_({str(path), str(real)})).first()
+        if legacy:
+            legacy.path = rel
+            db.session.commit()
+            return legacy, None
+        folder = real.parent.relative_to(uploads).as_posix()
+        doc = register_file(os.path.join(config.UPLOAD_DIR, rel), folder_name="" if folder == "." else folder)
+    else:
+        audio_dir = Path(config.UPLOAD_DIR) / "Audio"
+        audio_dir.mkdir(parents=True, exist_ok=True)
+        target = audio_dir / real.name
+        if not (target.is_file() and _same_bytes(real, target)):
+            target = audio_dir / resolve_filesystem_filename(audio_dir, real.name)
+            shutil.copy2(real, target)
+        existing = Document.query.filter_by(path=f"Audio/{target.name}").first()
+        if existing:
+            return existing, None
+        doc = register_file(str(target), folder_name="Audio")
+    if doc is None:
+        return None, f"song '{path.name}' could not be added to the library."
+    return doc, None
+
+
 def _document_from_song_ref(song: str, *, mcp: bool = False):
-    """Return (Document, None) or (None, error). Creates a row for a local file.
+    """Return (Document, None) or (None, error).
 
     A document id (or its /api/files/document/<id>/download link) names an
-    existing row; anything else is resolved under the shared media-input rules.
+    existing row; anything else is resolved under the shared media-input rules
+    and stored as a library song (_library_song).
     """
     from backend.models import Document, db
     from backend.utils.media_inputs import accepted_forms, document_id_from_ref, resolve_media_ref
@@ -176,21 +309,7 @@ def _document_from_song_ref(song: str, *, mcp: bool = False):
     )
     if not found.path:
         return None, found.error
-    path = Path(found.path)
-    resolved = str(path)
-    existing = Document.query.filter_by(path=resolved).first()
-    if existing:
-        return existing, None
-    doc = Document(
-        filename=path.name,
-        path=resolved,
-        type=(path.suffix.lstrip(".") or "audio")[:50],
-        size=path.stat().st_size,
-        index_status="STORED",
-    )
-    db.session.add(doc)
-    db.session.commit()
-    return doc, None
+    return _library_song(Path(found.path))
 
 
 class MusicVideoTool(BaseTool):
@@ -216,7 +335,8 @@ class MusicVideoTool(BaseTool):
                 "guaardvark://outputs/<path> resource URI, or a file path. Over MCP the file must be "
                 "in Guaardvark's uploads folder or in an outputs folder MCP resources serve (what "
                 "resources/list shows); in chat, anywhere in its uploads, outputs or install folder. "
-                "Files named like keys or credentials are refused everywhere."
+                "Files named like keys or credentials are refused everywhere. A song given by path "
+                "joins the library (one outside the uploads folder is copied into its Audio folder)."
             ),
             required=True,
         ),
@@ -288,19 +408,23 @@ class MusicVideoTool(BaseTool):
                 project_id=None,
                 settings=settings,
             )
-            if svc.advance_if_predecessor(mv.id, expected_predecessor="draft"):
-                try:
-                    svc.dispatch_agent(mv.id, "analyzer")
-                except Exception as e:  # noqa: BLE001
-                    logger.warning("music-video analyzer dispatch failed for %s: %s", mv.id, e)
-                db.session.refresh(mv)
+            started, dispatch_err = _dispatch_first_stage(svc, mv.id, "analyzer")
+            db.session.refresh(mv)
 
             studio = f"/music-video"
+            if started:
+                next_line = "Analysis is running. Approve the cut plan in Studio before any clip renders."
+            else:
+                next_line = (
+                    f"Analysis was not started: {dispatch_err}. The project is saved at stage "
+                    f"'{mv.current_stage}'; its analysis starts when the backend restarts, or on "
+                    f"POST /api/music-video/{mv.id}/analyze. Do not create it again."
+                )
             return ToolResult(
                 success=True,
                 output="\n".join([
                     f"Music video '{mv.name}' created (id {mv.id}, stage: {mv.current_stage}).",
-                    "Analysis is running. Approve the cut plan in Studio before any clip renders.",
+                    next_line,
                     f"Open Music Video: {studio}",
                 ]),
                 metadata={
@@ -309,6 +433,8 @@ class MusicVideoTool(BaseTool):
                     "studio_url": studio,
                     "i2v_model": settings.get("i2v_model"),
                     "approved": False,
+                    "analysis_started": started,
+                    "dispatch_error": dispatch_err,
                 },
             )
         except Exception as e:  # noqa: BLE001
@@ -325,7 +451,9 @@ class FilmCrewTool(BaseTool):
     description = (
         "Start a five-role Film Crew production from a screenplay. The screenwriter "
         "begins at once; casting, storyboards and GPU renders wait for you in Studio. "
-        "Use when the user asks to film a script or start the film crew."
+        "ComfyUI need not be running: only the clip renders at the end use it, and the "
+        "answer says when it is stopped. Use when the user asks to film a script or start "
+        "the film crew."
     )
     parameters = {
         "script_text": ToolParameter(
@@ -376,10 +504,16 @@ class FilmCrewTool(BaseTool):
             if explicit:
                 if explicit not in VIDEO_MODEL_REGISTRY or not model_capabilities(explicit):
                     return ToolResult(success=False, error=f"video_model '{explicit}' is not a video model")
-            picked, resolve_err = resolve_active_video_model("i2v", explicit, surface="film-crew")
+            # Only the clip renders, the last stage, run on this model, and
+            # they check (and, with job-service start on, start) ComfyUI then;
+            # a stopped ComfyUI does not keep the screenwriter from starting.
+            picked, resolve_err = resolve_active_video_model(
+                "i2v", explicit, surface="film-crew", comfyui_down_ok=True,
+            )
             if resolve_err:
                 return ToolResult(success=False, error=resolve_err)
             settings["video_model"] = picked
+            comfyui_note = _comfyui_note(picked)
 
             first = next((ln.strip() for ln in script_text.splitlines() if ln.strip()), "Film Crew")
             title = (name or "").strip() or first[:80]
@@ -387,19 +521,25 @@ class FilmCrewTool(BaseTool):
             prod = svc.create(
                 name=title, script_text=script_text, project_id=None, settings=settings,
             )
-            if svc.advance_if_predecessor(prod.id, expected_predecessor="draft"):
-                try:
-                    svc.dispatch_agent(prod.id, "screenwriter")
-                except Exception as e:  # noqa: BLE001
-                    logger.warning("film-crew screenwriter dispatch failed for %s: %s", prod.id, e)
-                db.session.refresh(prod)
+            started, dispatch_err = _dispatch_first_stage(svc, prod.id, "screenwriter")
+            db.session.refresh(prod)
 
             studio = "/film-crew"
+            if started:
+                lines = ["The screenwriter is running. Casting, storyboards and renders wait in Studio."]
+            else:
+                lines = [
+                    f"The screenwriter was not started: {dispatch_err}. The production is saved at "
+                    f"stage '{prod.current_stage}'; use Re-dispatch on the Film Crew page, or restart "
+                    "the backend, which resumes it. Do not create it again."
+                ]
+            if comfyui_note:
+                lines.append(comfyui_note)
             return ToolResult(
                 success=True,
                 output="\n".join([
                     f"Film Crew '{prod.name}' created (id {prod.id}, stage: {prod.current_stage}).",
-                    "The screenwriter is running. Casting, storyboards and renders wait in Studio.",
+                    *lines,
                     f"Open Film Crew: {studio}",
                 ]),
                 metadata={
@@ -408,6 +548,9 @@ class FilmCrewTool(BaseTool):
                     "studio_url": studio,
                     "video_model": picked,
                     "rendered": False,
+                    "screenwriter_started": started,
+                    "dispatch_error": dispatch_err,
+                    "comfyui_running": comfyui_note is None,
                 },
             )
         except Exception as e:  # noqa: BLE001

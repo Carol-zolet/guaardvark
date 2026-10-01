@@ -471,10 +471,12 @@ def clear_memories():
 
 @memory_bp.route("/recall-debug", methods=["GET", "POST"])
 def recall_debug():
-    """Return selected memory ids and scores for a recall query."""
+    """Return selected memory ids and scores for a recall query. Looking does
+    not count as recalling, so the rows it shows are left as they were."""
     data = request.get_json(silent=True) if request.method == "POST" else request.args
     data = data or {}
     memories = _query_memories(
+        count_access=False,
         limit=int(data.get("limit", 10)),
         query=data.get("query"),
         session_id=data.get("session_id"),

@@ -23,7 +23,7 @@ class LlxClient:
 
     def __init__(self, server_url: str | None = None, api_key: str | None = None, timeout: float | None = None):
         self.server_url = server_url or get_server_url()
-        api_key = api_key or get_api_key()
+        api_key = api_key or get_api_key(self.server_url)
         timeout = timeout or get_global_timeout() or get_timeout()
         headers = {}
         if api_key:
