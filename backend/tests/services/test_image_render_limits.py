@@ -29,6 +29,9 @@ def _strict_off(monkeypatch):
 
 OLD_STILLS_DEFAULTS = {
     "zimage": {"min_steps": 2, "width": 1024, "height": 1024, "steps": 9, "guidance": 0.0, "prompt_style": "natural"},
+    # The generic "comfyui" selector samples Z-Image first, so it carries Z-Image's
+    # row rather than the legacy SD row (stills_defaults._build_family_defaults).
+    "comfyui": {"min_steps": 2, "width": 1024, "height": 1024, "steps": 9, "guidance": 0.0, "prompt_style": "natural"},
     "krea2-turbo": {"width": 1024, "height": 1024, "steps": 8, "guidance": 0.0, "prompt_style": "tags"},
     "krea2-raw": {"width": 1024, "height": 1024, "steps": 52, "guidance": 3.5, "prompt_style": "tags"},
     "sdxl": {"width": 1024, "height": 1024, "steps": 25, "guidance": 7.0, "prompt_style": "tags"},

@@ -47,8 +47,13 @@ def _build_family_defaults() -> dict[str, dict[str, Any]]:
         if d["min_steps"] is not None:
             entry["min_steps"] = int(d["min_steps"])
         entry.update({"width": d["width"], "height": d["height"], "steps": d["steps"],
-                      "guidance": d["guidance"], "prompt_style": d["prompt_style"]})
+                       "guidance": d["guidance"], "prompt_style": d["prompt_style"]})
         table[key] = entry
+    # The generic "comfyui" selector samples the first installed engine, which is
+    # Z-Image, so it inherits Z-Image's measured floor instead of the legacy SD
+    # 512/20/7.5 row a default or an agent could otherwise pick.
+    table["comfyui"] = dict(table.get("zimage") or {})
+
     return table
 
 
@@ -85,6 +90,8 @@ _LEGACY_GUIDANCE = 7.5
 def model_family(model: str | None) -> str:
     """Map catalog key / HF id / auto to a sampling family key."""
     mid = (model or "").strip().lower()
+    if mid == "comfyui":
+        return "comfyui"
     if not mid or mid == "auto":
         # Product daily driver family for unresolved auto.
         try:
@@ -178,6 +185,7 @@ def resolve_stills_defaults(
             "zimage": "Z-Image Turbo", "krea2-turbo": "Krea 2 Turbo",
             "krea2-raw": "Krea 2 Raw", "sdxl": "SDXL",
             "sd": "Stable Diffusion", "flux": "FLUX",
+            "comfyui": "ComfyUI (Z-Image)",
         }[family]
         notice = f"{label} needs at least {floor} steps; raised {resolved_steps} to {floor}."
         resolved_steps = floor
