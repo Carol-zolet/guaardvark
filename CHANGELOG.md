@@ -34,6 +34,15 @@
   is picked, and is never changed on its own. Cloned voices are not offered: a Cast member has no
   reference clip to clone from. `GET /api/audio-foundry/voices` now answers while Audio Foundry is
   stopped, from the catalog in the checkout, with `plugin_running: false`.
+- **Cast: unsaved edits are no longer wiped by the page's refresh.** The Cast member page reloaded
+  the member every 30 seconds, and every 5 seconds while samples generated or a LoRA trained, and
+  reset the Overview and training-settings forms each time, so a name, description, voice, bible
+  or hyperparameter left unsaved was lost. A refresh now updates only the fields the person has
+  not touched. When a field being edited was saved with another value elsewhere, the page says so
+  and offers *Reload* or *Keep mine* instead of choosing. The Overview's Save sends only the changed
+  fields, and leaving the page with unsaved edits asks first (links, the page's back arrow, closing
+  or reloading the tab; the browser's own Back button is not covered). The page now polls only while training or
+  sample generation is under way, and refreshes when its tab is shown again.
 - **Audio Studio: withdraw consent for a voice clip, or delete it.** "Manage imported clips" under
   the reference clip lists each clip and whether consent is recorded. *Withdraw consent* removes
   the record and keeps the clip, which is not cloned again until consent is confirmed; *Delete

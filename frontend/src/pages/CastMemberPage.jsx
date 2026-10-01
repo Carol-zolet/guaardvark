@@ -23,9 +23,44 @@ import {
 import { SubjectThumb } from '../components/filmcrew/CastLibraryView';
 import DragDropImageUpload from '../components/filmcrew/DragDropImageUpload';
 import CastVoicePicker from '../components/filmcrew/CastVoicePicker';
+import useServerSyncedForm from '../hooks/useServerSyncedForm';
+import useUnsavedChangesGuard from '../hooks/useUnsavedChangesGuard';
 
 const POLL_MS = 5000;
 const POLL_CAP = 180; // 15 min safety cap on a generate/train poll loop
+// Follow-up poll for work that outlives POLL_CAP (training runs for hours) or
+// whose terminal event beat the worker's DB commit. Runs only while the member
+// still reads as training or has queued samples.
+const SETTLE_POLL_MS = 30000;
+
+const TERMINAL_JOB_STATUSES = ['complete', 'end', 'error', 'cancelled', 'failed'];
+
+const EMPTY_OVERVIEW = { name: '', description: '', trigger_word: '', voice_id: '', bible: '' };
+
+const overviewFromSubject = (subject) => ({
+  name: subject.name || '',
+  description: subject.description || '',
+  trigger_word: subject.trigger_word || '',
+  voice_id: subject.voice_id || '',
+  bible: subject.bible || '',
+});
+
+const OVERVIEW_LABELS = {
+  name: 'Name',
+  trigger_word: 'Trigger word',
+  voice_id: 'Voice',
+  description: 'Description',
+  bible: 'Identity bible',
+};
+
+const TRAINING_LABELS = {
+  base_model_id: 'Train base',
+  resolution: 'Resolution',
+  rank: 'LoRA rank',
+  alpha: 'LoRA alpha',
+  learning_rate: 'Learning rate',
+  steps: 'Steps',
+};
 
 const DEFAULT_TRAINING_SETTINGS = {
   resolution: 768,
@@ -61,6 +96,31 @@ const StatusChip = ({ status }) => {
     : status === 'cancelled' ? 'default'
     : status === 'generating' ? 'warning' : 'default';
   return <Chip size="small" label={status} color={color} />;
+};
+
+/**
+ * Shown when fields the person is editing were saved with other values from
+ * somewhere else (another tab, the Casting Director, a sync). The page never
+ * picks a side on its own.
+ */
+const ChangedElsewhereNotice = ({ conflicts, labels, onReload, onKeep }) => {
+  const keys = Object.keys(conflicts || {});
+  if (!keys.length) return null;
+  const names = keys.map((k) => labels[k] || k).join(', ');
+  return (
+    <Alert
+      severity="warning"
+      action={(
+        <Box sx={{ display: 'flex', gap: 0.5 }}>
+          <Button color="inherit" size="small" onClick={onReload}>Reload</Button>
+          <Button color="inherit" size="small" onClick={onKeep}>Keep mine</Button>
+        </Box>
+      )}
+    >
+      {names} changed elsewhere while you were editing. Reload to take the saved
+      version, or keep your edit and save it over that change.
+    </Alert>
+  );
 };
 
 /** Training-lifecycle chip for a generated sample (approved / training / trained). */
@@ -101,10 +161,10 @@ const CastMemberPage = () => {
   const [error, setError] = useState(null);
   const [tab, setTab] = useState(0);
 
-  // Overview edit form.
-  const [form, setForm] = useState({
-    name: '', description: '', trigger_word: '', voice_id: '', bible: '',
-  });
+  // Overview edit form. Server copies merge into it field by field and never
+  // overwrite an unsaved edit (hooks/useServerSyncedForm).
+  const overview = useServerSyncedForm(EMPTY_OVERVIEW);
+  const form = overview.values;
   const [saving, setSaving] = useState(false);
   const [savedNote, setSavedNote] = useState(false);
   const [rebuildingBible, setRebuildingBible] = useState(false);
@@ -125,44 +185,60 @@ const CastMemberPage = () => {
   // Local state to surface training progress from unified jobs (so frontend "knows"
   // when GPU is crunching on long LoRA train, even if subject poll lags or health/celery 503s).
   const [trainingJob, setTrainingJob] = useState(null);
-  const [trainingSettings, setTrainingSettings] = useState(DEFAULT_TRAINING_SETTINGS);
+  // Training hyperparameters (Training Data tab): same merge rules as Overview.
+  const trainingForm = useServerSyncedForm(DEFAULT_TRAINING_SETTINGS);
+  const trainingSettings = trainingForm.values;
   const [savingTrainingSettings, setSavingTrainingSettings] = useState(false);
   const [trainingSettingsSaved, setTrainingSettingsSaved] = useState(false);
 
-  const loadSubject = useCallback(async () => {
-    // Prefer efficient single-subject (with samples when convenient).
-    // Falls back gracefully.
+  // Responses can land out of order (a slow poll after a save). Each subject
+  // fetch takes a number; a response older than the newest one applied, or
+  // issued before the last write this page made, is dropped so it cannot
+  // put pre-save values back.
+  const fetchSeq = useRef(0);
+  const acceptFrom = useRef(0);
+  const ignoreEarlierFetches = () => { acceptFrom.current = fetchSeq.current + 1; };
+
+  const { reset: resetOverview, syncFromServer: syncOverview } = overview;
+  const { reset: resetTraining, syncFromServer: syncTraining } = trainingForm;
+
+  // Fetch the member (with its samples when the detail endpoint answers) and
+  // fold it into the page. `reset` starts both forms over (first load or a
+  // different member); otherwise they merge. `overwrite` passes through to the
+  // Overview merge for fields an explicit action just rewrote on the server.
+  // Resolves to { subject, samples } — samples null when the fallback path
+  // was used — or { stale: true } when the response was dropped.
+  const refreshSubject = useCallback(async ({ reset = false, overwrite } = {}) => {
+    const seq = ++fetchSeq.current;
+    let s;
+    let rows = null;
     try {
       const detail = await getCastSubjectDetail(subjectId, { includeSamples: true });
-      const s = detail?.subject || detail;
-      setSubject(s);
-      if (s) {
-        setForm({
-          name: s.name || '', description: s.description || '',
-          trigger_word: s.trigger_word || '', voice_id: s.voice_id || '',
-          bible: s.bible || '',
-        });
-        setTrainingSettings(trainingSettingsFromSubject(s));
-      }
-      if (detail?.samples) {
-        setSamples(detail.samples);
-      }
-      return s;
+      s = detail?.subject || detail;
+      rows = detail?.samples || null;
     } catch (e) {
-      // legacy fallback
-      const s = await getCastSubject(subjectId);
-      setSubject(s);
-      if (s) {
-        setForm({
-          name: s.name || '', description: s.description || '',
-          trigger_word: s.trigger_word || '', voice_id: s.voice_id || '',
-          bible: s.bible || '',
-        });
-        setTrainingSettings(trainingSettingsFromSubject(s));
-      }
-      return s;
+      s = await getCastSubject(subjectId);
     }
-  }, [subjectId]);
+    if (seq < acceptFrom.current) return { stale: true };
+    acceptFrom.current = seq;
+    setSubject(s);
+    if (s) {
+      if (reset) {
+        resetOverview(overviewFromSubject(s));
+        resetTraining(trainingSettingsFromSubject(s));
+      } else {
+        syncOverview(overviewFromSubject(s), { overwrite });
+        syncTraining(trainingSettingsFromSubject(s));
+      }
+    }
+    if (rows) setSamples(rows);
+    return { subject: s, samples: rows };
+  }, [subjectId, resetOverview, resetTraining, syncOverview, syncTraining]);
+
+  const loadSubject = useCallback(
+    async (options) => (await refreshSubject(options)).subject,
+    [refreshSubject],
+  );
 
   const loadSamples = useCallback(async () => {
     const data = await listSamples(subjectId);
@@ -170,21 +246,30 @@ const CastMemberPage = () => {
     return data.samples || [];
   }, [subjectId]);
 
+  // Subject and samples; one request when the detail endpoint includes samples.
+  const refreshAll = useCallback(async (options) => {
+    const result = await refreshSubject(options);
+    if (result.stale) return result;
+    const rows = result.samples || (await loadSamples());
+    return { ...result, samples: rows };
+  }, [refreshSubject, loadSamples]);
+
   useEffect(() => {
     let alive = true;
+    ignoreEarlierFetches();
     (async () => {
       setLoading(true);
       try {
-        const s = await loadSubject();
-        if (alive && !s) setError('Subject not found.');
-        const rows = await loadSamples();
+        const { subject: s, samples: rows, stale } = await refreshAll({ reset: true });
+        if (!alive || stale) return;
+        if (!s) setError('Subject not found.');
         // If a generation/regeneration is already in flight when we land on the
         // page (e.g. after a refresh), auto-resume polling so finished images
         // appear without a manual reload.
-        if (alive && (rows || []).some(isPending)) {
+        if (rows.some(isPending)) {
           setGenerateActive(true);
         }
-        if (alive && ((rows || []).some(isPending) || s?.training_status === 'training')) {
+        if (rows.some(isPending) || s?.training_status === 'training') {
           pollCount.current = 0;
           setPolling(true);
         }
@@ -195,17 +280,19 @@ const CastMemberPage = () => {
       }
     })();
     return () => { alive = false; };
-  }, [loadSubject, loadSamples]);
+  }, [refreshAll]);
 
   // Poll while a generate/regenerate/train job is running; auto-stop when the
   // work settles (no pending samples and not training) or the cap is hit.
+  // The forms merge, so a poll never touches what the person is typing.
   useEffect(() => {
     if (!polling) return undefined;
     const id = setInterval(async () => {
       pollCount.current += 1;
       try {
-        const [s, rows] = await Promise.all([loadSubject(), loadSamples()]);
-        const stillGenerating = (rows || []).some(isPending);
+        const { subject: s, samples: rows, stale } = await refreshAll();
+        if (stale) return;
+        const stillGenerating = rows.some(isPending);
         const stillTraining = s?.training_status === 'training';
         if (!stillGenerating) setGenerateActive(false);
         if ((!stillGenerating && !stillTraining) || pollCount.current >= POLL_CAP) {
@@ -216,7 +303,7 @@ const CastMemberPage = () => {
       }
     }, POLL_MS);
     return () => clearInterval(id);
-  }, [polling, loadSubject, loadSamples]);
+  }, [polling, refreshAll]);
 
   const startPolling = () => { pollCount.current = 0; setPolling(true); };
 
@@ -224,10 +311,23 @@ const CastMemberPage = () => {
   // The backend now creates processes with additional_data.subject_id on dispatch.
   // This lets the page get live updates / terminal notifications without sole reliance on 5s poll,
   // enabling long-running day+ batch jobs to surface correctly.
+  // A finished job stays in activeProcesses for a few seconds, and this effect
+  // re-runs on every progress update of any job, so each job's end is acted on
+  // once (settledJobs). Otherwise it reloads repeatedly and can switch off a
+  // poll just started for the next job.
   const { activeProcesses } = useUnifiedProgress();
+  const settledJobs = useRef(new Set());
   useEffect(() => {
     if (!subjectId) return;
     const procs = Array.from(activeProcesses.values());
+    const isTerminal = (p) => TERMINAL_JOB_STATUSES.includes((p.status || '').toLowerCase());
+    const firstTimeSettled = (p) => {
+      const key = p.job_id || p.id;
+      if (key == null) return true;
+      if (settledJobs.current.has(key)) return false;
+      settledJobs.current.add(key);
+      return true;
+    };
 
     // Find any job for this subject (samples or training)
     const subjectMatch = procs.find((p) => {
@@ -243,13 +343,11 @@ const CastMemberPage = () => {
       return isThisSubject && isTrain;
     });
 
+    let settled = false;
     if (trainingMatch) {
-      const st = (trainingMatch.status || '').toLowerCase();
-      if (['complete', 'end', 'error', 'cancelled', 'failed'].includes(st)) {
+      if (isTerminal(trainingMatch)) {
         setTrainingJob(null);
-        loadSubject();
-        loadSamples();
-        setPolling(false);
+        if (firstTimeSettled(trainingMatch)) settled = true;
       } else {
         setTrainingJob({
           id: trainingMatch.id || trainingMatch.job_id,
@@ -262,16 +360,16 @@ const CastMemberPage = () => {
       setTrainingJob(null);
     }
 
-    if (subjectMatch) {
-      const st = (subjectMatch.status || '').toLowerCase();
-      if (['complete', 'end', 'error', 'cancelled', 'failed'].includes(st)) {
-        setGenerateActive(false);
-        loadSubject();
-        loadSamples();
-        setPolling(false);
-      }
+    if (subjectMatch && isTerminal(subjectMatch)) {
+      setGenerateActive(false);
+      if (firstTimeSettled(subjectMatch)) settled = true;
     }
-  }, [activeProcesses, subjectId, loadSubject, loadSamples]);
+
+    if (settled) {
+      refreshAll().catch(() => {});
+      setPolling(false);
+    }
+  }, [activeProcesses, subjectId, refreshAll]);
 
   // Safety net: if the subject status updates to not-training (e.g. from a manual
   // refresh or late poll), make sure we stop the sample/training poll spinner.
@@ -284,22 +382,30 @@ const CastMemberPage = () => {
     }
   }, [subject, samples]);
 
-  // Slow background poll for subject status (every 30s) so that even if the
-  // main polling flag was turned off prematurely (e.g. due to race on complete
-  // event before DB commit), we eventually see the final 'trained' status and
-  // clear the spinner / footer state.
+  // Slow follow-up poll once the fast poll is off but the member has not
+  // settled: training outlives POLL_CAP, and a terminal event can arrive
+  // before the worker's DB commit, leaving 'training' on screen. The safety
+  // net above clears the spinner once this sees the final status. An idle
+  // member is not polled.
+  const settling = subject?.training_status === 'training' || samples.some(isPending) || !!trainingJob;
+  useEffect(() => {
+    if (!subjectId || polling || !settling) return undefined;
+    const id = setInterval(() => { refreshAll().catch(() => {}); }, SETTLE_POLL_MS);
+    return () => clearInterval(id);
+  }, [subjectId, polling, settling, refreshAll]);
+
+  // Returning to the tab picks up changes made elsewhere in the meantime
+  // (another tab, a Film Crew run); the merge keeps any edit in progress.
   useEffect(() => {
     if (!subjectId) return undefined;
-    const id = setInterval(() => {
-      loadSubject().then((s) => {
-        if (s && s.training_status !== 'training') {
-          const stillGen = samples.some(isPending);
-          if (!stillGen) setPolling(false);
-        }
-      }).catch(() => {});
-    }, 30000);
-    return () => clearInterval(id);
-  }, [subjectId, loadSubject, samples]);
+    const onVisible = () => {
+      if (document.visibilityState === 'visible') refreshAll().catch(() => {});
+    };
+    document.addEventListener('visibilitychange', onVisible);
+    return () => document.removeEventListener('visibilitychange', onVisible);
+  }, [subjectId, refreshAll]);
+
+  useUnsavedChangesGuard(overview.isDirty || trainingForm.isDirty);
 
   // Arrow-key / Escape navigation for the enlarged image viewer (sheet = non-promoted).
   const sheetLenForKeys = samples.filter(isOnGenerateSheet).length;
@@ -314,10 +420,26 @@ const CastMemberPage = () => {
     return () => window.removeEventListener('keydown', onKey);
   }, [lightboxIdx, sheetLenForKeys]);
 
+  const editOverview = (key, value) => {
+    setSavedNote(false);
+    overview.setField(key, value);
+  };
+
+  const editTraining = (key, value) => {
+    setTrainingSettingsSaved(false);
+    trainingForm.setField(key, value);
+  };
+
+  // Sends only the fields the person changed, so a save cannot write this
+  // page's older copy of an untouched field over a newer one saved elsewhere.
   const handleSave = async () => {
+    const changes = overview.changes;
+    if (!Object.keys(changes).length) return;
     setSaving(true); setError(null);
     try {
-      await updateCastSubject(subjectId, form);
+      await updateCastSubject(subjectId, changes);
+      ignoreEarlierFetches();
+      overview.markSaved(changes);
       await loadSubject();
       setSavedNote(true);
     } catch (e) {
@@ -333,17 +455,22 @@ const CastMemberPage = () => {
       setError('Upload reference photos on Training Data first, then sync identity from photos.');
       return;
     }
+    if (overview.dirty.includes('bible') && !window.confirm(
+      'Sync identity from photos rewrites the identity bible, replacing your unsaved edits to it. Continue?',
+    )) {
+      return;
+    }
     setRebuildingBible(true); setError(null);
     try {
-      const data = await rebuildBibleFromRefs(subjectId, {
+      await rebuildBibleFromRefs(subjectId, {
         refresh_captions: true,
         refresh_sample_prompts: true,
       });
-      if (data.subject) setSubject(data.subject);
-      if (data.bible != null) {
-        setForm((prev) => ({ ...prev, bible: data.bible || '', trigger_word: data.trigger_word || prev.trigger_word }));
-      }
-      await loadSubject();
+      ignoreEarlierFetches();
+      // The bible is what the person asked to rewrite; the sync may also set a
+      // new trigger word, which merges like any other server change. Samples
+      // come back too: their prompts were recomposed.
+      await refreshAll({ overwrite: ['bible'] });
       setSavedNote(true);
     } catch (e) {
       setError(
@@ -370,11 +497,13 @@ const CastMemberPage = () => {
     }
     setPlanning(true); setError(null);
     try {
-      const data = await planCharacter(subjectId);
-      if (data.bible) setSubject((prev) => prev ? { ...prev, bible: data.bible, trigger_word: data.trigger_word || prev.trigger_word } : prev);
-      // Reload full sample list so promoted Training Data keepers stay in state
-      // (plan response only returns the new sheet rows).
-      await loadSamples();
+      await planCharacter(subjectId);
+      ignoreEarlierFetches();
+      // Reload the member and the full sample list: the plan may rewrite the
+      // bible and trigger word (merged into Overview without touching edits),
+      // and its response only carries the new sheet rows, not the promoted
+      // Training Data keepers.
+      await refreshAll();
     } catch (e) {
       setError(formatUiError(e.response?.data?.error) || 'Planning failed (the LLM may be offline).');
     } finally {
@@ -472,11 +601,16 @@ const CastMemberPage = () => {
     };
   };
 
+  // The backend stores training settings as one object, so the whole set is
+  // sent; untouched fields already hold the latest server values.
   const handleSaveTrainingSettings = async () => {
+    const sent = trainingForm.values;
     setSavingTrainingSettings(true);
     setError(null);
     try {
       await updateCastSubject(subjectId, { training_settings: buildTrainingSettingsPayload() });
+      ignoreEarlierFetches();
+      trainingForm.markSaved(sent);
       await loadSubject();
       setTrainingSettingsSaved(true);
     } catch (e) {
@@ -487,9 +621,13 @@ const CastMemberPage = () => {
   };
 
   const handleTrain = async () => {
+    const sent = trainingForm.values;
     setBusy(true); setError(null);
     try {
+      // Starting a run stores the settings it was started with.
       const res = await trainSubject(subjectId, { training_settings: buildTrainingSettingsPayload() });
+      ignoreEarlierFetches();
+      trainingForm.markSaved(sent);
       await loadSubject();
       if (res?.job_id) {
         setTrainingJob({ id: res.job_id, operation: 'train_lora' });
@@ -653,16 +791,22 @@ const CastMemberPage = () => {
           </Grid>
           <Grid item xs={12} sm={8} md={9}>
             <Box sx={{ display: 'flex', flexDirection: 'column', gap: 2, maxWidth: 560 }}>
+              <ChangedElsewhereNotice
+                conflicts={overview.conflicts}
+                labels={OVERVIEW_LABELS}
+                onReload={() => overview.resolve('server')}
+                onKeep={() => overview.resolve('mine')}
+              />
               <TextField label="Name" value={form.name}
-                         onChange={(e) => setForm({ ...form, name: e.target.value })} fullWidth />
+                         onChange={(e) => editOverview('name', e.target.value)} fullWidth />
               {subject.kind === 'character' && (
                 <TextField label="Trigger word (LoRA token)" value={form.trigger_word}
-                           onChange={(e) => setForm({ ...form, trigger_word: e.target.value })} fullWidth
+                           onChange={(e) => editOverview('trigger_word', e.target.value)} fullWidth
                            helperText="Rare token the LoRA trains on; every prompt must include it. Blank → uses the name." />
               )}
               <CastVoicePicker
                 value={form.voice_id}
-                onChange={(voiceId) => setForm((f) => ({ ...f, voice_id: voiceId }))}
+                onChange={(voiceId) => editOverview('voice_id', voiceId)}
                 disabled={saving}
               />
               <TextField
@@ -670,7 +814,7 @@ const CastMemberPage = () => {
                 value={form.description}
                 multiline
                 rows={3}
-                onChange={(e) => setForm({ ...form, description: e.target.value })}
+                onChange={(e) => editOverview('description', e.target.value)}
                 fullWidth
                 helperText="Optional brief for FilmCrew / script invent only. Not used for Cast generate when reference photos exist."
               />
@@ -691,7 +835,7 @@ const CastMemberPage = () => {
               <TextField
                 label="Identity bible"
                 value={form.bible}
-                onChange={(e) => setForm({ ...form, bible: e.target.value })}
+                onChange={(e) => editOverview('bible', e.target.value)}
                 multiline
                 rows={5}
                 fullWidth
@@ -704,7 +848,8 @@ const CastMemberPage = () => {
                 }
               />
               <Box sx={{ display: 'flex', gap: 1, flexWrap: 'wrap', alignItems: 'center' }}>
-                <Button variant="contained" onClick={handleSave} disabled={saving || !form.name}>
+                <Button variant="contained" onClick={handleSave}
+                        disabled={saving || !form.name || !overview.isDirty}>
                   {saving ? 'Saving…' : 'Save changes'}
                 </Button>
                 <Button
@@ -714,7 +859,10 @@ const CastMemberPage = () => {
                 >
                   {rebuildingBible ? 'Scanning photos…' : 'Sync identity from photos'}
                 </Button>
-                {savedNote && <Typography variant="caption" color="success.main">Saved</Typography>}
+                {savedNote && !overview.isDirty && <Typography variant="caption" color="success.main">Saved</Typography>}
+                {overview.isDirty && !saving && (
+                  <Typography variant="caption" color="text.secondary">Unsaved changes</Typography>
+                )}
               </Box>
             </Box>
           </Grid>
@@ -756,7 +904,7 @@ const CastMemberPage = () => {
           <DragDropImageUpload
             subjectId={subject.id}
             existingPaths={subject.ref_image_paths || []}
-            onUploaded={loadSubject}
+            onUploaded={() => loadSubject()}
             helperText="Uploads immediately to this cast member."
             extraItems={pendingPromoteThumbs}
             getPathStatus={(path) => refTrainStatus(path, subject)}
@@ -768,6 +916,14 @@ const CastMemberPage = () => {
             Train base must match generate base. Z-Image Turbo is the product default and
             trains + generates; SDXL Legacy is the older path. Steps blank = auto from image count.
           </Typography>
+          <Box sx={{ maxWidth: 720, mb: 1.5 }}>
+            <ChangedElsewhereNotice
+              conflicts={trainingForm.conflicts}
+              labels={TRAINING_LABELS}
+              onReload={() => trainingForm.resolve('server')}
+              onKeep={() => trainingForm.resolve('mine')}
+            />
+          </Box>
           <Grid container spacing={2} sx={{ mb: 2, maxWidth: 720 }}>
             <Grid item xs={12} sm={8}>
               <TextField
@@ -776,10 +932,7 @@ const CastMemberPage = () => {
                 size="small"
                 fullWidth
                 value={trainingSettings.base_model_id || 'zimage-turbo'}
-                onChange={(e) => {
-                  setTrainingSettingsSaved(false);
-                  setTrainingSettings({ ...trainingSettings, base_model_id: e.target.value });
-                }}
+                onChange={(e) => editTraining('base_model_id', e.target.value)}
                 SelectProps={{ native: true }}
                 helperText="Global default: Settings → Media models"
               >
@@ -791,40 +944,45 @@ const CastMemberPage = () => {
             <Grid item xs={6} sm={4}>
               <TextField label="Resolution" type="number" size="small" fullWidth
                 value={trainingSettings.resolution}
-                onChange={(e) => { setTrainingSettingsSaved(false); setTrainingSettings({ ...trainingSettings, resolution: e.target.value }); }}
+                onChange={(e) => editTraining('resolution', e.target.value)}
                 helperText="Snapped to 64px (512–1024)" />
             </Grid>
             <Grid item xs={6} sm={4}>
               <TextField label="LoRA rank" type="number" size="small" fullWidth
                 value={trainingSettings.rank}
-                onChange={(e) => { setTrainingSettingsSaved(false); setTrainingSettings({ ...trainingSettings, rank: e.target.value }); }}
+                onChange={(e) => editTraining('rank', e.target.value)}
                 helperText="4–64" />
             </Grid>
             <Grid item xs={6} sm={4}>
               <TextField label="LoRA alpha" type="number" size="small" fullWidth
                 value={trainingSettings.alpha}
-                onChange={(e) => { setTrainingSettingsSaved(false); setTrainingSettings({ ...trainingSettings, alpha: e.target.value }); }}
+                onChange={(e) => editTraining('alpha', e.target.value)}
                 helperText="Usually matches rank" />
             </Grid>
             <Grid item xs={6} sm={4}>
               <TextField label="Learning rate" type="number" size="small" fullWidth
                 value={trainingSettings.learning_rate}
-                onChange={(e) => { setTrainingSettingsSaved(false); setTrainingSettings({ ...trainingSettings, learning_rate: e.target.value }); }}
+                onChange={(e) => editTraining('learning_rate', e.target.value)}
                 inputProps={{ step: '0.00001' }} />
             </Grid>
             <Grid item xs={6} sm={4}>
               <TextField label="Steps (optional)" type="number" size="small" fullWidth
                 value={trainingSettings.steps}
-                onChange={(e) => { setTrainingSettingsSaved(false); setTrainingSettings({ ...trainingSettings, steps: e.target.value }); }}
+                onChange={(e) => editTraining('steps', e.target.value)}
                 helperText="Blank = auto from image count" />
             </Grid>
             <Grid item xs={12}>
               <Button variant="outlined" size="small" onClick={handleSaveTrainingSettings}
-                disabled={savingTrainingSettings || training}>
+                disabled={savingTrainingSettings || training || !trainingForm.isDirty}>
                 {savingTrainingSettings ? 'Saving…' : 'Save training settings'}
               </Button>
-              {trainingSettingsSaved && (
+              {trainingSettingsSaved && !trainingForm.isDirty && (
                 <Typography variant="caption" color="success.main" sx={{ ml: 2 }}>Saved</Typography>
+              )}
+              {trainingForm.isDirty && !savingTrainingSettings && (
+                <Typography variant="caption" color="text.secondary" sx={{ ml: 2 }}>
+                  Unsaved changes (Train LoRA also uses and saves them)
+                </Typography>
               )}
             </Grid>
           </Grid>
