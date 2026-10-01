@@ -1013,8 +1013,15 @@ class BatchVideoGenerator:
                         from backend.models import db as _db, Subject
                         from backend.services.cast_lock import subjects_to_lock, resolve_lora_strength
                         subs = [_db.session.get(Subject, int(sid)) for sid in batch_request.subject_ids]
+                        subs = [s for s in subs if s]
+                        try:
+                            from backend.services.cast_lora_selection import select_cast_loras
+                            subs = select_cast_loras(subs).subjects
+                        except Exception as _sel_err:
+                            # A refusal is raised again, with its message, by the keyframe render.
+                            logger.info("Cast LoRA selection for video batch: %s", _sel_err)
                         cast_lora_paths, cast_lock_prefix = subjects_to_lock(
-                            [s for s in subs if s], include_bible=True)
+                            subs, include_bible=True)
                         # Compute representative training res from cast subjects so
                         # _generate_keyframe_still can produce appropriately scaled seeds.
                         from backend.services.lora_training_settings import settings_for_subject

@@ -865,6 +865,7 @@ class BatchImageGenerator:
                 output_path=out_path,
                 style=prompt.style or "realistic",
                 keep_pipeline=True,
+                image_model=prompt.model,
             )
             meta = still.metadata or {}
             logger.info(
