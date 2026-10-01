@@ -187,6 +187,7 @@ function ReviewDialog({ open, onClose, onChanged }) {
 
 const describeSweep = (sweep) => {
   if (!sweep?.at) return "No sweep yet.";
+  if (sweep.skipped) return `Sweep skipped ${new Date(sweep.at).toLocaleTimeString()}: ${sweep.skipped}.`;
   const parts = [`Last sweep ${new Date(sweep.at).toLocaleTimeString()}: ${sweep.files} files`];
   if (sweep.seeded) parts.push(`first read of the code (${sweep.audit_findings || 0} existing findings to read once)`);
   else parts.push(`${sweep.changed} changed`);

@@ -176,10 +176,35 @@ def _matches_head(paths: List[str]) -> Set[str]:
 
 # -- the sweep ---------------------------------------------------------------------------------
 
+_GIT_BUSY = ("MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "rebase-merge", "rebase-apply", "index.lock")
+
+
+def _git_busy() -> bool:
+    """A merge, cherry-pick, rebase or commit is under way.
+
+    Git rewrites the working tree before it moves HEAD — here up to half a
+    minute apart while hooks run and the commit is signed — so a file read in
+    between matches neither side and would look out-of-band.
+    """
+    guard.engine()
+    from scripts.inbound_guard.sources import git
+
+    git_dir = Path(git(guard.REPO_ROOT, "rev-parse", "--path-format=absolute", "--git-dir", check=False)
+                   .decode().strip() or ".")
+    return any((git_dir / name).exists() for name in _GIT_BUSY)
+
+
 def sweep(paths: Optional[Iterable[str]] = None) -> Dict:
     """Bring the baseline up to date and judge out-of-band changes. Needs an app context."""
     if not guard.is_on():
         return {"skipped": "guard off"}
+    if _git_busy():
+        # Shown in Settings, so a lock git left behind is noticed rather than silently stopping sweeps.
+        skipped = {"skipped": "a git operation is in progress; the next sweep reads it",
+                   "at": time.strftime("%Y-%m-%dT%H:%M:%S")}
+        _last_summary.clear()
+        _last_summary.update(skipped)
+        return skipped
     if not _sweep_lock.acquire(timeout=300):
         return {"skipped": "another sweep is running"}
     try:
@@ -224,6 +249,13 @@ def _sweep(paths: Optional[Iterable[str]]) -> Dict:
         changed.append((rel, path, sha, st))
 
     head_match = _matches_head([rel for rel, *_ in changed]) if not seeding else set()
+
+    # A held file that now matches HEAD came back through git (reverted, or the
+    # same change committed and judged there): it is no longer out-of-band.
+    if full:
+        held_rows = {rel: row for rel, row in rows.items() if row.status == "held"}
+        for rel in _matches_head(list(held_rows)):
+            _accept_current(held_rows[rel], max_bytes, note="the file now matches HEAD")
 
     # One engine pass over every changed file. No repo is passed on purpose: the
     # watch reads untracked surfaces (custom nodes, extensions) that this clone's
@@ -352,6 +384,24 @@ def accept_landed(event: dict) -> None:
         row.status, row.attribution = "clean", "product"
         row.accepted = json.dumps(sorted(accepted | prints))
     db.session.commit()
+
+
+def _accept_current(row, max_bytes: int, note: str) -> None:
+    """Take what the file holds now as judged: clear its hold and remember its findings."""
+    if row.scan_id:
+        guard.mark(row.scan_id, "clear", by="source watch", note=note)
+    path = guard.REPO_ROOT / row.path
+    text, _binary = _read(path, max_bytes)
+    accepted = set(json.loads(row.accepted or "[]"))
+    if text is not None:
+        sha = _sha256(path)
+        verdict = guard.engine().scan([guard.engine().change_from_texts(row.path, None, text)],
+                                      source="watch", subject=row.path, mode="observe")
+        accepted |= {_fingerprint(f, sha) for f in verdict.findings}
+        st = path.stat()
+        row.sha256, row.size, row.mtime = sha, st.st_size, st.st_mtime
+    row.accepted = json.dumps(sorted(accepted))
+    row.status, row.attribution = "clean", "git"
 
 
 def approve_held(scan_id: int) -> None:
