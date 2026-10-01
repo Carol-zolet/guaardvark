@@ -372,6 +372,22 @@ def test_no_plugin_server_listens_on_every_interface_by_default():
         assert '--host "$BIND_HOST"' in text
 
 
+def test_docker_publishes_its_database_queue_and_ollama_on_loopback_only():
+    import yaml
+
+    services = yaml.safe_load((ROOT / "docker-compose.yml").read_text())["services"]
+    expected = {
+        "postgres": "${GUAARDVARK_POSTGRES_PUBLISH_HOST:-127.0.0.1}:5432:5432",
+        "redis": "${GUAARDVARK_REDIS_PUBLISH_HOST:-127.0.0.1}:6379:6379",
+        "ollama": "${GUAARDVARK_OLLAMA_PUBLISH_HOST:-127.0.0.1}:11434:11434",
+    }
+    for name, port in expected.items():
+        assert services[name]["ports"] == [port]
+    # The UI and the API stay reachable from other devices (with the API key).
+    assert services["frontend"]["ports"] == ["5173:5173"]
+    assert services["backend"]["ports"] == ["5000:5000"]
+
+
 def test_no_plugin_lets_any_page_read_its_replies():
     for app in sorted((ROOT / "plugins").glob("*/service/app.py")):
         source = app.read_text()

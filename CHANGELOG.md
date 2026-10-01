@@ -32,6 +32,14 @@
   status only. The backend also masks any credential-named field in a plugin health reply it
   relays. Restart the upscaling and Vision Pipeline plugins after updating, or their protected
   routes refuse the backend's calls until you do.
+- **Docker publishes PostgreSQL, Redis and Ollama on 127.0.0.1 only.** `docker-compose.yml`
+  published all three on every interface of the Docker host, so anyone on the network could log
+  in to the database with the stock password, queue Celery tasks through Redis, or use Ollama.
+  The backend reaches them inside Docker's network and is unaffected; tools on the host (`psql`,
+  `redis-cli`, `ollama`) still connect at `127.0.0.1`. The Web UI and API ports are unchanged.
+  `GUAARDVARK_POSTGRES_PUBLISH_HOST`, `GUAARDVARK_REDIS_PUBLISH_HOST` and
+  `GUAARDVARK_OLLAMA_PUBLISH_HOST` in `.env` publish one more widely on purpose (INSTALL.md,
+  Docker, "Ports").
 - **The Vision Pipeline, Video Editor and the Discord bot's health port listen on 127.0.0.1.** They
   listened on every interface with no login, so anyone on the network could start the camera and
   read its frames, or run editor jobs. Every caller is the backend on the same machine.
