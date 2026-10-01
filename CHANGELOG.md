@@ -46,6 +46,12 @@
 - **Film Crew: the "Regenerate shot" dialog survives the storyboard refresh.** The refresh that
   runs for a minute after a shot regen replaced the storyboard with a spinner every 5 seconds,
   closing a regen dialog opened for the next shot and losing its prompt. It now refreshes in place.
+- **Cast: saving training settings or training keeps the identity sync.** Both replaced the cast
+  member's stored settings with the six hyperparameters, dropping the "grounded from photos" flag,
+  the vision tags and marks, the class token, the manual-edit flag and the post-train smoke score.
+  The Overview then warned that the bible might not match the photos, and every Train re-ran the
+  vision sync from the photos and rewrote the bible. The hyperparameters are now merged into the
+  stored settings. Train also stores the settings it was started with when no identity sync runs.
 - **Audio Studio: withdraw consent for a voice clip, or delete it.** "Manage imported clips" under
   the reference clip lists each clip and whether consent is recorded. *Withdraw consent* removes
   the record and keeps the clip, which is not cloned again until consent is confirmed; *Delete
