@@ -493,11 +493,18 @@ def _load_demo_step(native_id):
 
 
 def _load_unified_progress(process_id):
-    """Fetch the live ProgressEvent dict for `process_id`. None if unknown."""
+    """Fetch the live ProgressEvent for `process_id` as the dict
+    adapt_unified_progress reads. None if unknown."""
     from backend.utils.unified_progress_system import get_unified_progress
     ups = get_unified_progress()
     snapshot = ups.get_active_processes() if hasattr(ups, "get_active_processes") else {}
-    return snapshot.get(process_id)
+    event = snapshot.get(process_id)
+    if event is None:
+        return None
+    # The progress system holds ProgressEvent objects; the adapter calls .get().
+    payload = dict(event) if isinstance(event, dict) else dict(getattr(event, "__dict__", {}))
+    payload.setdefault("process_id", process_id)
+    return payload
 
 
 def _load_video_gen(batch_id):

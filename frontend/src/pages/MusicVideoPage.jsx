@@ -46,6 +46,7 @@ import useJobsGate from "../hooks/useJobsGate";
 import { useUnifiedProgress } from "../contexts/UnifiedProgressContext";
 import LiveLatentPreview from "../components/videogen/LiveLatentPreview";
 import { formatUiError } from "../utils/uiError";
+import { dispatchWarning } from "../api/taskQueue";
 
 const POLL_MS = 5000;
 const DEFAULT_KEYFRAME_MODEL = "flux-schnell";
@@ -623,6 +624,9 @@ const MusicVideoPage = () => {
   const [file, setFile] = useState(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState(null);
+  // A step the backend saved but could not queue ({dispatched: false,
+  // warning}); shown on the music video it belongs to.
+  const [notice, setNotice] = useState(null);
   const [pluginStatus, setPluginStatus] = useState(null); // {comfyui_reachable, ...} or {status:{comfyui:'stopped',...}} or {plugins:[...]} for storyboard guards
   const [models, setModels] = useState([]); // installed Ollama models for the director-model dropdown (embedding models filtered backend-side)
   const fileInputRef = useRef(null);
@@ -872,6 +876,11 @@ const MusicVideoPage = () => {
     return live.reduce((a, b) => ((b.timestamp || 0) > (a.timestamp || 0) ? b : a));
   }, [detail, getProcessesByType, activeProcesses]);
 
+  const noteDispatch = (id, result) => {
+    const warning = dispatchWarning(result);
+    if (warning) setNotice({ id, text: warning });
+  };
+
   const handleCreate = async () => {
     setError(null);
     if (!name.trim() || !stylePrompt.trim() || !file) {
@@ -923,6 +932,7 @@ const MusicVideoPage = () => {
       if (fileInputRef.current) fileInputRef.current.value = "";
       await refreshList();
       setSelectedId(mv.id);
+      noteDispatch(mv.id, mv);
     } catch (e) {
       setError(formatUiError(e?.response?.data?.error) || e.message || "Failed to create music video.");
     } finally {
@@ -936,6 +946,7 @@ const MusicVideoPage = () => {
     setError(null);
     try {
       const updated = await analyzeMusicVideo(detail.id);
+      noteDispatch(detail.id, updated);
       setDetail(updated);
       await refreshList();
     } catch (e) {
@@ -951,6 +962,7 @@ const MusicVideoPage = () => {
     setError(null);
     try {
       const updated = await approveMusicVideo(detail.id);
+      noteDispatch(detail.id, updated);
       setDetail(updated);
       await refreshList();
     } catch (e) {
@@ -1364,7 +1376,8 @@ const MusicVideoPage = () => {
                         if (!window.confirm(msg)) return;
                         try {
                           setBusy(true);
-                          await replanMusicVideo(detail.id);
+                          const replanned = await replanMusicVideo(detail.id);
+                          noteDispatch(detail.id, replanned);
                           await refreshDetail(detail.id);
                         } catch (e) {
                           setError(formatUiError(e?.response?.data?.error) || e.message || "Failed to re-plan");
@@ -1393,6 +1406,12 @@ const MusicVideoPage = () => {
                 {detail.style_prompt}
               </Typography>
               <Divider sx={{ mb: 2 }} />
+
+              {notice && notice.id === detail.id && (
+                <Alert severity="warning" sx={{ mb: 2 }} onClose={() => setNotice(null)}>
+                  {notice.text}
+                </Alert>
+              )}
 
               {needsAnalysis(detail) && !isAnalysisRunning(detail) && (
                 <Stack spacing={1.5} sx={{ mb: 2 }}>
