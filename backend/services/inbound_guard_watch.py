@@ -304,6 +304,13 @@ def _sweep(paths: Optional[Iterable[str]]) -> Dict:
         audit.files = summary["changed"]
         summary["audit_scan_id"] = guard.record(audit)
         summary["audit_findings"] = len(audit_findings)
+    if full:
+        from backend.services import inbound_guard_posture
+
+        try:
+            summary["posture"] = inbound_guard_posture.run()
+        except Exception as exc:
+            logger.warning("source watch: posture checks failed: %s", exc)
     summary["seconds"] = round(time.monotonic() - started, 2)
     _last_summary.clear()
     _last_summary.update(summary, at=time.strftime("%Y-%m-%dT%H:%M:%S"))
