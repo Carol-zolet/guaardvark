@@ -15,6 +15,29 @@
   such a name, Docker opened at a name) needs that address in `GUAARDVARK_CORS_ORIGINS`, and the
   refusal says which. Under Docker the backend also answers to `backend`, its name on the compose
   network.
+- **Every other server Guaardvark starts answers only to this machine's names too.** A page
+  re-pointed at 127.0.0.1 could drive the plugin ports directly: queue ComfyUI workflows and read
+  its outputs, turn on the Vision Pipeline's camera, run Audio Foundry, Video Editor or upscaling
+  jobs. Audio Foundry, upscaling, swarm, Video Editor, Vision Pipeline, GPU Embedding, the Discord
+  bot's health port, the MCP server's HTTP transport, the reboot log and `llx`'s lite server now
+  apply the backend's Host rule (421 `host_not_allowed`), with the same settings. ComfyUI gets it
+  from a Guaardvark extension in `plugins/comfyui/guaardvark_nodes/`, loaded through
+  `guaardvark_model_paths.yaml`; ComfyUI itself is unchanged and the ComfyUI link on the video
+  page still opens. Restart each plugin to pick this up.
+- **No plugin reply carries a token any more.** Upscaling's and the Vision Pipeline's `/health`
+  replies held the bearer token their protected routes check, and the backend passed the
+  upscaling one on to any browser at `/api/upscaling/health` and `/api/plugins/<id>/health`. The
+  token now lives in `data/.upscaling_internal_secret` and `data/.vision_pipeline_internal_secret`
+  (readable by your user only), which the plugin and the backend both read; health replies report
+  status only. The backend also masks any credential-named field in a plugin health reply it
+  relays. Restart the upscaling and Vision Pipeline plugins after updating, or their protected
+  routes refuse the backend's calls until you do.
+- **The Vision Pipeline, Video Editor and the Discord bot's health port listen on 127.0.0.1.** They
+  listened on every interface with no login, so anyone on the network could start the camera and
+  read its frames, or run editor jobs. Every caller is the backend on the same machine.
+  `GUAARDVARK_VISION_PIPELINE_HOST`, `GUAARDVARK_VIDEO_EDITOR_HOST` and `DISCORD_HEALTH_HOST` open
+  them deliberately (INSTALL.md, "Plugin servers and the network"). The Video Editor also stopped
+  letting any web page read its replies (it answered every origin with CORS).
 - **A GET or HEAD request no longer changes anything.** Any web page can make a browser send
   either without asking, and both are let through by design. `HEAD /api/enhanced-chat/history/all`
   deleted all chat history; only `DELETE` does now. Settings → Test LLM

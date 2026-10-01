@@ -32,8 +32,9 @@ def client():
             })
         )
         from service.app import app, _auth_token
-        with TestClient(app) as c:
-            c.headers["Authorization"] = f"Bearer {_auth_token}"
+        # An address the service's Host check answers.
+        with TestClient(app, base_url="http://127.0.0.1:8201") as c:
+            c.headers["Authorization"] = f"Bearer {_auth_token()}"
             yield c
 
 
@@ -42,6 +43,16 @@ class TestHealthEndpoint:
         resp = client.get("/health")
         assert resp.status_code == 200
         assert resp.json()["status"] in ("healthy", "degraded", "error")
+
+    def test_health_never_carries_the_token(self, client):
+        from service.app import _auth_token
+        resp = client.get("/health", headers={"Authorization": ""})
+        assert "token" not in resp.json()
+        assert _auth_token() not in resp.text
+
+    def test_a_rebound_name_is_refused(self, client):
+        resp = client.post("/camera/start", json={}, headers={"Host": "evil.example:8201"})
+        assert resp.status_code == 421
 
 class TestStreamLifecycle:
     def test_start_stop_stream(self, client):

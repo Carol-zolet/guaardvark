@@ -30,6 +30,16 @@ Accepted, whatever the port:
 VITE_ALLOWED_HOSTS=all turns the check off, as it turns off Vite's: the
 frontend then answers any name and passes its requests on to the backend.
 A request without a Host header passes; browsers always send one.
+
+Every other HTTP server Guaardvark starts applies the same rule through the
+adapters below, since a page re-pointed at 127.0.0.1 reaches those ports as
+easily as this one: the plugin servers (Audio Foundry, upscaling, swarm,
+video editor, vision pipeline, GPU embedding, the Discord bot's health port),
+the ComfyUI Guaardvark launches (plugins/comfyui/guaardvark_nodes/), the MCP
+server's HTTP transport and the reboot log server. Plugin servers cannot
+import the backend package, so they load this file through
+backend/utils/sidecar_guard.py as a member of a stand-in package. It imports
+only the standard library and cors_policy, relatively, and must stay that way.
 """
 
 from __future__ import annotations
@@ -40,7 +50,7 @@ import logging
 import re
 from typing import Optional
 
-from backend.utils import cors_policy
+from . import cors_policy
 
 logger = logging.getLogger(__name__)
 
@@ -119,6 +129,29 @@ def refusal_message(host_header: str, scheme: str = "http", forwarded_host: Opti
     )
 
 
+def refusal_body(host_header: Optional[str], scheme: str = "http", forwarded_host: Optional[str] = None) -> bytes:
+    """The JSON body of the 421 every adapter below sends."""
+    message = refusal_message(host_header or "", scheme, forwarded_host or None)
+    return json.dumps({"error": message, "code": HOST_CODE}).encode()
+
+
+def single_host(values) -> Optional[str]:
+    """The Host header among all the values a request carried: None without
+    one, and "" (never allowed) for more than one, since which of two a
+    server would honour is not something to guess."""
+    values = list(values)
+    if not values:
+        return None
+    return values[0] if len(values) == 1 else ""
+
+
+def _log_refusal(method, path, client, host_header) -> None:
+    logger.warning(
+        "[HOST] Refused %s %s from %s addressed to %r",
+        method, path, client, (host_header or "")[:100],
+    )
+
+
 class HostCheckMiddleware:
     """WSGI middleware applying host_allowed to every request, Socket.IO's
     included; wrap app.wsgi_app with it after socketio.init_app."""
@@ -132,16 +165,74 @@ class HostCheckMiddleware:
             return self.wsgi_app(environ, start_response)
         forwarded = (environ.get("HTTP_X_FORWARDED_PROTO") or "").split(",")[0].strip().lower()
         scheme = forwarded if forwarded in ("http", "https") else environ.get("wsgi.url_scheme", "http")
-        logger.warning(
-            "[HOST] Refused %s %s from %s addressed to %r",
-            environ.get("REQUEST_METHOD"), environ.get("PATH_INFO"),
-            environ.get("REMOTE_ADDR"), (host_header or "")[:100],
-        )
+        _log_refusal(environ.get("REQUEST_METHOD"), environ.get("PATH_INFO"), environ.get("REMOTE_ADDR"), host_header)
         forwarded_host = (environ.get("HTTP_X_FORWARDED_HOST") or "").split(",")[0].strip()
-        message = refusal_message(host_header, scheme, forwarded_host or None)
-        body = json.dumps({"error": message, "code": HOST_CODE}).encode()
+        body = refusal_body(host_header, scheme, forwarded_host)
         start_response(STATUS, [
             ("Content-Type", "application/json"),
             ("Content-Length", str(len(body))),
         ])
         return [body]
+
+
+class HostCheckASGIMiddleware:
+    """ASGI middleware applying host_allowed to every HTTP request and
+    websocket: ``app.add_middleware(HostCheckASGIMiddleware)`` on FastAPI or
+    Starlette, or wrap any ASGI app in it. A refused websocket is closed
+    before it is accepted, which the server answers with 403."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        kind = scope.get("type")
+        if kind not in ("http", "websocket"):
+            await self.app(scope, receive, send)
+            return
+        headers = scope.get("headers") or ()
+        host_header = single_host(v.decode("latin-1") for k, v in headers if k.lower() == b"host")
+        if host_allowed(host_header):
+            await self.app(scope, receive, send)
+            return
+        client = scope.get("client")
+        _log_refusal(scope.get("method", "WEBSOCKET"), scope.get("path"), client[0] if client else None, host_header)
+        if kind == "websocket":
+            await send({"type": "websocket.close", "code": 1008})
+            return
+        forwarded_host = next(
+            (v.decode("latin-1").split(",")[0].strip() for k, v in headers if k.lower() == b"x-forwarded-host"),
+            None,
+        )
+        scheme = "https" if scope.get("scheme") == "https" else "http"
+        body = refusal_body(host_header, scheme, forwarded_host)
+        await send({
+            "type": "http.response.start",
+            "status": 421,
+            "headers": [
+                (b"content-type", b"application/json"),
+                (b"content-length", str(len(body)).encode()),
+            ],
+        })
+        await send({"type": "http.response.body", "body": body})
+
+
+def aiohttp_middleware():
+    """An aiohttp middleware applying host_allowed to every request, websocket
+    upgrades included. Put it first in the application's list so it runs
+    before any other. aiohttp is imported only when this is called."""
+    from aiohttp import web
+
+    @web.middleware
+    async def host_check(request, handler):
+        host_header = single_host(request.headers.getall("Host", []))
+        if host_allowed(host_header):
+            return await handler(request)
+        _log_refusal(request.method, request.path, request.remote, host_header)
+        forwarded_host = (request.headers.get("X-Forwarded-Host") or "").split(",")[0].strip()
+        return web.Response(
+            status=421,
+            body=refusal_body(host_header, request.scheme, forwarded_host),
+            content_type="application/json",
+        )
+
+    return host_check

@@ -1,8 +1,9 @@
 """
 Upscaling API — proxy endpoints for the Upscaling plugin service.
 
-Proxies requests to the upscaling service on port 8202.
-Auth token is fetched from the plugin's /health endpoint and cached.
+Proxies requests to the upscaling service on port 8202. The bearer token its
+protected routes check is read from data/.upscaling_internal_secret
+(backend/utils/sidecar_guard.py), never from a reply.
 """
 
 import io
@@ -18,6 +19,8 @@ from werkzeug.security import safe_join
 from werkzeug.utils import secure_filename
 
 from backend.utils.response_utils import success_response, error_response
+from backend.utils.secret_redaction import redact_fields
+from backend.utils.sidecar_guard import read_internal_token
 
 logger = logging.getLogger(__name__)
 
@@ -28,28 +31,10 @@ UPSCALING_TIMEOUT = 10  # seconds for quick endpoints
 # Model weights can be large; urlretrieve in the plugin holds the HTTP request open until done.
 UPSCALING_DOWNLOAD_READ_TIMEOUT = 1800  # seconds
 
-# Cached bearer token — fetched from plugin /health on first use
-_cached_token: str | None = None
-
-
-def _get_auth_token() -> str | None:
-    """Fetch and cache the bearer token from the upscaling plugin."""
-    global _cached_token
-    if _cached_token:
-        return _cached_token
-    try:
-        resp = requests.get(f"{UPSCALING_URL}/health", timeout=3)
-        if resp.status_code == 200:
-            _cached_token = resp.json().get("auth_token")
-            return _cached_token
-    except Exception:
-        pass
-    return None
-
-
 def _auth_headers() -> dict:
-    """Return Authorization header for upscaling service."""
-    token = _get_auth_token()
+    """Authorization header for the upscaling service. Read on every call,
+    so a token the plugin created after this process started is used."""
+    token = read_internal_token("upscaling")
     if token:
         return {"Authorization": f"Bearer {token}"}
     return {}
@@ -132,7 +117,7 @@ def health():
     """Get upscaling service health status."""
     data, status = _proxy_get("/health")
     if status == 200:
-        return success_response(data=data, message="Upscaling service healthy")
+        return success_response(data=redact_fields(data), message="Upscaling service healthy")
     return error_response(data.get("error", "Service unavailable"), status)
 
 

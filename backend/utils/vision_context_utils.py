@@ -3,11 +3,14 @@
 Fetches and formats vision context from the Vision Pipeline plugin
 for injection into chat messages alongside RAG context.
 
-Handles bearer token exchange: on first call, fetches token from
-the plugin's /health endpoint and caches it for subsequent requests.
+The bearer token the plugin's /analyze, /frame and PUT /config check is read
+from data/.vision_pipeline_internal_secret (backend/utils/sidecar_guard.py),
+never from a reply.
 """
 import logging
 import requests
+
+from backend.utils.sidecar_guard import read_internal_token
 
 logger = logging.getLogger(__name__)
 
@@ -15,28 +18,10 @@ VISION_PIPELINE_URL = "http://localhost:8201"
 VISION_CONTEXT_TIMEOUT = 2  # seconds
 VISION_ANALYZE_TIMEOUT = 30  # seconds
 
-# Cached bearer token — fetched from plugin /health on first use
-_cached_token: str | None = None
-
-
-def _get_auth_token() -> str | None:
-    """Fetch and cache the bearer token from the vision pipeline plugin."""
-    global _cached_token
-    if _cached_token:
-        return _cached_token
-    try:
-        resp = requests.get(f"{VISION_PIPELINE_URL}/health", timeout=2)
-        if resp.status_code == 200:
-            _cached_token = resp.json().get("token")
-            return _cached_token
-    except Exception:
-        pass
-    return None
-
 
 def _auth_headers() -> dict:
     """Return Authorization header if token is available."""
-    token = _get_auth_token()
+    token = read_internal_token("vision_pipeline")
     if token:
         return {"Authorization": f"Bearer {token}"}
     return {}

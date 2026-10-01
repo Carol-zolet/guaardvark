@@ -10,17 +10,17 @@ import torch
 if not torch.cuda.is_available():
     torch.cuda.is_available = lambda: False
 
-# Fix 11: Import AUTH_TOKEN from service.auth, not _auth_token from app
 from service.app import app
-from service.auth import AUTH_TOKEN
+from service.auth import auth_token
 
-AUTH_HEADER = {"Authorization": f"Bearer {AUTH_TOKEN}"}
+AUTH_HEADER = {"Authorization": f"Bearer {auth_token()}"}
 
 
 @pytest.fixture(scope="module")
 def client():
-    """TestClient as context manager triggers lifespan events."""
-    with TestClient(app) as c:
+    """TestClient as context manager triggers lifespan events. The base URL
+    is an address the service's Host check answers."""
+    with TestClient(app, base_url="http://127.0.0.1:8202") as c:
         yield c
 
 
@@ -30,7 +30,14 @@ def test_health_endpoint(client):
     data = resp.json()
     assert "status" in data
     assert "gpu" in data
-    assert "auth_token" in data  # Fix 2 verification
+    # The backend relays /health to browsers; the token stays in its file.
+    assert "auth_token" not in data
+    assert auth_token() not in resp.text
+
+
+def test_a_rebound_name_is_refused(client):
+    resp = client.get("/health", headers={"Host": "evil.example:8202"})
+    assert resp.status_code == 421
 
 
 def test_models_endpoint(client):
