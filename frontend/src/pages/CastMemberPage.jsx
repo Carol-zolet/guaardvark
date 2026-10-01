@@ -22,6 +22,7 @@ import {
 } from '../api/productionService';
 import { SubjectThumb } from '../components/filmcrew/CastLibraryView';
 import DragDropImageUpload from '../components/filmcrew/DragDropImageUpload';
+import CastVoicePicker from '../components/filmcrew/CastVoicePicker';
 
 const POLL_MS = 5000;
 const POLL_CAP = 180; // 15 min safety cap on a generate/train poll loop
@@ -659,9 +660,11 @@ const CastMemberPage = () => {
                            onChange={(e) => setForm({ ...form, trigger_word: e.target.value })} fullWidth
                            helperText="Rare token the LoRA trains on; every prompt must include it. Blank → uses the name." />
               )}
-              <TextField label="Voice ID (optional)" value={form.voice_id}
-                         onChange={(e) => setForm({ ...form, voice_id: e.target.value })} fullWidth
-                         helperText="Audio Foundry voice for narration. Leave blank to clear." />
+              <CastVoicePicker
+                value={form.voice_id}
+                onChange={(voiceId) => setForm((f) => ({ ...f, voice_id: voiceId }))}
+                disabled={saving}
+              />
               <TextField
                 label="Description"
                 value={form.description}

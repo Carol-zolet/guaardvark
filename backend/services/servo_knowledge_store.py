@@ -54,6 +54,153 @@ REFLEXES = {
         "model": "universal",
         "notes": "Global pixel diff threshold. Lower = more sensitive.",
     },
+
+    # ---- Second-pass zoom refinement (servo_controller._estimate_coordinates) ----
+    # These three live here, next to the thing they constrain, rather than as an
+    # `if` at the call site — a per-family conditional in one function is how the
+    # next model gets missed.
+    "refine_enabled": {
+        "value": False,
+        "source": "servo_20260921_222821 blind-calibration session, n=15, gemma4:e4b @1000x1000",
+        "confidence": 0.4,
+        "model": "universal",
+        "notes": (
+            "Second zoom-in pass over a crop around the anchor. OFF, measured on two "
+            "boards.\n"
+            "  Fixed five-dot board (2026-09-21, 15 clicks): catastrophic. Median "
+            "absolute X error 6.0px anchor-alone to 54.2px after refine, worse than the "
+            "anchor on 10 of 15. Not a framing problem — the target was fully inside the "
+            "crop in 15 of 15, so a wider crop does not fix it.\n"
+            "  Jittered board, 40 fresh positions (2026-09-22): roughly neutral. With "
+            "calibration on, median distance 45.4px without refine against 49.9px with "
+            "it, at double the inference cost. Hit rate slightly favours refine, median "
+            "error does not.\n"
+            "  The pattern across both: refine hurts most when the anchor is already "
+            "good and has room to help only when the anchor is poor. That is a bad trade "
+            "for a pass you cannot condition on knowing which case you are in.\n"
+            "  Re-enable only when eye_bakeoff --mode pipeline,full beats --mode "
+            "anchor,calibrated on BOTH median |X| and median distance, on frames the "
+            "threshold was not tuned against. As of 2026-09-22 it loses on both."
+        ),
+    },
+    "refine_max_disagreement_px": {
+        "value": 40,
+        "source": "servo_20260921_222821: anchor |X| error spanned -7 to +8.5px on the 11 "
+                  "uncontaminated clicks; +38.5px was the worst case, and only on the "
+                  "target the page had poisoned with its own red click markers",
+        "confidence": 0.4,
+        "model": "universal",
+        "notes": (
+            "Discard a refined point that disagrees with the calibration-corrected anchor "
+            "by more than this in EITHER axis, and keep the anchor. A refine asking for a "
+            "larger X correction than that is asserting an anchor error never once observed "
+            "on this display. Loosening it puts the damage straight back: at 60 the gate "
+            "keeps 9 of 15 and median |X| returns to 37px."
+        ),
+    },
+    # ---- Correction loop (servo_controller._correct_estimate) ----
+    # Armed from the eye's MEASURED accuracy, not from being stuck: an eye
+    # coarser than the target earns a second look before the click. Numbers
+    # below carry what they were measured against; change them with a new
+    # measurement, not a hunch.
+    "correction_mode": {
+        "value": "auto",
+        "source": "operator decision 2026-09-24 (was shadow since 2026-09-22): on for eyes "
+                  "measured to judge well, shadow for unmeasured ones. Measured with "
+                  "eye_bakeoff --mode corrected on 30 trainer targets: gemma4:e4b 5-7 hits "
+                  "on its estimate alone, 16 with the loop applied",
+        "confidence": 0.5,
+        "model": "universal",
+        "notes": (
+            "off: never probe. shadow: run the loop, log estimate/final/drift, click "
+            "the ESTIMATE. on: click the FINAL. auto: on when the eye's measured judge "
+            "rate meets EYE_JUDGE_MIN_BOTH_RATE, shadow when unmeasured (an eye measured "
+            "below it is never armed). Precedence: vision_config "
+            "correction_mode > env GUAARDVARK_SERVO_CORRECTION > this value. The "
+            "shadow pass criterion (plan 2026-09-22): median |final-truth| on Y at "
+            "most 0.7 of |estimate-truth|, X no worse than estimate+5px, unparseable "
+            "or not-visible stops at most 15% of armed rows."
+        ),
+    },
+    "correction_target_px": {
+        "value": 24,
+        "source": "vision_trainer_grid dot diameter 24px; a UI button is rarely smaller",
+        "confidence": 0.5,
+        "model": "universal",
+        "notes": "An eye measured at or under this needs no second look. A box narrowed "
+                 "to this on both axes counts as converged.",
+    },
+    "correction_max_steps": {
+        "value": 4,
+        "source": "initial_design; the ServoController ctor's max_corrections default",
+        "confidence": 0.5,
+        "model": "universal",
+        "notes": "Probes per click after probe 0 (the estimate itself).",
+    },
+    "correction_max_steps_cap": {
+        "value": 10,
+        "source": "2026-09-24: a 600px seed box needs ~10 side calls to reach the 24px "
+                  "target at the 0.725 per-step keep; measured probe cost 0.2-0.5s",
+        "confidence": 0.5,
+        "model": "universal",
+        "notes": "Upper bound on probes per click once the budget is sized from the "
+                 "search box; correction_max_steps is the floor.",
+    },
+    "correction_deadline_s": {
+        "value": 4.0,
+        "source": "gemma4:e4b anchor inference 0.6-1.2s per call on this box, 2026-09-22",
+        "confidence": 0.5,
+        "model": "universal",
+        "notes": "Wall-clock budget for the probes. A probe that cannot finish inside "
+                 "it is never started, so the worst case is deadline + one in flight.",
+    },
+    "correction_session_cap": {
+        "value": 12,
+        "source": "initial_design: 12 armed clicks x ~5.5s worst case = about 66s per task",
+        "confidence": 0.5,
+        "model": "universal",
+        "notes": "Armed clicks (shadow or on) per servo instance; past it the loop disarms.",
+    },
+    "correction_keep_fraction": {
+        "value": 0.55,
+        "source": "initial_design",
+        "confidence": 0.4,
+        "model": "universal",
+        "notes": "After a left/right or above/below call the box is cut at the probe and "
+                 "(1 - this) of the discarded half is kept, so one wrong call cannot "
+                 "exclude the target.",
+    },
+    "correction_gain_y": {
+        "value": 0.69,
+        "source": "gemma4:e4b Y compression slope 0.65-0.70 across three boards @1000x1000, "
+                  "2026-09-22 (servo_calibrate --from-bench)",
+        "confidence": 0.6,
+        "model": "universal",
+        "notes": "How much of the true centre-to-target distance the eye reports on Y. With "
+                 "no calibration active the seed box is extended away from screen centre "
+                 "by 1.15 * |v| * (1/gain - 1) so the box still covers the target.",
+    },
+    "correction_gain_x": {
+        "value": 1.0,
+        "source": "gemma4:e4b X error is 22px noise with no centre-pull, same boards",
+        "confidence": 0.6,
+        "model": "universal",
+        "notes": "1.0 means no spoke extension on X.",
+    },
+    "refine_y_echo_band": {
+        "value": 20,
+        "source": "servo_20260921_222821: refine returned y of exactly 499 or 500 on 9 of 15 "
+                  "crops, and the crop's centre y equalled the anchor's y in 15 of 15 "
+                  "(edge clamping never fired)",
+        "confidence": 0.5,
+        "model": "universal",
+        "notes": (
+            "Half-width, in the refine's own normalised-to-1000 space, around the crop's "
+            "vertical centre. The crop is built centred on the anchor, so a refine y inside "
+            "this band restates the anchor rather than measuring anything — keep the "
+            "anchor's y and let the gate judge x on its own."
+        ),
+    },
 }
 
 
@@ -194,14 +341,22 @@ def get_vision_config(model_name: str = "") -> Dict[str, Any]:
         if model_name.startswith(f"{key}-") or model_name.startswith(f"{key}:"):
             return config
 
-    # Known multimodal families not yet in MODEL_VISION_CONFIGS (e.g. qwen3-vl:4b).
-    if model_name_looks_vision(model_name):
+    # A model with no row: whether it sees is the capability resolver's answer
+    # (Ollama's capabilities first; the name guess only when Ollama is down).
+    # The name markers alone got both ways wrong: qwen3.5, qwen3.6 and
+    # ministral-3 see, a gemma4-named build without a vision tower does not.
+    try:
+        from backend.services.model_capability_resolver import _vision_with_evidence
+        sees, evidence = _vision_with_evidence(model_name)
+    except Exception:  # noqa: BLE001 - fall back to the name markers
+        sees, evidence = model_name_looks_vision(model_name), "name_markers"
+    if sees:
         return {
             **_DEFAULT_VISION_CONFIG,
             "has_vision": True,
             "vision_model": None,
-            "source": "name_heuristic_vision",
-            "notes": f"'{model_name}' looks multimodal by name — treat as native vision.",
+            "source": f"resolver_{evidence}",
+            "notes": f"'{model_name}' sees natively ({evidence}).",
         }
 
     logger.info(f"No vision config for '{model_name}', using text-only defaults")
@@ -292,6 +447,8 @@ class ServoArchive:
         reason: str = "",
         inference_ms: int = 0,
         truth: Optional[Dict[str, Any]] = None,
+        correction: Optional[Dict[str, Any]] = None,
+        correction_skip: str = "",
     ):
         """Record a servo interaction to the universal archive."""
         entry = {
@@ -338,6 +495,22 @@ class ServoArchive:
         # can see which way the model was consistently off
         if correction_log:
             entry["correction_log"] = correction_log
+        # Correction-loop summary (mode, why it armed, estimate, final, drift,
+        # why it stopped). ADDITIVE. With truth present both |estimate - truth|
+        # and |final - truth| are computable per row, which is the shadow
+        # measurement the default mode is decided from.
+        if correction_skip:
+            # Why the loop did not arm on this click (eye_accurate(13px<=24px),
+            # mode_off, session_cap, ...). Proves the gate reads the store.
+            entry["correction_skip"] = correction_skip
+        if correction:
+            entry["correction"] = correction
+            tx, ty = (truth or {}).get("target_cx"), (truth or {}).get("target_cy")
+            est = correction.get("estimate")
+            fin = correction.get("final")
+            if tx is not None and ty is not None and est and fin:
+                entry["correction"]["estimate_error_px"] = round(((est[0] - tx) ** 2 + (est[1] - ty) ** 2) ** 0.5, 1)
+                entry["correction"]["final_error_px"] = round(((fin[0] - tx) ** 2 + (fin[1] - ty) ** 2) ** 0.5, 1)
 
         with self._write_lock:
             with open(self._archive_path, "a") as f:
@@ -678,6 +851,20 @@ def _load_calibration_file() -> Dict[str, Any]:
         return data
 
 
+# One entry per model@WxH now carries three kinds of fact about a model on this
+# machine: the calibration FIT (flat keys, as always), the coordinate CONVENTION
+# it was measured to speak, and its measured pointing ACCURACY. They used to
+# live in three files written by three tools, and the resolver could read only
+# one of them — which is why a hand-written row outranked an eye four times more
+# accurate. Same file, same lock, same mtime cache; only the shape grows.
+_FIT_KEYS = ("model", "a_x", "b_x", "a_y", "b_y", "k", "cx", "cy", "elbow")
+_MEASUREMENT_SECTIONS = ("coords", "accuracy", "judge")
+
+
+def _has_fit(entry: Optional[Dict[str, Any]]) -> bool:
+    return bool(entry) and any(k in entry for k in _FIT_KEYS)
+
+
 def load_servo_calibration(model: str, screen_w: int, screen_h: int) -> Optional[Dict[str, Any]]:
     """Return the calibration fit for (model, resolution), or None.
 
@@ -693,7 +880,10 @@ def load_servo_calibration(model: str, screen_w: int, screen_h: int) -> Optional
     make aim WORSE than uncalibrated.
     """
     entry = _load_calibration_file().get(_calibration_key(model, screen_w, screen_h))
-    if not entry:
+    # A measurement-only entry (coords/accuracy, no fit) is not malformed; it is
+    # a model that has been probed but never calibrated. Without this guard the
+    # KeyError below logged "malformed" on every servo init for such a model.
+    if not entry or not _has_fit(entry):
         return None
     try:
         family = str(entry.get("model", "linear"))
@@ -735,9 +925,76 @@ def save_servo_calibration(model: str, screen_w: int, screen_h: int, fit: Dict[s
             data = json.loads(_CALIBRATION_PATH.read_text())
         except (OSError, json.JSONDecodeError):
             pass
-        data[key] = fit
+        prior = data.get(key) or {}
+        # Replace the fit, keep the measurements. The fit tool knows nothing about
+        # coords/accuracy and must not be able to erase them by saving.
+        merged = {k: prior[k] for k in _MEASUREMENT_SECTIONS if k in prior}
+        merged.update(fit)
+        rb = merged.get("_rollback")
+        if isinstance(rb, dict):
+            merged["_rollback"] = {k: v for k, v in rb.items() if k not in _MEASUREMENT_SECTIONS}
+        data[key] = merged
         _CALIBRATION_PATH.parent.mkdir(parents=True, exist_ok=True)
         _CALIBRATION_PATH.write_text(json.dumps(data, indent=2) + "\n")
         _calibration_cache.update(mtime=None, data={})  # force re-read
     logger.info(f"servo calibration saved for {key}: {fit}")
     return key
+
+
+def record_measurement(model: str, screen_w: int, screen_h: int,
+                       section: str, data: Dict[str, Any]) -> str:
+    """Write one measurement section for model@WxH, leaving the fit and the other
+    sections untouched. `section` is "coords", "accuracy" or "judge"."""
+    if section not in _MEASUREMENT_SECTIONS:
+        raise ValueError(f"unknown measurement section {section!r}; expected one of {_MEASUREMENT_SECTIONS}")
+    key = _calibration_key(model, screen_w, screen_h)
+    with _calibration_lock:
+        store = {}
+        try:
+            store = json.loads(_CALIBRATION_PATH.read_text())
+        except (OSError, json.JSONDecodeError):
+            pass
+        entry = store.setdefault(key, {})
+        entry[section] = dict(data)
+        _CALIBRATION_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _CALIBRATION_PATH.write_text(json.dumps(store, indent=2) + "\n")
+        _calibration_cache.update(mtime=None, data={})
+    try:
+        from backend.services.model_capability_resolver import invalidate
+        invalidate(model)
+    except Exception:
+        pass
+    logger.info(f"servo measurement recorded for {key}: {section}")
+    return key
+
+
+def load_model_measurements(model: str, screen_w: Optional[int] = None,
+                            screen_h: Optional[int] = None) -> Dict[str, Any]:
+    """{"screen": "WxH"|None, "coords": dict|None, "accuracy": dict|None}.
+
+    With a screen: that exact entry. Without one: the newest entry for the model
+    at any resolution — a coordinate convention does not depend on resolution,
+    accuracy does, so the returned "screen" says which resolution the accuracy
+    was measured at and the ranker can discount a mismatch.
+    """
+    store = _load_calibration_file()
+    if screen_w and screen_h:
+        entry = store.get(_calibration_key(model, screen_w, screen_h)) or {}
+        return {"screen": f"{int(screen_w)}x{int(screen_h)}" if entry else None,
+                "coords": entry.get("coords"), "accuracy": entry.get("accuracy"),
+                "judge": entry.get("judge")}
+    prefix = f"{(model or 'unknown').strip()}@"
+    best_key, best_stamp = None, ""
+    for key, entry in store.items():
+        if not key.startswith(prefix) or not isinstance(entry, dict):
+            continue
+        stamp = max(str((entry.get("coords") or {}).get("probed_at", "")),
+                    str((entry.get("accuracy") or {}).get("measured_at", "")),
+                    str(entry.get("fitted_at", "")))
+        if best_key is None or stamp > best_stamp:
+            best_key, best_stamp = key, stamp
+    if best_key is None:
+        return {"screen": None, "coords": None, "accuracy": None, "judge": None}
+    entry = store[best_key]
+    return {"screen": best_key.split("@", 1)[1], "coords": entry.get("coords"),
+            "accuracy": entry.get("accuracy"), "judge": entry.get("judge")}

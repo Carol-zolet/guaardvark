@@ -9,8 +9,11 @@ Every interaction can be recorded by a TrainingDataCollector for self-supervised
 """
 
 import json
+import math
 import logging
+import os
 import time
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
 from PIL import Image
@@ -34,21 +37,97 @@ DIRECTION_MAP = {
 
 TASKBAR_H = 30  # tint2 taskbar at the bottom — never click here
 
+CORRECTION_MODES = ("off", "shadow", "on", "auto")
+CORRECTION_ENV = "GUAARDVARK_SERVO_CORRECTION"
+PROBE_RING = (220, 30, 30)   # the correction probe's marker: red, unlike the cursor reticle
+PROBE_MARKER_PX = 48
+PROBE_CROP_MIN = 320
+PROBE_CROP_MAX = 600
+SEED_HALF_MAX = 600.0
+FINAL_DRIFT_MAX = 250.0
+
+
+@dataclass
+class CorrectionOutcome:
+    """What one run of the correction loop did, and why it stopped."""
+    estimate: Tuple[int, int]
+    final: Tuple[int, int]
+    mode: str
+    armed_reason: str
+    stop_reason: str = ""
+    steps: List[Dict[str, Any]] = field(default_factory=list)
+    elapsed_ms: int = 0
+    applied: bool = False
+    clamped: bool = False
+    unparsed: int = 0
+
+    @property
+    def drift_px(self) -> float:
+        ex, ey = self.estimate
+        fx, fy = self.final
+        return ((fx - ex) ** 2 + (fy - ey) ** 2) ** 0.5
+
+    def summary(self) -> Dict[str, Any]:
+        return {
+            "mode": self.mode,
+            "armed_reason": self.armed_reason,
+            "stop_reason": self.stop_reason,
+            "estimate": list(self.estimate),
+            "final": list(self.final),
+            "drift_px": round(self.drift_px, 1),
+            "steps": len(self.steps),
+            "applied": self.applied,
+            "clamped": self.clamped,
+            "unparsed": self.unparsed,
+            "elapsed_ms": self.elapsed_ms,
+        }
+
 
 class ServoController:
-    """
-    Closed-loop motor control for precise mouse targeting.
+    """Aim, look again, click.
+
+    One shot by default: the eye estimates where the target is, the cursor
+    moves, the click lands, and a pixel-change poll verifies the screen
+    reacted. When the eye's measured accuracy is coarser than the target, or
+    unknown, a correction loop runs first: a red marker is drawn at the
+    estimate on the captured frame, the eye is asked only which way the
+    target lies from the marker's centre, and a search box narrows until it
+    says "same" or the budget runs out. The mouse never moves during probes.
+    In shadow mode the loop runs and is logged but the estimate is clicked;
+    in on mode the final is. The numbers live in REFLEXES["correction_*"]
+    (servo_knowledge_store) next to what they were measured against.
 
     Usage:
         servo = ServoController(screen, analyzer)
         result = servo.click_target("Reply button under first comment")
     """
 
-    def __init__(self, screen, analyzer, max_corrections: int = 4, collector=None, vision_config: Dict = None):
+    def __init__(self, screen, analyzer, max_corrections: int = 4, collector=None,
+                 vision_config: Dict = None, eye_accuracy_px: Optional[float] = None,
+                 eye_judge_rate: Optional[float] = None):
         self.screen = screen
         self.analyzer = analyzer
         self.max_corrections = max_corrections
         self.collector = collector
+        # Measured median pointing error of this eye on this screen, from the
+        # measurement store; None when unmeasured. The correction loop arms on
+        # it: an eye coarser than the target earns a second look.
+        self.eye_accuracy_px = eye_accuracy_px
+        # How often this eye judges a marker's offset right (None: unmeasured).
+        self.eye_judge_rate = eye_judge_rate
+        # Correction loop. Precedence: an explicit vision_config value, then the
+        # environment, then the reflex. "explicit" is what lets a training
+        # (single_attempt) run exercise the loop when it asks for it.
+        self.correction_mode, self._correction_explicit = self._resolve_correction_mode(vision_config or {})
+        if self.correction_mode == "auto":
+            # On for an eye measured to judge well, where it roughly doubled
+            # hits; shadow for an unmeasured one, whose judging is unknown and
+            # whose shadow rows are the evidence for measuring it.
+            from backend.services.model_capability_data import EYE_JUDGE_MIN_BOTH_RATE
+            good = self.eye_judge_rate is not None and self.eye_judge_rate >= EYE_JUDGE_MIN_BOTH_RATE
+            self.correction_mode = "on" if good else "shadow"
+        self._corrections_armed_this_session = 0
+        self._last_correction_skip = ""
         # Optional TrainerTruthProbe (trainer_truth_probe.py) — attached by the
         # agent loop during training sessions. When present, clicks on the
         # vision trainer get TRUE hit/miss labels from the page's own
@@ -91,6 +170,45 @@ class ServoController:
                     logger.info(f"Servo calibration active for {model_name}: {self._calibration}")
             except Exception as e:
                 logger.debug(f"servo calibration load skipped: {e}")
+
+        # Coordinate convention. An explicit value in vision_config always wins —
+        # that is how a hand-measured row and the eye bake-off's deliberate
+        # overrides keep working. Everything else asks the capability resolver
+        # rather than falling back to a silent "xy", which contradicted the very
+        # prompt this class sends ("box_2d: [y1, x1, y2, x2]") and, on any model
+        # without its own row, clicked with the axes swapped. Measured on
+        # gemma4:e4b: 326px median error read the wrong way against 63px read
+        # the right way, on the same frames.
+        self._coords = None
+        if not self._vision_config.get("coord_order"):
+            try:
+                from backend.services.model_capability_resolver import coords_for
+                conv = coords_for(getattr(analyzer, "default_model", "") or "",
+                                  (self.screen_w, self.screen_h))
+                self._coords = conv
+                if conv.order:
+                    self._vision_config = dict(self._vision_config)
+                    self._vision_config["coord_order"] = conv.order
+                    # Assign, never setdefault: a grid of None means absolute
+                    # pixels, and 0 is how the parser is told that. setdefault
+                    # would let the text-only default's 1000 leak through and
+                    # divide raw pixels by a thousand.
+                    self._vision_config["internal_width"] = conv.grid or 0
+                    self._vision_config.setdefault("coord_style", conv.style)
+                    logger.info(
+                        "Servo coordinate convention for %s: %s %s/%s (%s, confidence %.2f)",
+                        getattr(analyzer, "default_model", "?"), conv.style, conv.order,
+                        conv.grid, conv.source, conv.confidence,
+                    )
+                else:
+                    logger.warning(
+                        "Servo has no known coordinate convention for %s (%s) — clicks "
+                        "will be refused rather than guessed. Run "
+                        "backend.tools.probe_coord_order.",
+                        getattr(analyzer, "default_model", "?"), conv.source,
+                    )
+            except Exception as e:  # noqa: BLE001
+                logger.debug("coordinate convention lookup skipped: %s", e)
 
         logger.info(f"Servo initialized for {self.screen_w}x{self.screen_h} screen")
 
@@ -159,16 +277,27 @@ class ServoController:
             "inference_ms": self._last_inference_ms,
         }
 
-    def click_target(self, target_description: str, button: str = "left", single_attempt: bool = False) -> Dict[str, Any]:
+    def click_target(self, target_description: str, button: str = "left", single_attempt: bool = False,
+                     precision: Optional[bool] = None, attempt: int = 1) -> Dict[str, Any]:
         """
-        Click on a described target element. ONE-SHOT, human-pattern:
+        Click on a described target element, human-pattern:
           1. See — capture screen, ask vision model to locate target
+          1b. Look again — the correction loop, when the eye's measured
+              accuracy says the estimate deserves it (see _should_correct)
           2. Move — cursor to those coords (via screen.move → xdotool)
           3. Click — at those coords (via screen.click → xdotool)
           4. Verify — Differential Pixel Comparison (DPC) polling
           5. Record — to training archive
+
+        single_attempt: a training run; the loop stays off unless the mode was
+            set explicitly for this run.
+        precision: True arms the loop (the caller's second try at the same
+            target); False forbids it; None leaves it to the accuracy gate.
+        attempt: the caller's attempt number at this target, recorded as-is.
         """
         start = time.time()
+        correction: Optional[CorrectionOutcome] = None
+        self._last_correction_skip = ""
 
         # 1. SEE — capture + vision-model coordinate estimate
         screenshot, _ = self.screen.capture()
@@ -227,6 +356,15 @@ class ServoController:
                 }
 
         x, y = coords
+        # 1b. LOOK AGAIN
+        armed, armed_reason = self._should_correct(target_description, single_attempt, precision, screenshot)
+        if armed:
+            self._corrections_armed_this_session += 1
+            correction = self._correct_estimate(screenshot, target_description, (x, y), armed_reason)
+            if correction.applied:
+                x, y = correction.final
+        else:
+            self._last_correction_skip = armed_reason
         # 2. MOVE
         move_result = self.screen.move(x, y)
         if not move_result.get("success", False):
@@ -241,13 +379,16 @@ class ServoController:
                 elapsed_ms=elapsed_ms,
                 reason="move_failed",
                 post_action_effect="not_checked",
+                correction=correction,
+                attempt=attempt,
             )
             return {
                 "success": False, "verified": False,
                 "target_found": True, "click_issued": False,
                 "post_action_effect": "not_checked",
                 "x": x, "y": y,
-                "corrections": 0, "attempt": 1,
+                "corrections": len(correction.steps) if correction else 0, "attempt": attempt,
+                "correction": correction.summary() if correction else None,
                 "time_ms": elapsed_ms,
                 "reason": "move_failed",
                 "error": move_result.get("error", "move failed"),
@@ -301,6 +442,8 @@ class ServoController:
             reason="" if click_issued else click_result.get("error", "click_failed"),
             post_action_effect=post_action_effect,
             truth=truth,
+            correction=correction,
+            attempt=attempt,
         )
 
         return {
@@ -308,7 +451,8 @@ class ServoController:
             "target_found": True, "click_issued": click_issued,
             "post_action_effect": post_action_effect,
             "x": x, "y": y,
-            "corrections": 0, "attempt": 1,
+            "corrections": len(correction.steps) if correction else 0, "attempt": attempt,
+            "correction": correction.summary() if correction else None,
             "time_ms": elapsed_ms,
             "reason": "" if click_issued else "click_failed",
             "error": click_result.get("error"),
@@ -397,9 +541,18 @@ class ServoController:
         reason: str = "",
         post_action_effect: str = "",
         truth: Dict[str, Any] | None = None,
+        correction: Optional[CorrectionOutcome] = None,
+        attempt: int = 1,
     ) -> None:
         """Record telemetry without treating predicted coords as ground truth."""
         x, y = coords
+        corr_summary = correction.summary() if correction else None
+        corr_log = [
+            {"direction": st.get("direction", ""), "dx": st.get("dx"), "dy": st.get("dy"),
+             "probe": st.get("probe"), "visible": st.get("visible")}
+            for st in (correction.steps if correction else [])
+            if st.get("direction")
+        ]
         raw = getattr(self, "_last_raw_coords", (0, 0))
         scale = getattr(self, "_last_scale", (1.0, 1.0))
         model_name = getattr(self.analyzer, "default_model", "unknown")
@@ -422,6 +575,11 @@ class ServoController:
         # gate on truth.true_hit and label from (target_cx, target_cy).
         if truth is not None:
             metadata["truth"] = truth
+        if corr_summary is not None:
+            metadata["correction"] = corr_summary
+        else:
+            metadata["correction_skip"] = self._last_correction_skip
+        metadata["attempt"] = attempt
         if self.collector:
             try:
                 self.collector.record(
@@ -429,7 +587,7 @@ class ServoController:
                     crosshair_pos=(x, y),
                     target_description=target_description,
                     target_actual=(x, y),
-                    corrections=[],
+                    corrections=corr_log,
                     success=success,
                     metadata=metadata,
                 )
@@ -446,11 +604,11 @@ class ServoController:
                 actual_click_coords=(x, y),
                 scale_factor=scale,
                 success=success,
-                corrections=0,
-                attempt=1,
+                corrections=len(corr_log),
+                attempt=attempt,
                 time_ms=elapsed_ms,
                 screen_size=(self.screen_w, self.screen_h),
-                correction_log=[],
+                correction_log=corr_log,
                 raw_response=self._last_raw_response,
                 parse_path=self._last_parse_path,
                 detection_source=self._last_detection_source,
@@ -461,6 +619,8 @@ class ServoController:
                 reason=reason,
                 inference_ms=self._last_inference_ms,
                 truth=truth,
+                correction=corr_summary,
+                correction_skip="" if corr_summary else self._last_correction_skip,
             )
         except Exception as e:
             logger.debug(f"Archive record failed (non-fatal): {e}")
@@ -554,6 +714,50 @@ class ServoController:
 
         return None
 
+    def _anchor_request(self, target: str):
+        """(prompt, num_predict) for the anchor pass, from the eye's dialect.
+
+        Token budget comes from the convention too. A thinking-variant model
+        that ignores Ollama's think:false spends its budget thinking first;
+        128 tokens produces an empty answer and looks like "cannot point".
+        """
+        from backend.services.model_capability_data import COORD_STYLES, DEFAULT_STYLE
+        style = self._vision_config.get("coord_style") or DEFAULT_STYLE
+        template = COORD_STYLES.get(style, COORD_STYLES[DEFAULT_STYLE])["prompt"]
+        budget = 128
+        if self._coords is not None:
+            budget = max(budget, int(getattr(self._coords, "min_num_predict", 128) or 128))
+        budget = max(budget, int(self._vision_config.get("min_num_predict", 0) or 0))
+        return template.format(target=target), budget
+
+    def _anchor_result(self, anchor_coords, result1, parse_path: str = "anchor_only"):
+        """Return the anchor pass's own answer, offset-corrected and clamped.
+
+        Single exit for every path that decides the refinement is not worth
+        trusting: refinement disabled, refinement unparseable, or refinement
+        rejected by the agreement gate. `parse_path` lands in the servo archive
+        so which of those happened is answerable from the log alone.
+        """
+        raw_x, raw_y = anchor_coords
+        ox = self._vision_config.get("offset_x", 0)
+        oy = self._vision_config.get("offset_y", 0)
+        raw_x += ox
+        raw_y += oy
+
+        self._last_raw_coords = (raw_x, raw_y)
+        self._last_parse_path = parse_path
+        self._last_detection_source = "vision"
+        self._last_inference_ms = getattr(result1, "inference_ms", 0)
+
+        x = max(0, min(self.screen_w - 1, int(raw_x)))
+        y = max(0, min(self.screen_h - TASKBAR_H - 1, int(raw_y)))
+
+        logger.info(
+            f"Servo coords ({parse_path}): ({x}, {y}) (offset {ox},{oy}) "
+            f"model={getattr(self.analyzer, 'default_model', '?')}"
+        )
+        return (x, y)
+
     def _estimate_coordinates(self, screenshot: Image.Image, target: str) -> Optional[Tuple[int, int]]:
         """Find where the target is on screen using a Two-Pass Zoom-In pipeline.
 
@@ -587,14 +791,29 @@ class ServoController:
         # Reset raw-response telemetry so a failed run doesn't inherit the
         # previous target's model output in the servo log.
         self._last_raw_response = ""
-        prompt_pass1 = (
-            f"Detect the {target}. Reply with ONLY a JSON list "
-            f'[{{"box_2d": [y1, x1, y2, x2], "label": "{target}"}}] '
-            f"with coordinates normalized to 1000. If the target is not visible, "
-            f"reply with an empty list []."
-        )
+        self._last_parse_path = ""
+
+        # No known convention means no click. Reading a model's numbers with the
+        # wrong axis order does not fail loudly — it lands a plausible click on
+        # the wrong thing and reports success, which is worse than not clicking.
+        if self._coords is not None and self._coords.order is None:
+            self._last_failure_reason = "coord_convention_unknown"
+            logger.warning(
+                "Servo refusing to click: no measured coordinate convention for %s. "
+                "Run backend.tools.probe_coord_order against this model.",
+                getattr(self.analyzer, "default_model", "?"),
+            )
+            return None
+
+        # The request dialect is part of the convention. Asking every model in
+        # Google's box_2d form made models that answer only in their own form
+        # look unable to point at all; ministral-3 says "[]" to this request
+        # and answers a plain point request at ~140px. The default style's
+        # prompt is the historical string verbatim, so gemma4's path is
+        # byte-identical (a test pins that).
+        prompt_pass1, num_predict1 = self._anchor_request(target)
         result1 = self.analyzer.analyze_fullsize(
-            screenshot, prompt=prompt_pass1, num_predict=128, temperature=0.1
+            screenshot, prompt=prompt_pass1, num_predict=num_predict1, temperature=0.1
         )
         if not result1.success or not result1.description:
             # Vision Ollama call itself failed (timeout, network, model
@@ -612,7 +831,7 @@ class ServoController:
         self._last_raw_response = f"anchor: {result1.description}"
 
         # Parse Anchor (accepts point or box, but box is better for ROI)
-        anchor_coords = self._parse_detection_response(result1.description)
+        anchor_coords = self._parse_detection_response(result1.description, image_size=screenshot.size)
         if anchor_coords is None:
             anchor_coords = self._parse_coordinates(result1.description)
 
@@ -650,6 +869,15 @@ class ServoController:
                 ax, ay = cal_ax, cal_ay
             # The fallback path below reuses anchor_coords — keep it corrected too.
             anchor_coords = (cal_ax, cal_ay)
+
+        # The second pass is opt-in. It is off by default because it measured as a
+        # net loss (see REFLEXES["refine_enabled"] for the numbers and the
+        # re-enable criterion). An explicit vision_config value still wins, which
+        # is what lets eye_bakeoff compare both configurations in one run.
+        _cfg_refine = self._vision_config.get("disable_refine")
+        refine_on = (not _cfg_refine) if _cfg_refine is not None else bool(get_reflex("refine_enabled", False))
+        if not refine_on:
+            return self._anchor_result(anchor_coords, result1, "anchor_only_refine_disabled")
 
         # --- PASS 2: REFINEMENT PASS (ZOOM-IN) ---
         # Extract a localized crop centered on the anchor (widened when the
@@ -695,6 +923,26 @@ class ServoController:
                 # lx/1000 * actual_crop_width + left_offset
                 gx = int((lx / 1000.0) * (right - left) + left)
                 gy = int((ly / 1000.0) * (bottom - top) + top)
+
+                # The crop is built centred on the anchor, so a refine y sitting at
+                # the crop's vertical centre is restating the anchor, not measuring
+                # anything. Take the anchor's y verbatim and let the gate below
+                # judge x on its own merits.
+                if abs(ly - 500.0) <= get_reflex("refine_y_echo_band", 20):
+                    gy = ay
+                    self._last_parse_path = "zoom_refinement_y_echo"
+
+                # Agreement gate: a refinement that wants to move the click further
+                # than the anchor has ever been wrong is not a correction.
+                cax, cay = anchor_coords
+                _gate = get_reflex("refine_max_disagreement_px", 40)
+                if max(abs(gx - cax), abs(gy - cay)) > _gate:
+                    logger.info(
+                        f"Servo: refine ({gx},{gy}) disagrees with anchor ({cax},{cay}) "
+                        f"by more than {_gate}px — keeping the anchor"
+                    )
+                    return self._anchor_result(anchor_coords, result1, "anchor_refine_rejected")
+
                 
                 # Phase 1.4: Apply global calibration offsets
                 ox = self._vision_config.get("offset_x", 0)
@@ -703,7 +951,11 @@ class ServoController:
                 gy += oy
                 
                 self._last_raw_coords = (gx, gy)
-                self._last_parse_path = "zoom_refinement"
+                # Keep the y-echo tag if it was set above — it records that the
+                # refinement contributed x only, which is the difference between
+                # "the second pass agreed" and "the second pass said nothing".
+                if self._last_parse_path != "zoom_refinement_y_echo":
+                    self._last_parse_path = "zoom_refinement"
                 self._last_detection_source = "vision"
                 self._last_inference_ms = getattr(result1, "inference_ms", 0) + getattr(result2, "inference_ms", 0)
                 
@@ -714,26 +966,321 @@ class ServoController:
                 logger.info(f"Servo Zoom-In: anchor ({ax},{ay}) -> refined ({gx},{gy}) (offset {ox},{oy}) -> final ({x},{y})")
                 return (x, y)
 
-        # Fallback to anchor if refinement fails
-        raw_x, raw_y = anchor_coords
-        ox = self._vision_config.get("offset_x", 0)
-        oy = self._vision_config.get("offset_y", 0)
-        raw_x += ox
-        raw_y += oy
-        
-        self._last_raw_coords = (raw_x, raw_y)
-        self._last_parse_path = "anchor_only"
-        self._last_detection_source = "vision"
-        self._last_inference_ms = getattr(result1, "inference_ms", 0)
-        
-        # Clamp to screen bounds
-        x = max(0, min(self.screen_w - 1, int(raw_x)))
-        y = max(0, min(self.screen_h - TASKBAR_H - 1, int(raw_y)))
-        
-        logger.info(f"Servo coords (anchor fallback): ({x}, {y}) (offset {ox},{oy}) model={getattr(self.analyzer, 'default_model', '?')}")
-        return (x, y)
+        return self._anchor_result(anchor_coords, result1, "anchor_only")
 
 
+    # ------------------------------------------------------------------
+    # Correction loop
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _resolve_correction_mode(vision_config: Dict[str, Any]) -> Tuple[str, bool]:
+        """(mode, explicit). Explicit means a caller or the environment chose it."""
+        for value, explicit in ((vision_config.get("correction_mode"), True),
+                                (os.environ.get(CORRECTION_ENV), True),
+                                (get_reflex("correction_mode", "shadow"), False)):
+            if value is None or value == "":
+                continue
+            mode = str(value).strip().lower()
+            if mode in CORRECTION_MODES:
+                return mode, explicit
+            logger.warning("Servo: correction mode %r is not one of %s; ignoring it", value, CORRECTION_MODES)
+        return "shadow", False
+
+    def _should_correct(self, target: str, single_attempt: bool, precision: Optional[bool],
+                        screenshot: Image.Image) -> Tuple[bool, str]:
+        """Arm the loop from what is known, never from being stuck.
+
+        Never: mode off, a DOM-sourced estimate (already exact), a calibration
+        run (measuring the raw eye), the session cap, or a caller that said
+        precision=False. A training run arms only when the mode was set
+        explicitly for it. Otherwise arm when the caller asked (its second
+        try at the same target), when the eye is unmeasured, or when its
+        measured error exceeds the target size. An animating screen refuses
+        the probes: the frame they would judge is already stale.
+        """
+        if self.correction_mode == "off":
+            return False, "mode_off"
+        if self._last_detection_source == "dom":
+            return False, "dom_sourced"
+        if (self._vision_config or {}).get("disable_calibration"):
+            return False, "calibration_run"
+        cap = int(get_reflex("correction_session_cap", 12))
+        if self._corrections_armed_this_session >= cap:
+            return False, f"session_cap({cap})"
+        if precision is False:
+            return False, "precision_off"
+        if single_attempt and not self._correction_explicit:
+            return False, "single_attempt"
+        if self.eye_judge_rate is not None:
+            from backend.services.model_capability_data import EYE_JUDGE_MIN_BOTH_RATE
+            if self.eye_judge_rate < EYE_JUDGE_MIN_BOTH_RATE:
+                # A loop steered by a judge that is often wrong spends probes
+                # and moves nothing closer (gemma4:e2b at 0.76).
+                return False, f"judge_unreliable({self.eye_judge_rate:.2f})"
+        target_px = float(get_reflex("correction_target_px", 24))
+        acc = self.eye_accuracy_px
+        if precision is True:
+            reason = "precision_requested"
+        elif acc is None:
+            reason = "eye_unmeasured"
+        elif acc > target_px:
+            reason = f"eye_coarse({acc:.0f}px>{target_px:.0f}px)"
+        else:
+            return False, f"eye_accurate({acc:.0f}px<={target_px:.0f}px)"
+        try:
+            time.sleep(0.15)
+            again, _ = self.screen.capture()
+            if self._screen_changed(screenshot, again, click_pos=None):
+                return False, "screen_animating"
+        except Exception as e:  # noqa: BLE001
+            logger.debug("correction pre-check capture failed: %s", e)
+        return True, reason
+
+    def _seed_box(self, estimate: Tuple[int, int]) -> List[float]:
+        """[lo_x, lo_y, hi_x, hi_y] around the estimate: ±1.15 × accuracy per
+        axis (100 when unmeasured). With no calibration active the side away
+        from screen centre is extended along the centre-to-estimate spoke by
+        1.15 × |v| × (1/gain − 1), which is where a centre-pulling eye leaves
+        the target. Capped and clamped on screen."""
+        acc = float(self.eye_accuracy_px) if self.eye_accuracy_px is not None else 100.0
+        half = min(SEED_HALF_MAX, 1.15 * acc)
+        ex, ey = estimate
+        cx, cy = self.screen_w / 2.0, self.screen_h / 2.0
+        lo = [ex - half, ey - half]
+        hi = [ex + half, ey + half]
+        if not self._calibration:
+            gains = (float(get_reflex("correction_gain_x", 1.0)), float(get_reflex("correction_gain_y", 0.69)))
+            for axis, (e, c, k) in enumerate(((ex, cx, gains[0]), (ey, cy, gains[1]))):
+                if k <= 0 or k >= 1.0:
+                    continue
+                v = e - c
+                ext = min(SEED_HALF_MAX, 1.15 * abs(v) * (1.0 / k - 1.0))
+                if v >= 0:
+                    hi[axis] += ext
+                else:
+                    lo[axis] -= ext
+        return [max(0.0, lo[0]), max(0.0, lo[1]),
+                min(self.screen_w - 1.0, hi[0]), min(self.screen_h - TASKBAR_H - 1.0, hi[1])]
+
+    @staticmethod
+    def _update_axis(lo: float, hi: float, probe: float, call: str, keep: float, target_px: float) -> Tuple[float, float]:
+        """`same` collapses the axis to the target width; a side call cuts at
+        the probe and keeps (1 − keep) of the discarded half."""
+        if call == "same":
+            # An eye's "same" means within about a target's width, not on its
+            # centre (gemma4:e4b said "same" 18px off a 26px dot). Collapsing
+            # to exactly the target width left the true centre outside the
+            # box, where no later call could reach it.
+            return probe - target_px, probe + target_px
+        slack = max(0.0, 1.0 - keep)
+        if call in ("left", "above"):
+            return lo, probe + slack * max(0.0, hi - probe)
+        return probe - slack * max(0.0, probe - lo), hi
+
+    @staticmethod
+    def _parse_relative_judgment(text: str) -> Optional[Dict[str, Any]]:
+        """Strict: a JSON object with a boolean `visible` and, when visible,
+        `dx` in left/right/same and `dy` in above/below/same. Anything else is
+        None. Never a default direction: a guessed "down" is how the old
+        loop walked clicks off their targets."""
+        if not text:
+            return None
+        t = text.strip()
+        start, end = t.find("{"), t.rfind("}") + 1
+        if start < 0 or end <= start:
+            return None
+        try:
+            obj = json.loads(t[start:end])
+        except (json.JSONDecodeError, ValueError):
+            return None
+        if not isinstance(obj, dict) or not isinstance(obj.get("visible"), bool):
+            return None
+        if not obj["visible"]:
+            return {"visible": False, "dx": None, "dy": None}
+        dx = str(obj.get("dx", "")).strip().lower()
+        dy = str(obj.get("dy", "")).strip().lower()
+        horizontal, vertical = ("left", "right", "same"), ("above", "below", "same")
+        if dx in horizontal and dy in vertical:
+            return {"visible": True, "dx": dx, "dy": dy}
+        # The words name their own axis. gemma4:e2b answers with the fields
+        # swapped ("dx": "below", "dy": "right") on most probes; the meaning
+        # is not in doubt, so read it. Anything outside the vocabulary is
+        # still refused.
+        if dy in horizontal and dx in vertical:
+            return {"visible": True, "dx": dy, "dy": dx}
+        return None
+
+    def _probe_relative(self, screenshot: Image.Image, target: str, probe: Tuple[int, int],
+                        box: List[float]) -> Tuple[Optional[Dict[str, Any]], str, int]:
+        """Draw the marker at the probe on the captured frame, crop around it,
+        scale 2x, and ask one question. The mouse does not move."""
+        from backend.utils.cursor_overlay import composite_bullseye
+        px, py = int(probe[0]), int(probe[1])
+        marked = composite_bullseye(screenshot, (px, py), size=PROBE_MARKER_PX, ring=PROBE_RING)
+        # The crop covers the whole search box and the marker, so a target the
+        # box still allows is in view. A fixed 600px cap hid targets from eyes
+        # that miss by more than 300px and ended the loop on "not visible".
+        # Small crops are enlarged 2x for the eye; a large one is sent as is.
+        margin = 40
+        left = min(box[0], px) - margin
+        right = max(box[2], px) + margin
+        top = min(box[1], py) - margin
+        bottom = max(box[3], py) + margin
+        for lo_name in ("x", "y"):
+            lo, hi = (left, right) if lo_name == "x" else (top, bottom)
+            if hi - lo < PROBE_CROP_MIN:
+                centre = px if lo_name == "x" else py
+                lo, hi = centre - PROBE_CROP_MIN / 2, centre + PROBE_CROP_MIN / 2
+            if lo_name == "x":
+                left, right = lo, hi
+            else:
+                top, bottom = lo, hi
+        left, top = int(max(0, left)), int(max(0, top))
+        right, bottom = int(min(self.screen_w, right)), int(min(self.screen_h, bottom))
+        crop = marked.crop((left, top, right, bottom))
+        if max(crop.width, crop.height) <= PROBE_CROP_MAX:
+            crop = crop.resize((crop.width * 2, crop.height * 2), Image.LANCZOS)
+        prompt = (
+            f"A red ring marker is drawn on this image. Is the {target} visible in this image, "
+            f"and where is it relative to the CENTRE of the red marker?\n"
+            f'Reply with ONLY this JSON: {{"visible": true or false, "dx": "left" or "right" or "same", '
+            f'"dy": "above" or "below" or "same"}}\n'
+            f'"same" means the marker\'s centre is already on it. No distances, no other words.'
+        )
+        t0 = time.monotonic()
+        result = self.analyzer.analyze_fullsize(crop, prompt=prompt, num_predict=48, temperature=0.0)
+        ms = int((time.monotonic() - t0) * 1000)
+        raw = (result.description or "") if getattr(result, "success", False) else ""
+        return self._parse_relative_judgment(raw), raw, ms
+
+    def _correct_estimate(self, screenshot: Image.Image, target: str, estimate: Tuple[int, int],
+                          armed_reason: str) -> CorrectionOutcome:
+        """Narrow a search box around the estimate with relative judgments
+        until the eye says "same" on both axes, the box is target-sized, the
+        step or time budget runs out, or an axis reverses twice. Shadow logs
+        and leaves the estimate; on applies the final, drift-clamped."""
+        mode = self.correction_mode
+        out = CorrectionOutcome(estimate=estimate, final=estimate, mode=mode, armed_reason=armed_reason)
+        target_px = float(get_reflex("correction_target_px", 24))
+        keep = float(get_reflex("correction_keep_fraction", 0.55))
+        max_steps = int(get_reflex("correction_max_steps", self.max_corrections))
+        deadline_s = float(get_reflex("correction_deadline_s", 4.0))
+        box = self._seed_box(estimate)
+        # Enough steps to narrow this box to the target: a side call keeps about
+        # 0.725 of the axis, so a fixed four could not take a coarse eye's
+        # 600px box below ~160px. The cap bounds the cost.
+        span0 = max(box[2] - box[0], box[3] - box[1], target_px)
+        need = int(math.ceil(math.log(target_px / span0) / math.log(0.5 + 0.5 * (1.0 - keep)))) + 1
+        max_steps = min(int(get_reflex("correction_max_steps_cap", 10)), max(max_steps, need))
+        widened = False
+        t_start = time.monotonic()
+        last_probe_s: Optional[float] = None
+        judged = False
+        calls_x: List[str] = []
+        calls_y: List[str] = []
+        reversals = {"x": 0, "y": 0}
+        stop = "max_steps"
+        for step in range(max_steps + 1):
+            elapsed = time.monotonic() - t_start
+            remaining = deadline_s - elapsed
+            if remaining <= 0 or (last_probe_s is not None and last_probe_s > remaining):
+                stop = "deadline"
+                break
+            probe = estimate if step == 0 else (int(round((box[0] + box[2]) / 2)), int(round((box[1] + box[3]) / 2)))
+            # Whether this look is close up: only a zoomed view can tell a ring
+            # 50px off a 26px dot from one on it. A wide view's "same" narrows
+            # the box and is asked again close up rather than ending the search.
+            zoomed = max(box[2] - box[0], box[3] - box[1], abs(probe[0] - (box[0] + box[2]) / 2) * 2,
+                         abs(probe[1] - (box[1] + box[3]) / 2) * 2) + 80 <= PROBE_CROP_MAX
+            judgment, raw, ms = self._probe_relative(screenshot, target, probe, box)
+            last_probe_s = ms / 1000.0
+            rec: Dict[str, Any] = {"probe": [int(probe[0]), int(probe[1])], "ms": ms, "raw": raw[:120]}
+            if judgment is None:
+                out.unparsed += 1
+                rec.update({"visible": None, "dx": None, "dy": None, "direction": ""})
+                out.steps.append(rec)
+                stop = "unparseable"
+                break
+            if not judgment["visible"]:
+                rec.update({"visible": False, "dx": None, "dy": None, "direction": ""})
+                out.steps.append(rec)
+                full = [0.0, 0.0, self.screen_w - 1.0, self.screen_h - TASKBAR_H - 1.0]
+                if not widened and box != full:
+                    # Not in view is not proof the target is absent: the eye's
+                    # first guess can sit outside the box it seeds. Look once
+                    # across the whole screen from the same probe.
+                    widened = True
+                    box = full
+                    continue
+                stop = "not_visible"
+                break
+            judged = True
+            dx, dy = judgment["dx"], judgment["dy"]
+            dy_name = {"above": "up", "below": "down", "same": "same"}[dy]
+            if dx != "same" and dy != "same":
+                direction = f"{dx}_and_{dy_name}"
+            elif dx != "same":
+                direction = dx
+            elif dy != "same":
+                direction = dy_name
+            else:
+                direction = "on_target"
+            box[0], box[2] = self._update_axis(box[0], box[2], probe[0], dx, keep, target_px)
+            box[1], box[3] = self._update_axis(box[1], box[3], probe[1], dy, keep, target_px)
+            rec.update({"visible": True, "dx": dx, "dy": dy, "direction": direction,
+                        "box_after": [round(v) for v in box]})
+            out.steps.append(rec)
+            if dx != "same":
+                if calls_x and self._direction_reversed(calls_x[-1], dx):
+                    reversals["x"] += 1
+                calls_x.append(dx)
+            if dy != "same":
+                if calls_y and self._direction_reversed(calls_y[-1], dy_name):
+                    reversals["y"] += 1
+                calls_y.append(dy_name)
+            if dx == "same" and dy == "same" and zoomed:
+                stop = "on_target"
+                break
+            if (box[2] - box[0]) <= target_px and (box[3] - box[1]) <= target_px:
+                stop = "converged"
+                break
+            if reversals["x"] >= 2 or reversals["y"] >= 2:
+                stop = "oscillating_" + ("x" if reversals["x"] >= 2 else "y")
+                break
+        out.stop_reason = stop
+        out.elapsed_ms = int((time.monotonic() - t_start) * 1000)
+
+        if judged:
+            fx = (box[0] + box[2]) / 2.0
+            fy = (box[1] + box[3]) / 2.0
+            ex, ey = estimate
+            v = ((ex - self.screen_w / 2.0) ** 2 + (ey - self.screen_h / 2.0) ** 2) ** 0.5
+            acc = float(self.eye_accuracy_px) if self.eye_accuracy_px is not None else 100.0
+            # Drift bound: errors scale with distance from centre (the eye's
+            # centre-pull), floored at the eye's own noise so a central target
+            # still gets a noise-sized correction.
+            max_drift = max(acc, min(FINAL_DRIFT_MAX, 0.75 * v))
+            d = ((fx - ex) ** 2 + (fy - ey) ** 2) ** 0.5
+            if d > max_drift and d > 0:
+                fx = ex + (fx - ex) * max_drift / d
+                fy = ey + (fy - ey) * max_drift / d
+                out.clamped = True
+            out.final = (max(0, min(self.screen_w - 1, int(round(fx)))),
+                         max(0, min(self.screen_h - TASKBAR_H - 1, int(round(fy)))))
+        out.applied = (mode == "on") and judged and out.final != estimate
+        logger.info(
+            "Servo correction[%s]: armed(%s) estimate=%s final=%s drift=%.0fpx steps=%d stop=%s %dms applied=%s%s",
+            mode, armed_reason, estimate, out.final, out.drift_px, len(out.steps), stop,
+            out.elapsed_ms, out.applied, " clamped" if out.clamped else "",
+        )
+        return out
+
+    # Superseded by _correct_estimate (2026-09-22). _check_on_target and
+    # _parse_correction answer with a DEFAULT direction on any failure, which
+    # is how the earlier loop walked clicks off their targets; the nudge table
+    # moved fixed distances instead of narrowing a box. Not called by the click
+    # path; kept for readers and the tests that pin them, pending removal.
     def _check_on_target(self, screenshot: Image.Image, target: str) -> Dict[str, Any]:
         prompt = (
             f'Is the crosshair on the {target}? Reply ONLY JSON: '
@@ -745,12 +1292,14 @@ class ServoController:
             return {"on_target": False, "direction": "down", "distance": "small"}
         return self._parse_correction(result.description)
 
-    def _parse_detection_response(self, text: str) -> Optional[Tuple[int, int]]:
-        """Parse detection response — handles both point and box_2d formats.
+    def _parse_detection_response(self, text: str,
+                                  image_size: Optional[Tuple[int, int]] = None) -> Optional[Tuple[int, int]]:
+        """Parse a pointing answer: {"x","y"} object, "point" list, or box.
 
-        box_2d coordinates are normalized to the model's internal grid:
-          Gemma4: 1000 (confirmed by Google docs)
-        The divisor comes from vision_config["internal_width"].
+        internal_width > 0 means the numbers are normalised to that grid.
+        internal_width == 0 means absolute pixels OF THE IMAGE THE MODEL SAW;
+        when that image is not the screen (a crop, a resize) pass image_size so
+        the answer is scaled back into screen space rather than trusted raw.
         """
         try:
             text = text.strip()
@@ -807,13 +1356,36 @@ class ServoController:
             # "xy" → [x1, y1, x2, y2]; "yx" → [y1, x1, y2, x2]. Default is
             # xy for back-compat. Gemma4 explicitly sets "yx".
             coord_order = (self._vision_config or {}).get("coord_order", "xy")
+            grid = int(self._vision_config.get("internal_width", 1000)) if self._vision_config else 1000
+            iw, ih = image_size if image_size else (self.screen_w, self.screen_h)
+
+            def _abs_to_screen(px: float, py: float) -> Tuple[int, int]:
+                # Absolute pixels of the image sent. Identity when that image
+                # is the screen; otherwise scale into screen space.
+                sx = self.screen_w / float(iw or self.screen_w)
+                sy = self.screen_h / float(ih or self.screen_h)
+                return int(px * sx), int(py * sy)
+
+            # Format 0: {"x": .., "y": ..} object — the plain point dialect.
+            # Must run before the legacy _parse_coordinates fallback, which
+            # accepts the same shape and returns raw floats with no grid
+            # handling.
+            if "x" in entry and "y" in entry and not entry.get("box_2d") and not entry.get("bbox_2d"):
+                px, py = float(entry["x"]), float(entry["y"])
+                if grid > 0:
+                    px, py = int((px / grid) * self.screen_w), int((py / grid) * self.screen_h)
+                    self._last_parse_path = "point_obj_normalized"
+                else:
+                    px, py = _abs_to_screen(px, py)
+                    self._last_parse_path = "point_obj"
+                logger.info(f"Servo: point object ({entry['x']},{entry['y']}) grid={grid} → ({px},{py})")
+                return (px, py)
 
             # Format 1: "point" — always [x, y], all models.
             point = entry.get("point")
             if point and len(point) == 2:
                 px, py = int(point[0]), int(point[1])
-                grid = self._vision_config.get("internal_width", 1000) if self._vision_config else 1000
-                if 0 <= px <= grid and 0 <= py <= grid and (px > self.screen_w or py > self.screen_h):
+                if grid > 0 and 0 <= px <= grid and 0 <= py <= grid and (px > self.screen_w or py > self.screen_h):
                     px = int((px / grid) * self.screen_w)
                     py = int((py / grid) * self.screen_h)
                     self._last_parse_path = "point_normalized"
@@ -834,13 +1406,11 @@ class ServoController:
                 else:
                     x1, y1, x2, y2 = (int(c) for c in box)
 
-                grid = self._vision_config.get("internal_width", 1000) if self._vision_config else 1000
                 if grid > 0:
                     cx = int(((x1 + x2) / 2 / grid) * self.screen_w)
                     cy = int(((y1 + y2) / 2 / grid) * self.screen_h)
                 else:
-                    cx = (x1 + x2) // 2
-                    cy = (y1 + y2) // 2
+                    cx, cy = _abs_to_screen((x1 + x2) / 2, (y1 + y2) / 2)
                 
                 if x1 == 0 and x2 == 0 and y1 == 0 and y2 == 0:
                     logger.warning(f"Servo: box [0,0,0,0] received (ignoring as null detection)")

@@ -24,6 +24,11 @@ If you have access to relevant documents for the query, use them to inform your 
 Otherwise, use web search to get current information."""
 
 
+# The rule id behind the persona most recently fetched, so a reply's provenance
+# can name the rule that shaped it (feedback blames sources, not prose).
+LAST_PERSONA_RULE_ID: Optional[int] = None
+
+
 def get_active_system_prompt(model_name: Optional[str] = None) -> Optional[str]:
     """The chat persona, or None when no active rule supplies one.
 
@@ -46,6 +51,8 @@ def get_active_system_prompt(model_name: Optional[str] = None) -> Optional[str]:
         text, _rule_id = rule_utils.get_active_system_prompt(
             GLOBAL_DEFAULT_SYSTEM_PROMPT_RULE_NAME, db.session, model_name
         )
+        global LAST_PERSONA_RULE_ID
+        LAST_PERSONA_RULE_ID = _rule_id if text else None
         return text or None
     except Exception as e:  # noqa: BLE001 - a missing persona must never break chat
         logger.debug("No active system prompt: %s", e)
@@ -157,43 +164,48 @@ def _is_vision_capable_by_name(model_name: str) -> bool:
 
 
 def is_vision_model(model_name: str) -> bool:
-    """Return True if the provided model name is vision capable.
-    
-    Uses dynamic detection from Ollama API with pattern-based fallback.
+    """Return True if the provided model can accept images.
+
+    Delegates to the capability resolver, which reads Ollama's own
+    /api/show capabilities. The substring matching this used to do was wrong on
+    real models in both directions: `qwen3-vl:8b-thinking-q8_0` matched nothing
+    here and was sent through the describe-then-inject detour built for blind
+    models, and several Mistral and Qwen builds that genuinely see were treated
+    the same way.
+
+    Note the cache this used to consult was fed by /api/tags, which is not a
+    substitute: measured 2026-09-22, tags omits `vision` for every gemma4 tag on
+    this machine while /api/show reports it.
     """
     if not model_name:
         return False
-    
-    # Update cache if needed
-    _update_vision_models_cache()
-    
-    # Check if model is in cached vision models list
-    if _vision_models_cache["models"]:
-        lower_name = model_name.lower()
-        for vision_model in _vision_models_cache["models"]:
-            if lower_name == vision_model.lower() or lower_name in vision_model.lower():
-                logger.debug(f"Model '{model_name}' detected as vision-capable from cache")
-                return True
-    
-    # Fallback to pattern-based detection
-    result = _is_vision_capable_by_name(model_name)
-    if result:
-        logger.debug(f"Model '{model_name}' detected as vision-capable by pattern matching")
-    
-    return result
+    try:
+        from backend.services.model_capability_resolver import sees_natively
+        return sees_natively(model_name)
+    except Exception:
+        return _is_vision_capable_by_name(model_name)
 
 
 def get_available_vision_models() -> List[str]:
-    """Get list of currently available vision models from Ollama."""
-    _update_vision_models_cache()
-    return _vision_models_cache["models"].copy()
+    """Installed models that can actually accept images, per Ollama."""
+    try:
+        from backend.services.model_capability_resolver import _installed, sees_natively
+        return [m for m in _installed() if sees_natively(m)]
+    except Exception:
+        _update_vision_models_cache()
+        return _vision_models_cache["models"].copy()
 
 
 def clear_vision_models_cache() -> None:
-    """Clear the vision models cache to force refresh."""
+    """Clear cached capability answers so the next call re-reads Ollama."""
     _vision_models_cache["models"] = []
     _vision_models_cache["last_updated"] = 0
-    logger.debug("Vision models cache cleared")
+    try:
+        from backend.services.model_capability_resolver import invalidate
+        invalidate()
+    except Exception:
+        pass
+    logger.debug("Vision capability caches cleared")
 
 
 def contains_image_data(msg: object) -> bool:

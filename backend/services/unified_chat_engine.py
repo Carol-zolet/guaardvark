@@ -19,7 +19,11 @@ from typing import Dict, List, Any, Optional, Callable
 
 logger = logging.getLogger(__name__)
 
+from backend.utils.display_paths import display_params
 from backend.utils.text_cut import cut_on_whitespace
+from backend.utils.inline_reasoning import (
+    InlineReasoningStream, REASONING, RETRACT, VISIBLE, split_inline_reasoning,
+)
 from backend.utils.llm_debug_logger import (
     log_system_prompt, log_user_message, log_llm_response,
     log_tool_call, log_tool_result, log_guard_event, log_decision,
@@ -416,7 +420,7 @@ OUTREACH_TOOLS = ["outreach_status", "outreach_list_queue", "outreach_draft_post
 # page holds every chat request until a person approves it.
 PUBLISH_TOOLS = ["request_publish"]
 # Populated dynamically when an MCP server connects — see
-# backend.services.mcp_native_proxy. Holds names like 'filesystem_list_directory'
+# backend.tools.mcp_tools.sync_proxy_tools. Holds names like 'mcp__fs__list_directory'
 # so the LLM can pick MCP tools by name without going through mcp_execute.
 # Mutated in place so the TOOL_CONTEXT_KEYWORDS reference below stays live.
 MCP_NATIVE_TOOLS: List[str] = []
@@ -586,9 +590,9 @@ TOOL_CONTEXT_KEYWORDS = {
     "file": (["bulk file", "rename files", "process all files", "watch file",
               "watch the file", "monitor file", "all files in", "every file in",
               "batch file"], FILE_TOOLS),
-    # MCP-native proxies (filesystem_list_directory, filesystem_read_text_file, …)
+    # MCP proxies (mcp__fs__list_directory, mcp__fs__read_text_file, …)
     # surface for natural file/dir queries without needing an MCP keyword. List
-    # is mutated by mcp_native_proxy on connect/disconnect; until any MCP server
+    # is mutated by mcp_tools.sync_proxy_tools on connect/disconnect; until any MCP server
     # is connected, this category is empty and contributes nothing.
     "mcp_native": (["list the files", "list files", "files in", "directory",
                     "read file", "read the file", "write file", "write to file",
@@ -1028,12 +1032,29 @@ def parse_outpaint_pad(message: str) -> dict:
     return pad
 
 
+_IDENTITY_PLACE_RE = re.compile(
+    r"^(?:please\s+)?(?:can you\s+|could you\s+)?"
+    r"put this (?:person|face|guy|girl|man|woman) (in|into|on)\s+",
+    re.IGNORECASE,
+)
+
+
 def identity_prompt_from_message(message: str) -> str:
+    """The scene prompt for generate_identity.
+
+    "this person as a 1940s detective" names a subject already. "put this
+    person in a greenhouse" names only a place: without a subject FLUX draws
+    the greenhouse empty and the face reference has nobody to land on, so
+    that form keeps "a person" in front of the place."""
     text = (message or "").strip()
+    place = _IDENTITY_PLACE_RE.match(text)
+    if place:
+        rest = text[place.end():].strip(" .")
+        prep = "on" if place.group(1).lower() == "on" else "in"
+        return f"a person {prep} {rest}" if rest else text
     stripped = re.sub(
         r"^(?:please\s+)?(?:can you\s+|could you\s+)?"
-        r"(?:put this (?:person|face) (?:in|into|on)\s+|"
-        r"this (?:person|face|photo|picture) as\s+)",
+        r"this (?:person|face|photo|picture) as\s+",
         "",
         text,
         flags=re.IGNORECASE,
@@ -1123,6 +1144,60 @@ def inject_chat_image_model(
     return out
 
 
+_MCP_WORD_RE = re.compile(r"(?<!\w)mcp(?!\w)", re.IGNORECASE)
+_WORD_RE = re.compile(r"[a-z0-9]+")
+
+
+def select_mcp_tools_for_message(message: str, registry, max_mcp_tools: int = 8) -> List[str]:
+    """MCP proxy tools the message explicitly points at.
+
+    Triggers: the word "mcp" or a leading "/mcp" (all connected servers), a
+    connected server's name, or one of its configured ``keywords``. Tools are
+    ranked by word overlap between the message and the tool name/description.
+    """
+    try:
+        from backend.services.mcp_client_service import get_mcp_service
+        from backend.tools.mcp_tools import get_proxy_tools_by_server
+    except Exception:
+        return []
+    proxies = get_proxy_tools_by_server()
+    if not proxies:
+        return []
+    msg = message.lower()
+    mentions_mcp = bool(_MCP_WORD_RE.search(msg)) or msg.lstrip().startswith("/mcp")
+    service = get_mcp_service()
+    wanted: List[str] = []
+    for server, names in proxies.items():
+        if not names:
+            continue
+        rt = service._runtimes.get(server)
+        keywords = [k.lower() for k in (rt.config.keywords if rt else [])]
+        named = re.search(rf"(?<!\w){re.escape(server.lower())}(?!\w)", msg) is not None
+        if mentions_mcp or named or any(k and k in msg for k in keywords):
+            wanted.extend(names)
+    if not wanted:
+        return []
+    msg_words = set(_WORD_RE.findall(msg))
+
+    def score(name: str) -> int:
+        tool = registry.get_tool(name)
+        text = f"{name} {getattr(tool, 'description', '')}".lower().replace("_", " ")
+        return len(msg_words & set(_WORD_RE.findall(text)))
+
+    wanted.sort(key=score, reverse=True)
+    return [n for n in wanted if registry.get_tool(n)][:max_mcp_tools]
+
+
+def merge_forced_tools(selected: List[str], forced: List[str], max_tools: int = 15) -> List[str]:
+    """Put explicitly requested tools right after the core tools, keeping the cap."""
+    if not forced:
+        return selected
+    core = [t for t in selected if t in CORE_TOOLS]
+    rest = [t for t in selected if t not in CORE_TOOLS and t not in forced]
+    merged = core + [t for t in forced if t not in core] + rest
+    return merged[:max(max_tools, len(core) + len(forced))]
+
+
 def build_concise_tool_list(registry, tool_names: List[str]) -> str:
     """Build a concise tool description list for the system prompt (~20 tokens per tool)."""
     lines = []
@@ -1157,6 +1232,7 @@ def build_mcp_inventory_for_prompt(selected_tools: List[str]) -> str:
         return ""
     try:
         from backend.services.mcp_client_service import MCPClientService, MCP_ENABLED
+        from backend.services.mcp_policy import sanitize_tool_name
         if not MCP_ENABLED:
             return ""
         service = MCPClientService.get_instance()
@@ -1170,7 +1246,7 @@ def build_mcp_inventory_for_prompt(selected_tools: List[str]) -> str:
     lines = [
         "",
         "Connected MCP servers — these are also exposed as native tools "
-        "(prefer the native form `<server>_<tool>` when possible; fall back "
+        "(prefer the native form `mcp__<server>__<tool>` when possible; fall back "
         "to mcp_execute(server, tool, arguments) only for tools you can't see "
         "by name in your tool list):",
     ]
@@ -1183,7 +1259,7 @@ def build_mcp_inventory_for_prompt(selected_tools: List[str]) -> str:
             schema = t.get("inputSchema") or {}
             required = schema.get("required") or []
             req_hint = f"  [args: {', '.join(required)}]" if required else ""
-            native_name = f"{srv_name}_{tname}"
+            native_name = sanitize_tool_name(srv_name, tname)
             lines.append(f"    - {tname}  (native: `{native_name}`){req_hint}: {desc}")
     return "\n".join(lines)
 
@@ -1710,6 +1786,25 @@ def _artifact_for_result(res) -> Optional[Dict[str, Any]]:
     return artifact
 
 
+def emit_message_saved(emit_fn, session_id: str, request_id, message_id, role: str = "assistant") -> None:
+    """Tell the client which database row a reply became.
+
+    `chat:complete` is emitted before the assistant row is written, so it
+    cannot carry the id; this follows it. The client matches on request_id.
+    """
+    if not emit_fn or message_id is None:
+        return
+    try:
+        emit_fn("chat:message_saved", {
+            "session_id": session_id,
+            "request_id": request_id or "",
+            "message_id": message_id,
+            "role": role,
+        })
+    except Exception as e:  # noqa: BLE001
+        logger.debug(f"chat:message_saved emit failed (non-fatal): {e}")
+
+
 class UnifiedChatEngine:
     """Core engine combining RAG + tools + conversation in one ReACT loop."""
 
@@ -1740,10 +1835,16 @@ class UnifiedChatEngine:
         Returns:
             Result dict with response, iterations, steps
         """
-        request_id = str(uuid.uuid4())
+        # One id per turn, minted by whoever received the request (the HTTP
+        # layer or the brain) and reused here, so the ack, chat:complete and
+        # the saved row all agree. Feedback resolves a reply by this id.
+        request_id = str((options or {}).get("request_id") or "") or str(uuid.uuid4())
         clear_abort_flag(session_id)
         clear_task_scoped_tool_grants(session_id)
         steps = []
+        self._request_id = request_id
+        self._emit_fn = emit_fn
+        self._prov = {"request_id": request_id, "tier": int((options or {}).get("tier", 2) or 2)}
 
         try:
             # Store app reference for thread-safe DB access in helper methods
@@ -1964,6 +2065,7 @@ class UnifiedChatEngine:
 
         # 3. Route-aware tool selection (skipped for social / skip_tools path)
         model_name = getattr(self.llm, "model", "unknown")
+        self._prov_note("model", model_name)
         _skip_tools = bool(getattr(self, "_skip_tools", False) or options.get("skip_tools"))
 
         if _skip_tools:
@@ -2007,6 +2109,16 @@ class UnifiedChatEngine:
                         merged.append(t)
                 selected_tools = merged
 
+            # MCP tools the message names (the word "mcp", a server name or one
+            # of its configured keywords) go in ahead of the rest.
+            try:
+                selected_tools = merge_forced_tools(
+                    selected_tools, select_mcp_tools_for_message(message, self.registry),
+                    max_tools=25,
+                )
+            except Exception as exc:
+                logger.debug(f"MCP tool selection skipped: {exc}")
+
             _screen_active = bool(options and options.get("agent_screen_active", False))
             if not _screen_active:
                 _SCREEN_ONLY_TOOLS = set(DESKTOP_TOOLS) | set(AGENT_CONTROL_TOOLS)
@@ -2046,6 +2158,13 @@ class UnifiedChatEngine:
                 tool_list=tool_list,
                 is_voice_message=getattr(self, "_is_voice_message", False),
             )
+            # The brain state built the memory block; take the ids it used so
+            # feedback on this reply can reach those memories.
+            try:
+                from backend.api.memory_api import pop_last_selected_ids
+                self._prov_note("memory_ids", pop_last_selected_ids())
+            except Exception:
+                pass
         else:
             rules_persona = self._load_rules(model_name)
             system_prompt = self._build_system_prompt(
@@ -2142,7 +2261,8 @@ class UnifiedChatEngine:
         if provider_context:
             context_parts.append(f"Current context:\n{provider_context}")
         if rag_context and not hold_rag_for_code:
-            context_parts.append(f"Relevant context from knowledge base:\n{rag_context}")
+            from backend.services.chat_prompt_blocks import CHAT_KB_CONTEXT_HEADER
+            context_parts.append(f"{CHAT_KB_CONTEXT_HEADER}\n{rag_context}")
         # Vision pipeline context (if active). Ask the plugin manager first so
         # we skip a 2-second HTTP probe on every chat when the plugin is off.
         try:
@@ -2470,7 +2590,7 @@ class UnifiedChatEngine:
             for tc, tool_name, params in tool_jobs:
                 emit_fn("chat:tool_call", {
                     "tool": tool_name,
-                    "params": params,
+                    "params": display_params(params),
                     "iteration": iteration,
                     "reasoning": tc.reasoning,
                 })
@@ -2488,11 +2608,16 @@ class UnifiedChatEngine:
                     approval_details.append(_approval_detail(tool, tool_name, params, tc.reasoning))
                     approval_pending.append((tool, params))
 
+            # Names a person said yes to this iteration, on the card or as a
+            # standing session/task approval. Only these may run tools that
+            # refuse without a human answer (see _exec_one).
+            human_approved = set(_pre)
             if approval_jobs and not is_aborted(session_id):
                 approved = self._await_tool_approval(
                     session_id, emit_fn, request_id, iteration, approval_details,
                 )
                 if approved:
+                    human_approved.update(approval_jobs)
                     for tool, params in approval_pending:
                         _record_approved_consent(tool, params, session_id)
 
@@ -2674,27 +2799,34 @@ class UnifiedChatEngine:
                     f"emit_fn_id={id(emit_fn)} iter={iteration}"
                 )
                 t0 = time.time()
+                # A tool that refuses without a human answer (an MCP tool the
+                # server policy gates) runs only if the person approved it.
+                import contextlib
+                from backend.services.tool_confirmation import trusted_caller
+                approval_mark = (trusted_caller("chat_approval") if t_name in human_approved
+                                 else contextlib.nullcontext())
                 try:
                     exec_params = inject_chat_image_model(t_name, dict(t_params or {}), options)
-                    res = self.registry.execute_tool(
-                        t_name,
-                        on_output=on_output,
-                        agent_context={
-                            "transport": "chat",
-                            "user_message": message,
-                            "message": message,
-                            "project_root": (
-                                (options.get("project_root") or options.get("projectRoot"))
-                                if isinstance(options, dict) else None
-                            ),
-                            "pending_image_prompt": _SESSION_PENDING_IMAGE_PROMPT.get(session_id),
-                            "direct_tool_params": (
-                                options.get("direct_tool_params")
-                                if isinstance(options, dict) else None
-                            ),
-                        },
-                        **exec_params,
-                    )
+                    with approval_mark:
+                        res = self.registry.execute_tool(
+                            t_name,
+                            on_output=on_output,
+                            agent_context={
+                                "transport": "chat",
+                                "user_message": message,
+                                "message": message,
+                                "project_root": (
+                                    (options.get("project_root") or options.get("projectRoot"))
+                                    if isinstance(options, dict) else None
+                                ),
+                                "pending_image_prompt": _SESSION_PENDING_IMAGE_PROMPT.get(session_id),
+                                "direct_tool_params": (
+                                    options.get("direct_tool_params")
+                                    if isinstance(options, dict) else None
+                                ),
+                            },
+                            **exec_params,
+                        )
                 except Exception as exc:
                     logger.error(
                         f"Tool '{t_name}' raised unexpected exception: {exc}",
@@ -3240,7 +3372,7 @@ class UnifiedChatEngine:
             _approval_responses.pop(session_id, None)
         payload: Dict[str, Any] = {
             "tools": approval_jobs,
-            "tool_details": approval_details,
+            "tool_details": display_params(approval_details),
             "iteration": iteration,
             "available_scopes": ["once", "session", "task"],
             "session_id": session_id,
@@ -3348,7 +3480,7 @@ class UnifiedChatEngine:
                     tool_name, params, detail, session_id, emit_fn, request_id,
                 )
 
-        emit_fn("chat:tool_call", {"tool": tool_name, "params": params, "iteration": 1})
+        emit_fn("chat:tool_call", {"tool": tool_name, "params": display_params(params), "iteration": 1})
         _t0 = time.time()
         try:
             result = self.registry.execute_tool(tool_name, **params)
@@ -3527,6 +3659,8 @@ class UnifiedChatEngine:
         except Exception:
             pass
         self._save_message(session_id, "assistant", response, extra_data=extra_data)
+        # The CLI calls this over HTTP with no socket to receive chat:image on,
+        # so the reply carries the files too.
         return {
             "success": result.success,
             "response": response,
@@ -3534,6 +3668,7 @@ class UnifiedChatEngine:
             "steps": [],
             "request_id": request_id,
             "session_id": session_id,
+            "generated_images": generated_images,
         }
 
     def _try_media_direct(self, message: str, session_id: str,
@@ -3560,7 +3695,7 @@ class UnifiedChatEngine:
             self._save_message(session_id, "user", message)
 
             # Execute the tool
-            emit_fn("chat:tool_call", {"tool": tool_name, "params": params, "iteration": 1})
+            emit_fn("chat:tool_call", {"tool": tool_name, "params": display_params(params), "iteration": 1})
             _t0 = time.time()
             try:
                 result = self.registry.execute_tool(tool_name, **params)
@@ -4053,22 +4188,7 @@ class UnifiedChatEngine:
                 emit_fn("chat:token", {"content": text, "session_id": session_id})
             return text, 0, 0
 
-        # Provider dispatch: route generation to Mistral's API when the user has
-        # selected it (runtime toggle), else stay on local Ollama. The streaming
-        # loop below is provider-agnostic because mistral_provider.chat() yields
-        # chunks in the same shape ollama.chat() does.
-        from backend.services import llm_provider as _llm_provider
-        _use_mistral = _llm_provider.is_mistral_active()
-
         model_name = getattr(self.llm, "model", "gemma4:e4b")
-        # Provider dispatch: when the master cloud toggle is on AND a cloud
-        # provider is selected, route generation to its API. The streaming loop
-        # below is provider-agnostic — mistral_provider.chat() yields chunks in
-        # the same shape ollama.chat() does.
-        from backend.services import llm_provider as _llm_provider
-        _use_cloud = _llm_provider.is_mistral_active()
-        if _use_cloud:
-            model_name = _llm_provider.get_mistral_model()
 
         # Prioritize LLM load via orchestrator. This helps prevent image/video
         # jobs from evicting the chat model mid-analysis (the cause of the
@@ -4099,12 +4219,22 @@ class UnifiedChatEngine:
         # One predicate for the whole product: name patterns, then Ollama's
         # capabilities list, so a model the pattern list has not met still counts.
         from backend.utils.ollama_resource_manager import model_supports_thinking
-        is_thinking_model = (not _use_cloud) and model_supports_thinking(model_name)
+        is_thinking_model = model_supports_thinking(model_name)
         think_on = is_thinking_model and bool(getattr(self, "_think", False))
 
-        # Track <think>...</think> blocks in the content stream so we can
-        # suppress them from being emitted as visible tokens.
-        in_think_block = False
+        # Reasoning written into the content stream goes to the reasoning
+        # channel, not the answer: anywhere, or ended by a lone closing tag, for
+        # a thinking model; only a block that opens the answer for any other
+        # (a model imported without Ollama's thinking support still writes
+        # <think>). think_buffer holds visible text that may open tool markup.
+        reasoning_tags = None
+        leading_only = not is_thinking_model
+        try:
+            from backend.services.model_capabilities import capabilities_for
+            reasoning_tags = capabilities_for(model_name, with_vision=False).reasoning_tags
+        except Exception as _tag_err:  # noqa: BLE001 - fall back to the default pairs
+            logger.debug(f"reasoning tag lookup failed for {model_name}: {_tag_err}")
+        inline_reasoning = InlineReasoningStream(reasoning_tags, leading_only=leading_only)
         think_buffer = ""
 
         # Reasoning (message.thinking) goes out on its own channel, batched;
@@ -4214,41 +4344,29 @@ class UnifiedChatEngine:
             # gated additionally on model 'tools' capability — see _run_chat). When
             # active we pass Ollama's native tools=[...] schema; the model returns
             # structured tool_calls in message.tool_calls rather than inline XML.
-            # Native tool-calling applies to the local Ollama path only; a cloud
-            # provider streams text and tool-calls ride the XML path (see
-            # mistral_provider docstring), so it's disabled when cloud is active.
-            _native_active = (not _use_cloud) and bool(getattr(self, "_native_toolcalls_active", False))
+            _native_active = bool(getattr(self, "_native_toolcalls_active", False))
             _native_schema = getattr(self, "_native_tools_schema", None)
             if _native_active:
                 # Reset the per-call native tool-call sink so a prior iteration's
                 # calls never leak into this one.
                 self._native_pending_tool_calls = None
 
-            if _use_cloud:
-                from backend.services import mistral_provider
-                stream = mistral_provider.chat(
-                    model=model_name,
-                    messages=call_messages,
-                    stream=True,
-                    options=opts,
-                )
-            else:
-                from backend.config import get_chat_keep_alive
-                _chat_kwargs = dict(
-                    model=model_name,
-                    messages=call_messages,
-                    stream=True,
-                    options=opts,
-                    keep_alive=get_chat_keep_alive(),  # don't re-pin the model 24h on every chat burst (VRAM squat)
-                )
-                if _native_active and _native_schema:
-                    _chat_kwargs["tools"] = _native_schema
-                # Honor the per-chat/global thinking toggle (resolved in _run_chat).
-                # Only thinking-capable models accept `think`; passing it to others can
-                # error, so gate on is_thinking_model. Default-off keeps chat snappy.
-                if is_thinking_model and getattr(self, "_think", None) is not None:
-                    _chat_kwargs["think"] = bool(self._think)
-                stream = ollama.chat(**_chat_kwargs)
+            from backend.config import get_chat_keep_alive
+            _chat_kwargs = dict(
+                model=model_name,
+                messages=call_messages,
+                stream=True,
+                options=opts,
+                keep_alive=get_chat_keep_alive(),  # don't re-pin the model 24h on every chat burst (VRAM squat)
+            )
+            if _native_active and _native_schema:
+                _chat_kwargs["tools"] = _native_schema
+            # Honor the per-chat/global thinking toggle (resolved in _run_chat).
+            # Only thinking-capable models accept `think`; passing it to others can
+            # error, so gate on is_thinking_model. Default-off keeps chat snappy.
+            if is_thinking_model and getattr(self, "_think", None) is not None:
+                _chat_kwargs["think"] = bool(self._think)
+            stream = ollama.chat(**_chat_kwargs)
 
             # XML filter: stream tokens to client until <tool_call is detected,
             # then suppress further emission (tool calls are announced separately).
@@ -4260,9 +4378,29 @@ class UnifiedChatEngine:
             xml_detected = False
             _native_tool_calls_acc = []  # collected message.tool_calls (native path)
 
+            def _route_inline_reasoning(events) -> List[str]:
+                """Send inline reasoning to the reasoning channel; return the visible pieces."""
+                nonlocal think_buffer
+                visible = []
+                for kind, piece in events:
+                    if kind == VISIBLE:
+                        visible.append(piece)
+                        continue
+                    accumulated_thinking.append(piece)
+                    reasoning_buf.append(piece)
+                    if kind == RETRACT:
+                        # Text already on screen was reasoning: clear the answer.
+                        visible.clear()
+                        think_buffer = ""
+                        _flush_reasoning(force=True)
+                        if emit_tokens:
+                            emit_fn("chat:token", {"content": "", "reset": True, "session_id": session_id})
+                _flush_reasoning()
+                return visible
+
             def _consume(chunks) -> None:
                 """Drain one Ollama stream into the accumulators, emitting visible tokens."""
-                nonlocal xml_detected, in_think_block, think_buffer
+                nonlocal xml_detected, think_buffer
                 nonlocal input_tokens, output_tokens, done_reason
                 for chunk in chunks:
                     if is_aborted(session_id):
@@ -4285,6 +4423,7 @@ class UnifiedChatEngine:
                         # complete when the answer starts.
                         _flush_reasoning(force=True)
                         accumulated.append(token)
+                        visible_pieces = _route_inline_reasoning(inline_reasoning.feed(token))
                         if emit_tokens and not xml_detected:
                             # Check if we've hit a tool_call tag in the accumulated text
                             # Use last 20 chunks to handle slow-chunk Ollama streams.
@@ -4299,44 +4438,15 @@ class UnifiedChatEngine:
                                 or "[tool_call" in _tail or "[tool]" in _tail
                             ):
                                 xml_detected = True
-                            else:
-                                # Filter out <think>...</think> blocks from content stream
-                                emit_token = token
-                                if is_thinking_model:
-                                    think_buffer += token
-                                    if not in_think_block:
-                                        if "<think>" in think_buffer:
-                                            # Emit anything before the <think> tag
-                                            before = think_buffer.split("<think>", 1)[0]
-                                            if before:
-                                                emit_fn("chat:token", {"content": before, "session_id": session_id})
-                                            in_think_block = True
-                                            think_buffer = think_buffer.split("<think>", 1)[1]
-                                            emit_token = None
-                                        elif len(think_buffer) > 20:
-                                            # No <think> tag detected: flush, but keep a
-                                            # trailing "[tool_" / "<tool" that may be the
-                                            # start of tool markup arriving token by token.
-                                            _head, think_buffer = _split_pending_tool_marker(think_buffer)
-                                            if _head:
-                                                emit_fn("chat:token", {"content": _head, "session_id": session_id})
-                                            emit_token = None
-                                        else:
-                                            # Still buffering, don't emit yet
-                                            emit_token = None
-                                    else:
-                                        # Inside <think> block — suppress output
-                                        if "</think>" in think_buffer:
-                                            # End of think block, emit anything after
-                                            after = think_buffer.split("</think>", 1)[1]
-                                            think_buffer = after if after else ""
-                                            in_think_block = False
-                                            if after:
-                                                emit_fn("chat:token", {"content": after, "session_id": session_id})
-                                                think_buffer = ""
-                                        emit_token = None
-                                if emit_token:
-                                    emit_fn("chat:token", {"content": emit_token, "session_id": session_id})
+                            elif is_thinking_model:
+                                # Keep a trailing "[tool_" / "<tool" that may be the
+                                # start of tool markup arriving token by token.
+                                think_buffer += "".join(visible_pieces)
+                                _head, think_buffer = _split_pending_tool_marker(think_buffer)
+                                if _head:
+                                    emit_fn("chat:token", {"content": _head, "session_id": session_id})
+                            elif visible_pieces:
+                                emit_fn("chat:token", {"content": "".join(visible_pieces), "session_id": session_id})
                     if thinking_token:
                         accumulated_thinking.append(thinking_token)
                         reasoning_buf.append(thinking_token)
@@ -4349,17 +4459,16 @@ class UnifiedChatEngine:
 
             def _visible_content() -> str:
                 nonlocal think_buffer
-                # Flush any remaining think_buffer (non-think text that was still
+                tail = _route_inline_reasoning(inline_reasoning.finish())
+                think_buffer += "".join(tail)
+                # Flush any remaining think_buffer (visible text that was still
                 # buffered). Not when tool markup was detected: the buffer then
                 # holds the opening characters of that markup ("[tool_").
-                if think_buffer and not in_think_block and emit_tokens and not xml_detected:
+                if think_buffer and emit_tokens and not xml_detected:
                     emit_fn("chat:token", {"content": think_buffer, "session_id": session_id})
                 think_buffer = ""
                 text = "".join(accumulated).strip()
-                # Strip <think>...</think> blocks from final content
-                if is_thinking_model:
-                    text = re.sub(r'<think>[\s\S]*?</think>\s*', '', text).strip()
-                return text
+                return split_inline_reasoning(text, reasoning_tags, leading_only=leading_only)[1]
 
             _consume(stream)
             content = _visible_content()
@@ -4369,7 +4478,7 @@ class UnifiedChatEngine:
             # say so plainly if that still yields nothing. The reasoning text is
             # never promoted to content.
             if (
-                not content and thinking and not _use_cloud
+                not content and thinking
                 and not _native_tool_calls_acc and not is_aborted(session_id)
             ):
                 logger.info(
@@ -4389,7 +4498,7 @@ class UnifiedChatEngine:
                 )
                 accumulated.clear()
                 xml_detected = False
-                in_think_block = False
+                inline_reasoning = InlineReasoningStream(reasoning_tags, leading_only=leading_only)
                 think_buffer = ""
                 _consume(ollama.chat(**retry_kwargs))
                 content = _visible_content()
@@ -4445,10 +4554,10 @@ class UnifiedChatEngine:
                             output_tokens = chunk.get("eval_count", 0) or 0
                             done_reason = chunk.get("done_reason") or None
 
-                    content = "".join(accumulated).strip()
+                    inline, content = split_inline_reasoning("".join(accumulated), reasoning_tags)
+                    if inline:
+                        accumulated_thinking.append(inline)
                     thinking = "".join(accumulated_thinking).strip()
-                    # Strip <think>...</think> blocks from retry content
-                    content = re.sub(r'<think>[\s\S]*?</think>\s*', '', content).strip()
                     if not content and thinking:
                         logger.info(f"Sanitized retry returned reasoning only ({len(thinking)} chars)")
                         content = _REASONING_ONLY_FALLBACK_TEXT
@@ -4475,10 +4584,8 @@ class UnifiedChatEngine:
                     msg = resp.get("message", {}) if isinstance(resp, dict) else {}
                     text = (msg.get("content") or "").strip()
                     think = (msg.get("thinking") or "").strip()
-                    if is_thinking_model:
-                        text = re.sub(
-                            r'<think>[\s\S]*?</think>\s*', '', text
-                        ).strip()
+                    inline, text = split_inline_reasoning(text, reasoning_tags, leading_only=leading_only)
+                    think = "\n".join(p for p in (inline, think) if p)
                     if not text and think:
                         logger.info(f"Non-stream retry returned reasoning only ({len(think)} chars)")
                         text = _REASONING_ONLY_FALLBACK_TEXT
@@ -4562,8 +4669,11 @@ class UnifiedChatEngine:
                                 input_tokens = chunk.get("prompt_eval_count", 0) or 0
                                 output_tokens = chunk.get("eval_count", 0) or 0
                                 done_reason = chunk.get("done_reason") or None
-                        content = "".join(accumulated).strip()
-                        content = re.sub(r'<think>[\s\S]*?</think>\s*', '', content).strip()
+                        inline, content = split_inline_reasoning(
+                            "".join(accumulated), reasoning_tags, leading_only=leading_only,
+                        )
+                        if inline:
+                            accumulated_thinking.append(inline)
                         if _native_active:
                             self._native_pending_tool_calls = _native_tool_calls_acc or None
                         if content:
@@ -4797,17 +4907,25 @@ class UnifiedChatEngine:
             from backend.services.indexing_service import search_with_llamaindex
             project_id = getattr(self, '_project_id', None)
             results = search_with_llamaindex(query, project_id=project_id)
+            from backend.utils.reranker import drop_unrelated
+            results, dropped = drop_unrelated(results or [])
+            if dropped:
+                self._prov_note("rag_dropped_unrelated", dropped)
             chunks = []
-            for r in results or []:
+            sources = []
+            for r in results:
                 source = r.get("metadata", {}).get("source_filename", "Unknown")
                 text = cut_on_whitespace(r.get("text", ""), 500)
                 chunks.append(f"[Source: {source}]\n{text}")
+                sources.append(str(source))
             try:
                 from backend.services.knowledge_sources import retrieve_from_sources
                 for hit in retrieve_from_sources(query):
                     chunks.append(f"[Source: {hit['title']}]\n{cut_on_whitespace(hit['snippet'], 500)}")
+                    sources.append("ks:" + str(hit.get("title", "")))
             except Exception as e:
                 logger.debug(f"Knowledge source retrieval skipped: {e}")
+            self._prov_note("rag_sources", list(dict.fromkeys(sources))[:10])
             return "\n\n".join(chunks)
         except Exception as e:
             logger.debug(f"RAG retrieval skipped: {e}")
@@ -5041,6 +5159,8 @@ class UnifiedChatEngine:
                 )
             if memory_text:
                 memory_block = f"\n\n{memory_text}"
+            from backend.api.memory_api import pop_last_selected_ids
+            self._prov_note("memory_ids", pop_last_selected_ids())
         except Exception:
             pass  # Memory system unavailable — no impact on chat
 
@@ -5231,11 +5351,64 @@ You are a private, local AI assistant running on the user's own hardware. There 
         text = re.sub(r"https?://[^\s)\]<>\"']*oaiusercontent[^\s)\]<>\"']*", "[remote image removed]", text)
         return text
 
+    def _prov_note(self, key: str, value) -> None:
+        """Record one fact about how the current reply is being produced."""
+        try:
+            if not isinstance(getattr(self, "_prov", None), dict):
+                self._prov = {}
+            self._prov[key] = value
+        except Exception:
+            pass
+
+    def _provenance_for_save(self, extra_data: Optional[Dict]) -> Dict[str, Any]:
+        """The provenance block for an assistant row: what produced this reply.
+
+        Feedback on the reply flows back to these sources (memories, recipe,
+        rule), so a thumb teaches the thing that shaped the answer instead of
+        being filed against a line of text. Stable keys; missing facts are
+        simply absent.
+        """
+        prov = dict(getattr(self, "_prov", None) or {})
+        prov.setdefault("request_id", getattr(self, "_request_id", None))
+        prov.setdefault("tier", 2)
+        try:
+            bs = getattr(self, "_brain_state", None)
+            if bs is not None and getattr(bs, "persona_rule_id", None) is not None:
+                prov.setdefault("rule_id", bs.persona_rule_id)
+        except Exception:
+            pass
+        tools = []
+        for step in (extra_data or {}).get("steps") or []:
+            for tc in (step or {}).get("tool_calls") or []:
+                name = (tc or {}).get("tool_name") or (tc or {}).get("name")
+                if name and name not in tools:
+                    tools.append(name)
+        if tools:
+            prov["tools"] = tools
+        try:
+            from backend.services.agent_control_service import get_agent_control_service
+            prov.update(get_agent_control_service().drain_recipe_usage())
+        except Exception:
+            pass
+        return prov
+
     def _save_message(self, session_id: str, role: str, content: str,
-                      extra_data: Optional[Dict] = None):
-        """Save a message to the database (thread-safe with app context)."""
+                      extra_data: Optional[Dict] = None) -> Optional[int]:
+        """Save a message to the database (thread-safe with app context).
+
+        Assistant rows carry their provenance and announce their id with
+        `chat:message_saved`, which is how the client learns which row a
+        thumb refers to (chat:complete fires before the row exists).
+        Returns the new row id, or None when the save failed.
+        """
         if role == "assistant":
             content = self._strip_remote_image_urls(content)
+            try:
+                extra_data = dict(extra_data or {})
+                extra_data["provenance"] = self._provenance_for_save(extra_data)
+            except Exception:
+                pass
+        new_id = None
         try:
             from flask import has_app_context
             from backend.models import LLMSession, LLMMessage, db
@@ -5269,6 +5442,7 @@ You are a private, local AI assistant running on the user's own hardware. There 
                 )
                 db.session.add(msg)
                 db.session.commit()
+                new_id = msg.id
                 logger.debug(f"Saved {role} message to session {session_id}")
             finally:
                 if ctx:
@@ -5280,6 +5454,10 @@ You are a private, local AI assistant running on the user's own hardware. There 
                 db.session.rollback()
             except Exception:
                 pass
+        if new_id is not None and role == "assistant":
+            emit_message_saved(getattr(self, "_emit_fn", None), session_id,
+                               getattr(self, "_request_id", None), new_id, role)
+        return new_id
 
     def _maybe_summarize_session(self, session_id: str, keep_recent: int = 24, chunk_size: int = 24):
         """Persist a compact summary for older messages in active chat sessions."""
@@ -5355,54 +5533,7 @@ You are a private, local AI assistant running on the user's own hardware. There 
 
     def _normalize_parameters(self, params: Dict[str, Any], tool_name: Optional[str] = None) -> Dict[str, Any]:
         """Normalize tool parameters - coerce string values using tool schema when available."""
-        if not params:
-            return {}
+        from backend.services.agent_tools import coerce_params_to_schema
 
-        # Get parameter schema from tool registry if available
-        schema = {}
-        if tool_name:
-            tool = self.registry.get_tool(tool_name)
-            if tool and tool.parameters:
-                schema = {p_name: p.type for p_name, p in tool.parameters.items()}
-
-        coerced = {}
-        for k, v in params.items():
-            if not isinstance(v, str):
-                coerced[k] = v
-                continue
-
-            declared_type = schema.get(k)
-            low = v.lower().strip()
-
-            # Schema-driven coercion
-            if declared_type == "bool":
-                coerced[k] = low in ("true", "yes", "1", "on")
-            elif declared_type == "int":
-                try:
-                    coerced[k] = int(v)
-                except ValueError:
-                    coerced[k] = v
-            elif declared_type == "float":
-                try:
-                    coerced[k] = float(v)
-                except ValueError:
-                    coerced[k] = v
-            elif declared_type == "string":
-                coerced[k] = v
-            else:
-                # Fallback: heuristic coercion (no schema or unknown type)
-                if low in ("true", "yes"):
-                    coerced[k] = True
-                elif low in ("false", "no"):
-                    coerced[k] = False
-                elif low in ("none", "null"):
-                    coerced[k] = None
-                else:
-                    try:
-                        coerced[k] = int(v)
-                    except ValueError:
-                        try:
-                            coerced[k] = float(v)
-                        except ValueError:
-                            coerced[k] = v
-        return coerced
+        tool = self.registry.get_tool(tool_name) if tool_name else None
+        return coerce_params_to_schema(params or {}, tool)

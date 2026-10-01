@@ -2714,7 +2714,14 @@ def get_active_model_name() -> str:
 
 
 class ToolFeedback(db.Model):
-    """Store user feedback on tool calls for future performance analysis and routing improvements."""
+    """A thumb on one reply or tool card, and what it taught.
+
+    One row per (message_id, kind); a re-thumb updates it, an un-thumb marks
+    it retracted. `provenance` is a snapshot of what produced the reply and
+    `applied` the ledger of effects, so feedback_teacher can reverse them.
+    `positive` is kept in sync with `verdict` for the readers that predate it
+    (lesson distillation, recipe induction).
+    """
     __tablename__ = "tool_feedback"
     id = db.Column(db.Integer, primary_key=True)
     session_id = db.Column(db.String(36), index=True)
@@ -2728,6 +2735,27 @@ class ToolFeedback(db.Model):
     time_seconds = db.Column(db.Float, nullable=True) # Execution time
     model = db.Column(db.String(100), nullable=True) # Model name used for the tool
     created_at = db.Column(db.DateTime, default=lambda: datetime.now())
+    # The reply this thumb names, and the turn it came from.
+    message_id = db.Column(db.Integer, nullable=True, index=True)
+    request_id = db.Column(db.String(64), nullable=True, index=True)
+    # "response" for the reply itself, "tool:<name>@<step>.<call>" for a tool card.
+    kind = db.Column(db.String(120), nullable=True, default="response")
+    verdict = db.Column(db.String(8), nullable=True)  # up | down | none
+    # The why: reason text and tags. Wired end to end; the input UI follows.
+    why_text = db.Column(db.Text, nullable=True)
+    why_tags = db.Column(db.JSON, nullable=True)
+    provenance = db.Column(db.JSON, nullable=True)
+    applied = db.Column(db.JSON, nullable=True)
+    updated_at = db.Column(db.DateTime, nullable=True)
+    retracted_at = db.Column(db.DateTime, nullable=True)
+
+    __table_args__ = (
+        db.Index(
+            "ux_tool_feedback_message_kind", "message_id", "kind", unique=True,
+            postgresql_where=db.text("message_id IS NOT NULL"),
+            sqlite_where=db.text("message_id IS NOT NULL"),
+        ),
+    )
 
     def to_dict(self):
         return {
@@ -2741,6 +2769,16 @@ class ToolFeedback(db.Model):
             "time_seconds": self.time_seconds,
             "model": self.model,
             "created_at": self.created_at.isoformat() if self.created_at else None,
+            "message_id": self.message_id,
+            "request_id": self.request_id,
+            "kind": self.kind,
+            "verdict": self.verdict,
+            "why_text": self.why_text,
+            "why_tags": self.why_tags or [],
+            "provenance": self.provenance or {},
+            "applied": self.applied or [],
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+            "retracted_at": self.retracted_at.isoformat() if self.retracted_at else None,
         }
 
 class AgentMemory(db.Model):
@@ -2828,6 +2866,111 @@ class AgentMemoryAudit(db.Model):
             "actor": self.actor,
             "before": self.before,
             "after": self.after,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+        }
+
+
+class AgentTaskRun(db.Model):
+    """One screen-control task, from execute_task entry to its exit.
+
+    The agent's episodic memory. Beliefs and lessons already persist in
+    agent_memories; until this table the task itself did not: its steps lived
+    in the service's process memory and were overwritten by the next task.
+    Written once at task exit, on every exit path.
+    """
+
+    __tablename__ = "agent_task_runs"
+
+    id = db.Column(db.String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    task = db.Column(db.Text, nullable=False)
+    # sha256[:16] of the normalised task text: the "same task before" lookup key.
+    task_key = db.Column(db.String(64), nullable=False, index=True)
+    session_id = db.Column(db.String(64), nullable=True, index=True)
+    brain = db.Column(db.String(128), nullable=True)
+    eye = db.Column(db.String(128), nullable=True)
+    unified = db.Column(db.Boolean, default=True)
+    mode = db.Column(db.String(16), default="api", index=True)  # chat | api | training
+    started_at = db.Column(db.DateTime, nullable=False)
+    ended_at = db.Column(db.DateTime, nullable=False)
+    total_seconds = db.Column(db.Float, default=0.0)
+    success = db.Column(db.Boolean, default=False, index=True)
+    reason = db.Column(db.String(128), nullable=True, index=True)
+    # Which rule ended the loop: done | early_done | recipe | stalled | ceiling |
+    # timeout | killed | superseded | max_failures | loop | budget | error | other
+    stop_rule = db.Column(db.String(32), nullable=True, index=True)
+    verified = db.Column(db.Boolean, default=False)
+    steps_count = db.Column(db.Integer, default=0)
+    click_attempts = db.Column(db.Integer, default=0)
+    created_at = db.Column(db.DateTime, default=lambda: datetime.now(), index=True)
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "task": self.task,
+            "task_key": self.task_key,
+            "session_id": self.session_id,
+            "brain": self.brain,
+            "eye": self.eye,
+            "unified": bool(self.unified),
+            "mode": self.mode,
+            "started_at": self.started_at.isoformat() if self.started_at else None,
+            "ended_at": self.ended_at.isoformat() if self.ended_at else None,
+            "total_seconds": self.total_seconds,
+            "success": bool(self.success),
+            "reason": self.reason,
+            "stop_rule": self.stop_rule,
+            "verified": bool(self.verified),
+            "steps_count": self.steps_count,
+            "click_attempts": self.click_attempts,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+        }
+
+
+class AgentTaskStep(db.Model):
+    """One step of an AgentTaskRun: what was decided, done, and observed."""
+
+    __tablename__ = "agent_task_steps"
+
+    id = db.Column(db.String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    run_id = db.Column(db.String(36), nullable=False, index=True)
+    iteration = db.Column(db.Integer, nullable=False)
+    action_type = db.Column(db.String(32), nullable=True)
+    target = db.Column(db.Text, nullable=True)
+    text = db.Column(db.Text, nullable=True)
+    keys = db.Column(db.JSON, nullable=True)
+    coordinates = db.Column(db.JSON, nullable=True)
+    failed = db.Column(db.Boolean, default=False)
+    verified = db.Column(db.Boolean, default=False)
+    post_action_effect = db.Column(db.String(64), nullable=True)
+    reason = db.Column(db.String(128), nullable=True)
+    reasoning = db.Column(db.Text, nullable=True)
+    expected_effect = db.Column(db.Text, nullable=True)
+    success_proof = db.Column(db.Text, nullable=True)
+    scene_description = db.Column(db.Text, nullable=True)
+    servo_attempt = db.Column(db.Integer, nullable=True)
+    result = db.Column(db.JSON, nullable=True)
+    created_at = db.Column(db.DateTime, default=lambda: datetime.now(), index=True)
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "run_id": self.run_id,
+            "iteration": self.iteration,
+            "action_type": self.action_type,
+            "target": self.target,
+            "text": self.text,
+            "keys": self.keys,
+            "coordinates": self.coordinates,
+            "failed": bool(self.failed),
+            "verified": bool(self.verified),
+            "post_action_effect": self.post_action_effect,
+            "reason": self.reason,
+            "reasoning": self.reasoning,
+            "expected_effect": self.expected_effect,
+            "success_proof": self.success_proof,
+            "scene_description": self.scene_description,
+            "servo_attempt": self.servo_attempt,
+            "result": self.result,
             "created_at": self.created_at.isoformat() if self.created_at else None,
         }
 

@@ -62,68 +62,59 @@ class VisionAnalyzer:
         self.timeout = timeout
 
     def _detect_vision_model(self) -> str:
-        """Auto-detect best available vision model from Ollama.
-        
-        Prioritizes:
-        1. Any vision-capable model ALREADY in VRAM (/api/ps)
-        2. Configured gemma4 if available
-        3. Hardcoded priority list (gemma4, moondream)
+        """Pick a model that can actually accept images.
+
+        Order: a vision-capable model already in VRAM (so we do not load a
+        second multi-GB model to look at one screenshot), then the best
+        installed one.
+
+        This used to decide by name, guarded by the servo store's has_vision
+        flag, under the belief — written in the old comment here — that "every
+        gemma4 tag is multimodal". On this machine
+        `VladimirGav/gemma4-26b-16GB-VRAM-Uncensored` disproves it: the name
+        matches, the model has no vision tower, and handing it an image earns
+        an Ollama 400. Meanwhile the name rules were rejecting genuinely
+        multimodal Mistral and Qwen builds. Ollama's own capabilities answer
+        both cases; the capability resolver is where that lives now.
         """
         try:
-            # 1. Check what's ALREADY in VRAM. If a vision model is active, USE IT.
-            # This prevents loading a second model and blowing up VRAM.
-            from backend.services.servo_knowledge_store import get_vision_config
-            
-            from backend.services.servo_knowledge_store import model_name_looks_vision
+            from backend.services.model_capability_resolver import (
+                coords_for, sees_natively, _installed, _resident,
+            )
 
-            ps_resp = requests.get(f"{self.ollama_url}/api/ps", timeout=3)
-            if ps_resp.status_code == 200:
-                active_names = [m["name"] for m in ps_resp.json().get("models", [])]
-                for active in active_names:
-                    # Only reuse VRAM residents that are actually multimodal.
-                    # Unknown text models must NOT win here (Ollama 400 multimodal).
-                    config = get_vision_config(active)
-                    if config.get("has_vision", False) and model_name_looks_vision(active):
-                        logger.info(f"[VISION] Using active vision model from VRAM: {active}")
-                        return active
-                if active_names:
-                    logger.info(
-                        "[VISION] Active model(s) %s not multimodal — "
-                        "loading a real vision model instead",
-                        active_names,
-                    )
+            for active in _resident():
+                if sees_natively(active):
+                    logger.info("[VISION] Reusing the vision model already in VRAM: %s", active)
+                    return active
 
-            # 2. Not in VRAM? Check what's available to tag and pick from priority list
+            candidates = [m for m in _installed() if sees_natively(m)]
+            if candidates:
+                # Prefer an eye whose pointing convention we have actually
+                # measured — an unmeasured one is readable for describing but
+                # not trustworthy for clicking.
+                candidates.sort(key=lambda m: (-coords_for(m).confidence, m))
+                pick = candidates[0]
+                logger.info("[VISION] Auto-detected vision model: %s", pick)
+                return pick
+        except Exception as e:  # noqa: BLE001
+            logger.debug("Vision detection via resolver failed (%s); using the static list", e)
+
+        # Resolver or Ollama unavailable. Static list, unchanged.
+        try:
             tags_resp = requests.get(f"{self.ollama_url}/api/tags", timeout=5)
             if tags_resp.status_code == 200:
                 available = {m["name"] for m in tags_resp.json().get("models", [])}
-                
-                # Dynamic priority: gemma4 first (our primary brain). Every
-                # gemma4 tag is multimodal, so accept whichever variant this
-                # machine has rather than requiring one specific tag.
-                for model in ("gemma4:e4b", "gemma4:12b", "gemma4:latest", "gemma4:e2b"):
-                    if model in available:
-                        logger.info(f"[VISION] Auto-detected vision model: {model}")
-                        return model
-                gemma_any = next(
-                    (m for m in sorted(available) if m.rsplit("/", 1)[-1].startswith("gemma4")),
-                    None,
-                )
-                if gemma_any:
-                    logger.info(f"[VISION] Auto-detected vision model: {gemma_any}")
-                    return gemma_any
-
-                # Then check the fallback list
                 for model in self._VISION_MODEL_PRIORITY:
                     if model in available:
                         logger.info(f"[VISION] Auto-detected vision model: {model}")
                         return model
         except Exception as e:
             logger.debug(f"Vision detection error: {e}")
-            pass
         return "moondream:latest"  # Final fallback
 
-    def text_query(self, prompt: str, model: str = None, think: bool = False) -> VisionResult:
+    def text_query(self, prompt: str, model: str = None, think: bool = False,
+                   system: Optional[str] = None, num_predict: Optional[int] = None,
+                   temperature: Optional[float] = None) -> VisionResult:
         """
         Query a text LLM (no image) for reasoning/decision-making.
 
@@ -140,17 +131,32 @@ class VisionAnalyzer:
         Returns:
             VisionResult with the LLM's text response
         """
-        model = model or self._get_decision_model()
+        if not model:
+            # The agent loop must always name its brain. A silent auto-pick is
+            # how a blind user model ended up "deciding" through a third model
+            # nobody chose; see resolve_brain_eye in agent_control_service.
+            logger.warning("[VISION] text_query called without model= — auto-picking a decision "
+                           "model (legacy path; pass the brain explicitly)")
+            model = self._get_decision_model()
 
         try:
             import time
             start = time.time()
 
+            messages = []
+            if system:
+                messages.append({"role": "system", "content": system})
+            messages.append({"role": "user", "content": prompt})
+            opts = {}
+            if num_predict is not None:
+                opts["num_predict"] = num_predict
+            if temperature is not None:
+                opts["temperature"] = temperature
             request_body = {
                 "model": model,
-                "messages": [{"role": "user", "content": prompt}],
+                "messages": messages,
                 "stream": False,
-                "options": request_options(model),
+                "options": request_options(model, **opts),
             }
             if not think:
                 request_body["think"] = False
@@ -188,7 +194,14 @@ class VisionAnalyzer:
             return VisionResult(success=False, error=str(e), model_used=model)
 
     def _get_decision_model(self) -> str:
-        """Auto-detect best available text model for decision-making."""
+        """Legacy fallback: pick some text model when the caller named none.
+
+        Only for callers that genuinely have no brain of their own
+        (apprentice_engine, film_curator). The agent loop passes its brain
+        explicitly and must never land here. The gemma4 entries were removed
+        from the preference list on 2026-09-22: a vision model quietly becoming
+        the decider for a text-model user was exactly the fault being fixed.
+        """
         try:
             response = requests.get(f"{self.ollama_url}/api/tags", timeout=5)
             if response.status_code == 200:
@@ -198,8 +211,8 @@ class VisionAnalyzer:
                 override = os.environ.get("GUAARDVARK_DECISION_MODEL")
                 if override and override in models:
                     return override
-                for preferred in ["gemma4:e4b", "gemma4:e2b", "llama3.1:8b",
-                                  "llama3:8b", "llama3:latest", "mistral:latest", "gemma2:latest"]:
+                for preferred in ["llama3.1:8b", "llama3:8b", "llama3:latest",
+                                  "mistral:latest", "gemma2:latest"]:
                     if preferred in models:
                         return preferred
                 # Fall back to any non-vision model

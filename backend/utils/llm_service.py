@@ -127,21 +127,6 @@ def get_llm_instance(
             logger.warning("Per-model LLM construction failed for %r: %s", model, e)
             return None
 
-    # Cloud provider routing: when the master cloud toggle is on AND a cloud
-    # provider (e.g. Mistral) is the active selection, hand back a cloud-backed
-    # LlamaIndex LLM so every .chat()/.complete() caller routes to the API.
-    # Resolved per-call (cheap) so the toggle takes effect without a restart.
-    # Falls through to the local Ollama instance otherwise (and on any error).
-    try:
-        from backend.services import llm_provider as _llm_provider
-        if _llm_provider.is_mistral_active():
-            from backend.services import mistral_provider
-            cloud_llm = mistral_provider.make_llamaindex_llm(_llm_provider.get_mistral_model())
-            if cloud_llm is not None:
-                return cloud_llm  # type: ignore
-    except Exception as e:  # noqa: BLE001 - never let provider logic break LLM access
-        logger.warning("Cloud provider resolution failed, falling back to Ollama: %s", e)
-
     if not current_app:
         logger.error("Flask current_app context not available.")
         return None
@@ -425,12 +410,8 @@ def generate_text_basic(llm=None, prompt=None, is_json_response: bool = False):
             f"generate_text_basic: Raw LLM response received (length: {len(content)}). Preview: {content[:100]}"
         )
 
-        # --- Post-processing to remove <think>...</think> blocks ---
-        # Using re.DOTALL to make '.' match newlines, and re.IGNORECASE for the tags.
-        # Non-greedy match .*? is important.
-        cleaned_content = re.sub(
-            r"<think>.*?</think>", "", content, flags=re.DOTALL | re.IGNORECASE
-        )
+        from backend.utils.inline_reasoning import split_inline_reasoning
+        cleaned_content = split_inline_reasoning(content)[1]
 
         if len(cleaned_content) < len(content):
             logger.info(

@@ -1,6 +1,8 @@
 import logging
 import os
 
+from typing import Optional
+
 from flask import current_app, has_app_context
 
 try:
@@ -57,6 +59,30 @@ def get_web_access() -> bool:
             # No app context available
             logger.error(f"Failed to read web access setting (no app context): {e}")
     return allow
+
+
+def web_access_block_reason(action: str) -> Optional[str]:
+    """None when web access (Settings, allow_web_search; off by default) is on;
+    otherwise the error to report, naming ``action``.
+
+    Everything that reaches the internet on a person's or a model's behalf
+    asks this: the web tools, research tasks, the outreach recon search. In
+    the MCP server process, which has no Flask app, the backend is asked.
+    """
+    disabled = f"Web access is disabled. Enable it in Settings to {action}."
+    try:
+        if has_app_context():
+            return None if get_web_access() else disabled
+    except Exception:
+        pass
+    from backend.utils.backend_http import BackendError, in_mcp_process, request_json
+    if in_mcp_process():
+        try:
+            data = request_json("GET", "/api/settings/web_access").data or {}
+        except BackendError as e:
+            return f"Could not check whether web access is enabled: {e}"
+        return None if data.get("allow_web_search") else disabled
+    return disabled
 
 
 def get_llm_debug() -> bool:
@@ -117,6 +143,8 @@ ENV_VAR_MAP = {
     "vision_pipeline_monitor_model": "GUAARDVARK_VISION_MONITOR_MODEL",
     "vision_pipeline_escalation_model": "GUAARDVARK_VISION_ESCALATION_MODEL",
     "vision_pipeline_auto_select": "GUAARDVARK_VISION_AUTO_SELECT",
+    "eye_ranking": "GUAARDVARK_EYE_RANKING",
+    "servo_correction": "GUAARDVARK_SERVO_CORRECTION",
     "gpu_quality_tier": "GUAARDVARK_GPU_QUALITY_TIER",
     "gpu_eviction_grace": "GUAARDVARK_GPU_EVICTION_GRACE",
     "gpu_idle_timeout": "GUAARDVARK_GPU_IDLE_TIMEOUT",
@@ -126,6 +154,7 @@ ENV_VAR_MAP = {
     "media_stills_model": "GUAARDVARK_STILLS_MODEL",
     "media_cast_train_base": "GUAARDVARK_CAST_TRAIN_BASE",
     "media_max_quality_model": "GUAARDVARK_MAX_QUALITY_MODEL",
+    "confine_tool_paths": "GUAARDVARK_CONFINE_TOOL_PATHS",
 }
 
 _BOOL_TRUTHY = {"true", "1", "yes"}
@@ -221,3 +250,23 @@ def save_setting(key: str, value: str):
             db.session.rollback()
         except Exception:
             pass
+
+
+# Tools read this from worker threads that have no app context, so the value
+# is kept for the process: loaded at startup, updated when the setting is saved.
+_confine_tool_paths: Optional[bool] = None
+
+
+def get_confine_tool_paths() -> bool:
+    """True when file-reading tools (system_command, codegen) are limited to the
+    project folder and GUAARDVARK_ALLOWED_PATHS. Off by default."""
+    global _confine_tool_paths
+    if has_app_context() or _confine_tool_paths is None:
+        _confine_tool_paths = bool(get_setting("confine_tool_paths", default=False, cast=bool))
+    return _confine_tool_paths
+
+
+def set_confine_tool_paths(enabled: bool) -> None:
+    global _confine_tool_paths
+    save_setting("confine_tool_paths", "true" if enabled else "false")
+    _confine_tool_paths = bool(enabled)

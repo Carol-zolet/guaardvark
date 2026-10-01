@@ -130,6 +130,69 @@ VISION_PATTERNS = re.compile(
 # AgentBrain
 # ---------------------------------------------------------------------------
 
+def _brain_provenance(request_id: str, tier: int, model, thinking_steps, eye=None) -> Dict[str, Any]:
+    """Provenance for a reply the brain saved itself (reflex, screen-direct,
+    deliberate): the same keys the chat engine writes, so feedback treats
+    every path alike. Recipe usage and agent tasks are drained from the
+    agent service, as the engine does."""
+    prov: Dict[str, Any] = {"request_id": request_id or "", "tier": int(tier)}
+    if model:
+        prov["model"] = model
+    if eye:
+        prov["eye"] = eye
+    tools = []
+    for st in thinking_steps or []:
+        for name in (st or {}).get("tools") or []:
+            if name not in tools:
+                tools.append(name)
+    if tools:
+        prov["tools"] = tools
+    try:
+        from backend.services.agent_control_service import get_agent_control_service
+        prov.update(get_agent_control_service().drain_recipe_usage())
+    except Exception:
+        pass
+    return prov
+
+
+def _persist_turn(app, session_id: str, role: str, content: str, extra: Optional[Dict[str, Any]],
+                  emit_fn: Optional[Callable] = None, request_id: str = "", project_id=None) -> Optional[int]:
+    """Write one chat row and, for an assistant row, announce its id.
+
+    One helper for the three brain paths that used to carry their own copy
+    of this block; `chat:message_saved` is what lets the client attach a
+    thumb to the row rather than to a content prefix. Best effort: a failed
+    save is logged and never surfaces to the user.
+    """
+    if not app or not content:
+        return None
+    new_id = None
+    try:
+        with app.app_context():
+            from backend.models import LLMMessage, db
+            msg = LLMMessage(
+                session_id=session_id,
+                role=role,
+                content=content,
+                extra_data=extra or None,
+                project_id=project_id,
+                timestamp=datetime.now(),
+            )
+            db.session.add(msg)
+            db.session.commit()
+            new_id = msg.id
+    except Exception:
+        logger.exception("Failed to persist %s turn for session %s", role, session_id)
+        return None
+    if role == "assistant":
+        try:
+            from backend.services.unified_chat_engine import emit_message_saved
+            emit_message_saved(emit_fn, session_id, request_id, new_id, role)
+        except Exception:
+            pass
+    return new_id
+
+
 class AgentBrain:
     """
     Three-tier agent router.  Single entry point for all chat/agent
@@ -172,7 +235,12 @@ class AgentBrain:
             force_tier: Override tier routing (for agent_chat_api, testing)
         """
         start_time = time.monotonic()
-        request_id = str(uuid.uuid4())
+        # Reuse the id the HTTP layer minted (it is already in the client's
+        # ack); mint one only for callers that did not. Every exit below emits
+        # and saves under this one id.
+        request_id = str((options or {}).get("request_id") or "") or str(uuid.uuid4())
+        if isinstance(options, dict):
+            options["request_id"] = request_id
         tier_used = 0
         tools_called: List[str] = []
         tool_params_log: List[Dict] = []
@@ -261,16 +329,21 @@ class AgentBrain:
             # Gated on _screen_active — inactive screen = fall through to
             # normal tier routing so the model uses tools like web_search and
             # analyze_website instead of emitting JSON click actions.
-            if (self.state.model_caps.is_vision_model
-                    and "gemma4" in self.state.active_model.lower()
-                    and not force_tier
+            # Direct screen path for ANY brain the loop can drive with: the
+            # active model itself when it can see and point, or the active
+            # model deciding with a borrowed eye when it cannot. The old gate
+            # tested the literal string "gemma4", which excluded every other
+            # model from the screen — including one whose name contained
+            # "gemma4" and had no vision at all.
+            if (not force_tier
                     and _screen_active
-                    and not force_standard_image):
+                    and not force_standard_image
+                    and self._screen_drivable()):
                 logger.debug(
-                    f"[EMIT-HANDOFF][BRAIN] entering _gemma4_direct session={session_id} "
+                    f"[EMIT-HANDOFF][BRAIN] entering _screen_direct session={session_id} "
                     f"emit_fn_id={id(emit_fn)} threadlocal_get? (will log inside ACS if used)"
                 )
-                result = self._gemma4_direct(
+                result = self._screen_direct(
                     session_id, message, options, emit_fn, app,
                     project_id=project_id, image_data=image_data,
                     image_url=image_url, is_voice_message=is_voice_message,
@@ -289,7 +362,7 @@ class AgentBrain:
                     session_id, message, options, emit_fn, app,
                     project_id=project_id, image_data=image_data,
                     image_url=image_url, is_voice_message=is_voice_message,
-                    budget=budget,
+                    budget=budget, request_id=request_id,
                 )
 
             # -- Tier 1: Reflexes (<1ms check, <100ms execute) --
@@ -307,6 +380,21 @@ class AgentBrain:
                             emit_fn, session_id, result.response, request_id
                         )
                         budget.charge(1, 1, "tier1 reflex")
+                        # A reflex reply is still a reply: persisted (after the
+                        # emit, so latency is unchanged) so it survives a
+                        # refresh and can be thumbed like any other.
+                        if app and (options or {}).get("persist", True) is not False:
+                            _persist_turn(app, session_id, "user", message, None,
+                                          project_id=project_id)
+                            _persist_turn(
+                                app, session_id, "assistant", result.response,
+                                {"provenance": {
+                                    "request_id": request_id, "tier": 1,
+                                    "reflex": reflex_action.name,
+                                    "tools": [result.tool_called] if result.tool_called else [],
+                                }},
+                                emit_fn=emit_fn, request_id=request_id, project_id=project_id,
+                            )
                         return self._build_result(
                             result.response, session_id, request_id, tier=1,
                         )
@@ -356,7 +444,7 @@ class AgentBrain:
                     session_id, message, options, emit_fn, app,
                     project_id=project_id, image_data=image_data,
                     image_url=image_url, is_voice_message=is_voice_message,
-                    budget=budget,
+                    budget=budget, request_id=request_id,
                 )
 
             # -- Default: Tier 2 (single-shot with tools) --
@@ -390,7 +478,7 @@ class AgentBrain:
                     project_id=project_id, image_data=image_data,
                     image_url=image_url, is_voice_message=is_voice_message,
                     initial_context=result,
-                    budget=budget,
+                    budget=budget, request_id=request_id,
                 )
 
             return result
@@ -432,7 +520,7 @@ class AgentBrain:
 
     # -- Gemma4 direct path -------------------------------------------------
 
-    def _gemma4_direct(
+    def _screen_direct(
         self,
         session_id: str,
         message: str,
@@ -536,7 +624,6 @@ class AgentBrain:
             # Pass the explicit budget (gemma direct counts against the cross-tier cap).
             if budget is None:
                 budget = StepBudget.from_total(self.TOTAL_STEP_CAP)
-            gemma_steps = min(budget.remaining, 12)
             budget.charge(1, 0, "gemma4 direct entry")  # count the direct path
             # actively query memory/entity for context (Phase 2.1)
             try:
@@ -547,8 +634,10 @@ class AgentBrain:
                 budget.charge(1, 0, "gemma context query")
             except Exception:
                 pass
-            # Include budget summary in chat_context so the ACS/Gemma loop (and its LLM) "sees" the budget status for awareness.
-            budget_aware_context = (history_str or "") + "\n" + budget.to_llm_summary() + " (cross-tier budget visible to you — be mindful of remaining steps in this agentic task.)"
+            # The screen loop stops on its own stall rule and ceilings; a
+            # "[BUDGET: n/20 steps left]" line beside a task that states its
+            # own budget only misled the model, so it no longer rides along.
+            screen_context = history_str or ""
             logger.debug(
                 f"[EMIT-HANDOFF][BRAIN_GEMMA] calling acs.execute_task DIRECT (bypasses agent_task_execute tool) "
                 f"with explicit emit_fn_id={id(emit_fn)} session={session_id}"
@@ -557,9 +646,9 @@ class AgentBrain:
                 task=message, 
                 screen=screen, 
                 emit_fn=emit_fn, 
-                chat_context=budget_aware_context,
-                max_steps=gemma_steps,
-                budget=budget,  # pass through for future ACS awareness
+                chat_context=screen_context,
+                budget=budget,
+                session_id=session_id,
             )
 
             # Narrate the outcome in Guaardvark's voice
@@ -584,35 +673,27 @@ class AgentBrain:
 
             # Save assistant response (with generated images for persistence)
             if app and response:
-                with app.app_context():
-                    try:
-                        from backend.models import LLMMessage, db
-                        from datetime import datetime as _dt
-                        clean = re.sub(r'<[^>]*>', '', response).strip()
-                        extra = {}
-                        if generated_images:
-                            extra["generatedImages"] = generated_images
-                        try:
-                            agent_thinking_steps = acs.drain_thinking_steps()
-                            logger.debug(
-                                f"[EMIT-HANDOFF][BRAIN_DRAIN] gemma4_direct drain returned {len(agent_thinking_steps)} steps"
-                            )
-                            if agent_thinking_steps:
-                                extra["agentThinkingSteps"] = agent_thinking_steps
-                        except Exception:
-                            pass
-                        content = clean if not clean.startswith("{") else f"[Action] {response}"
-                        msg = LLMMessage(
-                            session_id=session_id,
-                            role="assistant",
-                            content=content,
-                            extra_data=extra or None,
-                            timestamp=_dt.now(),
-                        )
-                        db.session.add(msg)
-                        db.session.commit()
-                    except Exception:
-                        pass
+                clean = re.sub(r'<[^>]*>', '', response).strip()
+                extra = {}
+                if generated_images:
+                    extra["generatedImages"] = generated_images
+                agent_thinking_steps = []
+                try:
+                    agent_thinking_steps = acs.drain_thinking_steps()
+                    logger.debug(
+                        f"[EMIT-HANDOFF][BRAIN_DRAIN] screen_direct drain returned {len(agent_thinking_steps)} steps"
+                    )
+                    if agent_thinking_steps:
+                        extra["agentThinkingSteps"] = agent_thinking_steps
+                except Exception:
+                    pass
+                be = getattr(acs, "_brain_eye", None)
+                extra["provenance"] = _brain_provenance(
+                    request_id, 0, getattr(be, "brain", None), agent_thinking_steps,
+                    eye=getattr(be, "eye", None))
+                content = clean if not clean.startswith("{") else f"[Action] {response}"
+                _persist_turn(app, session_id, "assistant", content, extra,
+                              emit_fn=emit_fn, request_id=request_id, project_id=project_id)
 
             return {
                 "success": True,
@@ -716,7 +797,8 @@ class AgentBrain:
                 logger.warning(f"[narration_fallback] narration call failed (attempt {attempt}): {e}")
                 continue
             raw = "".join(accumulated)
-            text = re.sub(r'<think>[\s\S]*?</think>\s*', '', raw).strip()
+            from backend.utils.inline_reasoning import split_inline_reasoning
+            text = split_inline_reasoning(raw)[1]
             logger.info(
                 f"[narration] attempt={attempt} reason={reason!r} success={success} "
                 f"chunks={len(accumulated)} raw_len={len(raw)} clean_len={len(text)} "
@@ -751,6 +833,7 @@ class AgentBrain:
             "timeout": "I ran out of time on that one — want me to retry?",
             "max_iterations": "I tried a few times and couldn't get there. Tell me more about what you wanted?",
             "max_failures": "I tried a few times and couldn't get there. Tell me more about what you wanted?",
+            "stalled_no_progress": "I kept acting but the screen stopped changing and I had no new target, so I stopped rather than loop. Tell me what to try next?",
             "killed": "Stopped that one.",
         }
         if r in mapping:
@@ -849,15 +932,15 @@ class AgentBrain:
                 # them work. Per data/agent/LEARNING_PRINCIPLES.md.
                 if target:
                     try:
-                        from backend.services.servo_controller import ServoController
                         from backend.services.training_data_collector import TrainingDataCollector
-                        from backend.services.servo_knowledge_store import get_vision_config
-                        from backend.utils.vision_analyzer import VisionAnalyzer
-                        servo = ServoController(
-                            screen, VisionAnalyzer(),
-                            collector=TrainingDataCollector(),
-                            vision_config=get_vision_config(),
-                        )
+                        from backend.services.agent_control_service import (
+                            AgentControlService, build_servo)
+                        # Same eye, same config, same measured accuracy as the
+                        # loop. This path used to build its own eye with a
+                        # bare VisionAnalyzer() and a model-less config.
+                        be = AgentControlService.resolve_brain_eye(
+                            self.state.active_model, screen.screen_size())
+                        _, servo = build_servo(screen, be.eye, collector=TrainingDataCollector())
                         result = servo.click_target(target, button=button)
                         if result.get("success"):
                             cx, cy = result.get("x"), result.get("y")
@@ -924,6 +1007,7 @@ class AgentBrain:
             try:
                 import time as _sc_time
                 from backend.tools.agent_control_tools import SCREENSHOTS_DIR, _prune_old_screenshots
+                from backend.utils.screenshot_urls import screenshot_url
                 from backend.utils.vision_analyzer import VisionAnalyzer
 
                 screenshot, cursor_pos = screen.capture()
@@ -931,7 +1015,7 @@ class AgentBrain:
                 filename = f"agent_capture_{int(_sc_time.time() * 1000)}.webp"
                 filepath = os.path.join(SCREENSHOTS_DIR, filename)
                 screenshot.save(filepath, format="WEBP", quality=80)
-                image_url = f"/api/tools/screenshots/{filename}"
+                image_url = screenshot_url(filename)
                 _prune_old_screenshots(SCREENSHOTS_DIR)
 
                 emit_fn("chat:image", {
@@ -1125,6 +1209,7 @@ class AgentBrain:
         image_url: str = None,
         is_voice_message: bool = False,
         budget: Optional[StepBudget] = None,
+        request_id: str = "",
         **kwargs,
     ) -> Dict[str, Any]:
         """
@@ -1213,31 +1298,20 @@ class AgentBrain:
             except Exception:
                 pass
 
-            self._emit_response(emit_fn, session_id, response_text, "")
+            self._emit_response(emit_fn, session_id, response_text, request_id or "")
 
             # Persist the assistant turn (Tier 3 direct path bypasses legacy
             # UnifiedChatEngine which normally does the save + drain). Mirrors
-            # the save block in gemma4 direct and the legacy engine.
+            # the save block in the screen-direct path and the legacy engine.
             if app and response_text:
-                with app.app_context():
-                    try:
-                        from backend.models import LLMMessage, db
-                        from datetime import datetime as _dt
-                        clean = re.sub(r'<[^>]*>', '', response_text).strip()
-                        extra = {}
-                        if agent_thinking_steps:
-                            extra["agentThinkingSteps"] = agent_thinking_steps
-                        msg = LLMMessage(
-                            session_id=session_id,
-                            role="assistant",
-                            content=clean or response_text,
-                            extra_data=extra or None,
-                            timestamp=_dt.now(),
-                        )
-                        db.session.add(msg)
-                        db.session.commit()
-                    except Exception:
-                        pass
+                clean = re.sub(r'<[^>]*>', '', response_text).strip()
+                extra = {}
+                if agent_thinking_steps:
+                    extra["agentThinkingSteps"] = agent_thinking_steps
+                extra["provenance"] = _brain_provenance(
+                    request_id, 3, getattr(self.state.llm, "model", None), agent_thinking_steps)
+                _persist_turn(app, session_id, "assistant", clean or response_text, extra,
+                              emit_fn=emit_fn, request_id=request_id, project_id=project_id)
 
             return {
                 "success": result.success,
@@ -1309,6 +1383,18 @@ class AgentBrain:
 
     # -- Routing helpers ----------------------------------------------------
 
+    # Historical name; the path is no longer Gemma-specific.
+    _gemma4_direct = None  # rebound below the class body
+
+    def _screen_drivable(self) -> bool:
+        """Can the agent loop drive the screen with the active model as brain?"""
+        try:
+            from backend.services.agent_control_service import AgentControlService
+            return bool(AgentControlService.resolve_brain_eye(self.state.active_model).eye)
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"screen-drivable check failed: {e}")
+            return False
+
     def _is_vision_task(self, message: str, image_data: str = None) -> bool:
         """Check if this is a vision/screen task."""
         if image_data:
@@ -1362,3 +1448,6 @@ class AgentBrain:
             "tier": tier,
             **extra,
         }
+
+# Kept for callers and tests that still use the old name.
+AgentBrain._gemma4_direct = AgentBrain._screen_direct

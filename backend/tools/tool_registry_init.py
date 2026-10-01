@@ -364,51 +364,24 @@ def register_desktop_tools() -> List[str]:
 
 
 def register_mcp_tools() -> List[str]:
-    """Register MCP (Model Context Protocol) tools"""
+    """Register MCP (Model Context Protocol) meta-tools.
+
+    Per-server tools (mcp__<server>__<tool>) are registered dynamically by
+    backend.tools.mcp_tools.install_proxy_sync when servers connect.
+    """
     global _tool_categories
     registered = []
     category = "mcp"
 
     try:
-        from backend.tools.mcp_tools import (
-            MCPListServersTool,
-            MCPConnectTool,
-            MCPDisconnectTool,
-            MCPListToolsTool,
-            MCPExecuteTool,
-            MCPGetStateTool,
-        )
+        from backend.tools.mcp_tools import META_TOOL_CLASSES
 
-        register_tool(MCPListServersTool())
-        registered.append("mcp_list_servers")
-        _tool_categories["mcp_list_servers"] = category
-        logger.debug("Registered: MCPListServersTool")
-
-        register_tool(MCPConnectTool())
-        registered.append("mcp_connect")
-        _tool_categories["mcp_connect"] = category
-        logger.debug("Registered: MCPConnectTool")
-
-        register_tool(MCPDisconnectTool())
-        registered.append("mcp_disconnect")
-        _tool_categories["mcp_disconnect"] = category
-        logger.debug("Registered: MCPDisconnectTool")
-
-        register_tool(MCPListToolsTool())
-        registered.append("mcp_list_tools")
-        _tool_categories["mcp_list_tools"] = category
-        logger.debug("Registered: MCPListToolsTool")
-
-        register_tool(MCPExecuteTool())
-        registered.append("mcp_execute")
-        _tool_categories["mcp_execute"] = category
-        logger.debug("Registered: MCPExecuteTool")
-
-        register_tool(MCPGetStateTool())
-        registered.append("mcp_get_state")
-        _tool_categories["mcp_get_state"] = category
-        logger.debug("Registered: MCPGetStateTool")
-
+        for cls in META_TOOL_CLASSES:
+            tool = cls()
+            register_tool(tool)
+            registered.append(tool.name)
+            _tool_categories[tool.name] = category
+        logger.info(f"Registered MCP meta-tools: {', '.join(registered)}")
     except ImportError as e:
         logger.error(f"Failed to import MCP tools: {e}")
     except Exception as e:
@@ -511,10 +484,20 @@ def register_rag_tools() -> List[str]:
 
 
 def register_media_tools() -> List[str]:
-    """Register media player control tools"""
+    """Register media player control tools.
+
+    Registered on Linux only: they use D-Bus MPRIS2, amixer and a Linux VLC, so
+    elsewhere chat and MCP clients would see four tools that can only refuse.
+    """
     global _tool_categories
     registered = []
     category = "media"
+
+    from backend.utils.platform import media_player_available, os_name
+    if not media_player_available():
+        logger.info("Media player tools not registered: they need Linux (D-Bus MPRIS2, amixer, "
+                    "VLC) and this machine runs %s", os_name())
+        return registered
 
     try:
         from backend.tools.media_tools import (
@@ -637,6 +620,30 @@ def register_image_tools() -> List[str]:
         except Exception as e:
             logger.warning("Failed to register %s: %s", _tool_name, e)
 
+    return registered
+
+
+def register_audio_tools() -> List[str]:
+    """Register music and speech for MCP clients.
+
+    Registered only in the MCP server process, so chat's tool choice is unchanged;
+    agents connected over MCP get the Audio Foundry that the Studio's Audio page uses.
+    """
+    from backend.utils.backend_http import in_mcp_process
+
+    registered = []
+    if not in_mcp_process():
+        return registered
+    for _cls_name, _tool_name in (("GenerateMusicTool", "generate_music"),
+                                  ("GenerateSpeechTool", "generate_speech")):
+        try:
+            from backend.tools import audio_tools as _audio_tools
+            register_tool(getattr(_audio_tools, _cls_name)())
+            registered.append(_tool_name)
+            _tool_categories[_tool_name] = "audio"
+            logger.debug("Registered: %s", _cls_name)
+        except Exception as e:
+            logger.warning("Failed to register %s: %s", _tool_name, e)
     return registered
 
 
@@ -839,6 +846,7 @@ def initialize_all_tools() -> ToolRegistry:
     _registered_tools.extend(register_rag_tools())
     _registered_tools.extend(register_media_tools())
     _registered_tools.extend(register_image_tools())
+    _registered_tools.extend(register_audio_tools())
     _registered_tools.extend(register_test_execution_tools())
     _registered_tools.extend(register_agent_control_tools())
     _registered_tools.extend(register_outreach_tools())

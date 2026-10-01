@@ -37,6 +37,7 @@ const RulesPage = lazy(() => import("./pages/RulesPage"));
 const ToolsPage = lazy(() => import("./pages/ToolsPage"));
 const AgentsPage = lazy(() => import("./pages/AgentsPage"));
 const AgentMemoryPage = lazy(() => import("./pages/AgentMemoryPage"));
+const MCPServersPage = lazy(() => import("./pages/MCPServersPage"));
 const WebsitesPage = lazy(() => import("./pages/WebsitesPage"));
 const WebsiteDetailPage = lazy(() => import("./pages/WebsiteDetailPage"));
 const FileGenerationPage = lazy(() => import("./pages/FileGenerationPage"));
@@ -74,6 +75,7 @@ import ProgressFooterBar from "./components/layout/ProgressFooterBar";
 import { StatusProvider } from "./contexts/StatusContext";
 import { HealthProvider } from "./contexts/HealthContext";
 import BackendOfflineBanner from "./components/common/BackendOfflineBanner";
+import ApiKeyRefusalNotice from "./components/common/ApiKeyRefusalNotice";
 import { SnackbarProvider } from "./components/common/SnackbarProvider";
 import { ErrorProvider } from "./components/common/ErrorProvider";
 import ErrorBoundary from "./components/common/ErrorBoundary";
@@ -234,6 +236,7 @@ const AppContainer = () => {
               <VoiceProvider>
                 <SnackbarProvider>
                   <UncleNotificationListener />
+                  <ApiKeyRefusalNotice />
                   <ErrorProvider>
                     <FirstRunProfileDialog />
                     <Suspense fallback={<Box sx={{ display: "flex", flexDirection: "column", justifyContent: "center", alignItems: "center", height: "100vh", gap: 2 }}><BrandLogo size={64} animate /><CircularProgress size={24} /></Box>}>
@@ -475,6 +478,14 @@ const AppContainer = () => {
                         element={
                           <AppLayout>
                             <AgentMemoryPage />
+                          </AppLayout>
+                        }
+                      />
+                      <Route
+                        path="/agents/mcp"
+                        element={
+                          <AppLayout>
+                            <MCPServersPage />
                           </AppLayout>
                         }
                       />

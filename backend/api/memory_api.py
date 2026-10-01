@@ -16,6 +16,7 @@ Memory tiers in this app are intentionally separate:
 """
 
 import json
+import threading
 import logging
 import uuid
 from datetime import datetime
@@ -470,10 +471,12 @@ def clear_memories():
 
 @memory_bp.route("/recall-debug", methods=["GET", "POST"])
 def recall_debug():
-    """Return selected memory ids and scores for a recall query."""
+    """Return selected memory ids and scores for a recall query. Looking does
+    not count as recalling, so the rows it shows are left as they were."""
     data = request.get_json(silent=True) if request.method == "POST" else request.args
     data = data or {}
     memories = _query_memories(
+        count_access=False,
         limit=int(data.get("limit", 10)),
         query=data.get("query"),
         session_id=data.get("session_id"),
@@ -544,6 +547,8 @@ def _query_memories(
     include_global: bool = True,
     cli_working_memory: dict | None = None,
     raise_errors: bool = False,
+    include_always_on: bool = True,
+    count_access: bool = True,
 ):
     """Single source of truth for memory SELECT.
 
@@ -555,6 +560,14 @@ def _query_memories(
     Prompt builders keep the default and get an empty list when the query
     fails. A caller that reports results to a person passes raise_errors=True,
     so a failure is not shown as "no memories".
+
+    include_always_on adds up to three high-importance facts and notes even
+    when they do not match the query, which prompt recall wants and a search
+    that reports "matches" does not.
+
+    count_access records the returned rows as recalled (access_count and
+    last_accessed_at, which feed the "recalled before" rank reason). A
+    read-only search passes False.
     """
     try:
         q = db.session.query(AgentMemory)
@@ -646,7 +659,7 @@ def _query_memories(
             )
 
         always_on = []
-        if recall_query and not types:
+        if recall_query and not types and include_always_on:
             always_q = db.session.query(AgentMemory).filter(
                 AgentMemory.type.in_(["fact", "note"]),
                 AgentMemory.importance >= 0.85,
@@ -687,7 +700,7 @@ def _query_memories(
             if len(selected) >= limit:
                 break
 
-        if selected:
+        if selected and count_access:
             now = utcnow()
             for memory in selected:
                 memory.access_count = int(memory.access_count or 0) + 1
@@ -738,6 +751,19 @@ def get_memories_for_context(
         )
 
 
+# The ids behind the last memory block built on this thread. Feedback on a
+# reply needs to know which memories shaped it; the block itself is prose and
+# the chat engine must not re-run the query. Pop, never peek: a reused worker
+# thread must not hand one request's selection to the next.
+_LAST_SELECTED = threading.local()
+
+
+def pop_last_selected_ids() -> list:
+    ids = list(getattr(_LAST_SELECTED, "ids", None) or [])
+    _LAST_SELECTED.ids = []
+    return ids
+
+
 def _get_memories_for_context_inner(
     limit: int = 20,
     max_tokens: int = 500,
@@ -757,6 +783,7 @@ def _get_memories_for_context_inner(
         workspace_root=workspace_root,
         cli_working_memory=cli_working_memory,
     )
+    _LAST_SELECTED.ids = [m.id for m in (memories or [])]
 
     if not memories:
         return ""
@@ -767,9 +794,14 @@ def _get_memories_for_context_inner(
     # Group by category. lesson_summary stays as its own bucket (source-based);
     # everything else groups by type so each lands under a framing header
     # tailored to how strictly the model should treat it.
-    groups = {"fact": [], "note": [], "preference": [], "lesson_summary": [], "other": []}
+    groups = {"fact": [], "note": [], "preference": [], "lesson_summary": [], "other": [],
+              "correction": [], "keep": []}
     for m in memories:
-        if m.source == "lesson_summary" or m.type in ("lesson", "lesson_summary"):
+        if m.source == "learned_from_feedback":
+            # What the user's thumbs taught, rendered last under their own
+            # framing (see below) rather than as an operating note.
+            groups["keep" if "keep" in normalize_tags(m.tags) else "correction"].append(m)
+        elif m.source == "lesson_summary" or m.type in ("lesson", "lesson_summary"):
             groups["lesson_summary"].append(m)
         elif m.type in groups:
             groups[m.type].append(m)
@@ -876,6 +908,17 @@ def _get_memories_for_context_inner(
         if other_body:
             sections.append("\n".join(["Other saved memories:"] + other_body))
 
+    # Feedback last: corrections say what not to repeat, confirmations what
+    # to keep doing. Absent on a fresh install, so stock prompts are unchanged.
+    if groups["correction"]:
+        body = _render_plain(groups["correction"], 240)
+        if body:
+            sections.append("\n".join(["Corrections from your feedback (do not repeat these):"] + body))
+    if groups["keep"]:
+        body = _render_plain(groups["keep"], 240)
+        if body:
+            sections.append("\n".join(["Confirmed by your feedback (keep doing this):"] + body))
+
     if not sections:
         return ""
     return "\n\n".join(sections)
@@ -944,9 +987,8 @@ def _get_lessons_for_agent_prompt_inner(
         seen_ids = {r.id for r in rows}
         rows.extend(r for r in belief_rows if r.id not in seen_ids)
 
-    if not rows:
-        return ""
-
+    # No early return on empty rows: the corrections block below can still
+    # have something to say, and the final check covers the all-empty case.
     sections = []
     total = 0
     for row in rows:
@@ -978,6 +1020,32 @@ def _get_lessons_for_agent_prompt_inner(
             break
         sections.append(block)
         total += len(block) + 2
+
+    # Corrections from the user's thumbs, appended after the lessons and
+    # within the same budget. Empty on a fresh install.
+    try:
+        fb_rows = _query_memories(
+            sources=["learned_from_feedback"],
+            limit=4,
+            session_id=session_id,
+            project_id=project_id,
+            workspace_root=workspace_root,
+        )
+    except Exception:
+        fb_rows = []
+    fb_lines = []
+    for r in fb_rows:
+        content = (r.content or "").strip()
+        if not content:
+            continue
+        tag = "keep" if "keep" in normalize_tags(r.tags) else "avoid"
+        line = f"- ({tag}) {content[:240]}"
+        if total + len(line) > max_chars:
+            break
+        fb_lines.append(line)
+        total += len(line) + 1
+    if fb_lines:
+        sections.append("### Corrections from feedback\n" + "\n".join(fb_lines))
 
     if not sections:
         return ""

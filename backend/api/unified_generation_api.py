@@ -343,9 +343,19 @@ def generate_large_scale_csv():
         # Get file size
         file_size = os.path.getsize(output_path) if os.path.exists(output_path) else None
 
+        # With web access off the generator skips web research and says so.
+        research_skipped = stats.get("web_research_skipped")
+        web_research_used = bool(enable_web_research) and not research_skipped
+        message = (
+            f"Large-scale CSV generation completed successfully. Generated {stats.get('total_rows', 0)} rows "
+            f"with {'web research' if web_research_used else 'LLM-only content'}."
+        )
+        if research_skipped:
+            message += f" {research_skipped}"
+
         # Enhanced response with chunking information
         response_data = {
-            "message": f"Large-scale CSV generation completed successfully. Generated {stats.get('total_rows', 0)} rows with {'web research' if enable_web_research else 'LLM-only content'}.",
+            "message": message,
             "generation_type": "large_scale_bulk",
             "output_file": os.path.basename(output_path),
             "output_path": output_path,
@@ -353,7 +363,7 @@ def generate_large_scale_csv():
             "statistics": {
                 **stats,
                 "processing_method": "chunked" if num_items > 500 else "standard",
-                "web_research_enabled": enable_web_research,
+                "web_research_enabled": web_research_used,
                 "total_chunks": len(tasks) // chunk_size + (1 if len(tasks) % chunk_size else 0) if num_items > 500 else 1,
                 "chunk_size": chunk_size,
                 "concurrent_workers": concurrent_workers

@@ -306,7 +306,7 @@ export const runSelfTest = async (options = {}) => {
 
 export const testLLM = async () => {
   try {
-    const response = await fetch(`${BASE_URL}/meta/test-llm`);
+    const response = await fetch(`${BASE_URL}/meta/test-llm`, { method: "POST" });
     const data = await handleResponse(response);
     if (typeof data === "object" && data !== null && data.error)
       throw new Error(data.error);
@@ -624,6 +624,9 @@ export const triggerReboot = async () => {
       throw new Error(data.error);
     return data;
   } catch (err) {
+    // Refused (this device needs the API key): nothing restarted, and the
+    // caller shows the advice handleResponse put in the message.
+    if (err.authRefused) throw err;
     console.warn(
       "settingsService: Error triggering reboot (might be expected if server restarted):",
       err.message,
@@ -632,6 +635,30 @@ export const triggerReboot = async () => {
       warning: "Reboot initiated, connection may have been lost as expected.",
       error: err.message,
     };
+  }
+};
+
+export const getConfineToolPaths = async () => {
+  try {
+    const response = await fetch(`${BASE_URL}/settings/confine_tool_paths`);
+    return await handleResponse(response);
+  } catch (err) {
+    console.error("settingsService: Error getting tool path limit:", err.message);
+    return { error: err.message };
+  }
+};
+
+export const setConfineToolPaths = async (enabled) => {
+  try {
+    const response = await fetch(`${BASE_URL}/settings/confine_tool_paths`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ confine_tool_paths: !!enabled }),
+    });
+    return await handleResponse(response);
+  } catch (err) {
+    console.error("settingsService: Error setting tool path limit:", err.message);
+    return { error: err.message };
   }
 };
 

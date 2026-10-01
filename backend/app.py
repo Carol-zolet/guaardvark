@@ -413,25 +413,6 @@ except ImportError as e:
     )
 
 
-def dev_allowed_origins(frontend_url: str) -> list[str]:
-    """Browser origins the dev backend accepts, including Socket.IO handshakes.
-
-    A sibling install moves its dev server and backend off the default ports so
-    the two can run at once, so both are read from the environment: a hardcoded
-    list refuses every websocket from a relocated frontend.
-    """
-    flask_port = os.getenv("FLASK_PORT", os.getenv("PORT", "5000"))
-    dev_ports = sorted({os.getenv("VITE_PORT", "5173"), "3000", "5173", "5175"})
-    return [
-        f"http://{host}:{port}"
-        for port in dev_ports
-        for host in ("localhost", "127.0.0.1")
-    ] + [frontend_url] + [
-        f"http://localhost:{flask_port}",
-        f"http://127.0.0.1:{flask_port}",
-    ]
-
-
 # Re-entry guard. create_app() must run exactly once per Python process.
 # A second call would re-register all 80 blueprints, re-init BrainState, re-discover
 # plugins, and spawn duplicate background threads — corrupting all the singletons
@@ -482,7 +463,7 @@ def _initialize_app_components(app):
     start_time = time.time()
     executor = Executor(app)
     app.executor = executor
-    from backend.socketio_instance import socketio, FRONTEND_URL
+    from backend.socketio_instance import socketio
     from backend.celery_app import celery as shared_celery
     celery = shared_celery
     
@@ -528,77 +509,23 @@ def _initialize_app_components(app):
     app.logger.info(
         f"Backend application version {__version__} starting..."
     )
-    app.logger.info(
-        f"CORS policy configured to allow specific origins."
-    )
-
-    if flask_env == "production":
-        allowed_origins = [FRONTEND_URL]
-        supports_credentials = True
-        app.logger.info(f"Production CORS: Allowing only {FRONTEND_URL}")
-    else:
-        allowed_origins = dev_allowed_origins(FRONTEND_URL)
-        supports_credentials = True
-        app.logger.info(f"Development CORS: Allowing {len(allowed_origins)} origins")
-
-    # Always allow LAN private-IP origins for local workstation access from phones,
-    # tablets, or other browsers on the same network. This is the primary enabler for
-    # "go to the printed LAN IP + VITE_PORT and use chat/voice". The patterns were
-    # previously only added in interconnector master mode; we now include them
-    # unconditionally (additive) because this is a personal offline AI machine, not
-    # a public service. The interconnector block below may still run for cluster cases.
-    lan_patterns = [
-        r"http://192\.168\.\d+\.\d+:\d+",
-        r"http://10\.\d+\.\d+\.\d+:\d+",
-        r"http://172\.(1[6-9]|2\d|3[01])\.\d+\.\d+:\d+",
-        r"https://192\.168\.\d+\.\d+:\d+",
-        r"https://10\.\d+\.\d+\.\d+:\d+",
-        r"https://172\.(1[6-9]|2\d|3[01])\.\d+\.\d+:\d+",
-    ]
-    allowed_origins = lan_patterns + allowed_origins
-
-    interconnector_master_mode = False
-    try:
-        from backend.api.interconnector_api import _get_config
-        interconnector_config = _get_config()
-        if interconnector_config:
-            if interconnector_config.get("node_mode") == "master":
-                interconnector_master_mode = True
-                # (patterns already prepended above for general LAN UI access)
-                supports_credentials = False
-                app.logger.info("CORS: Master mode active for interconnector (LAN patterns already enabled)")
-            master_url = interconnector_config.get("master_url")
-            if master_url:
-                from urllib.parse import urlparse
-                parsed = urlparse(master_url)
-                master_origin = f"{parsed.scheme}://{parsed.netloc}"
-                if master_origin not in allowed_origins:
-                    allowed_origins.append(master_origin)
-                    app.logger.info(f"CORS: Added master origin {master_origin}")
-    except Exception as cors_err:
-        if "application context" not in str(cors_err).lower():
-            app.logger.warning(f"Could not load interconnector config for CORS: {cors_err}")
-
-    CORS(
-        app,
-        # Apply CORS to everything. The security boundary is the `allowed_origins` list
-        # (localhost variants + VITE_FRONTEND_URL + private LAN IP regex patterns).
-        # This is required because the frontend (when using an absolute VITE_API_BASE_URL
-        # pointing at the backend on a different port or LAN IP) makes direct calls to many
-        # top-level routes that are *not* under /api/* (e.g. some /voice/*, /model, /clients,
-        # /tasks, /meta/*, /gpu/*, /settings/*, /enhanced-chat/*, /plugins, /memory, /projects,
-        # /claude/*, /self-improvement/*, /autoresearch/*, /agent-control/*, /interconnector/*,
-        # /system/*, /files/*, etc.). Previously only /api/* and /health* were covered, so
-        # cross-origin requests from a LAN-loaded (or localhost + baked-LAN) frontend hit
-        # "CORS header ‘Access-Control-Allow-Origin’ missing".
-        resources={r"/*": {"origins": allowed_origins}},
-        supports_credentials=supports_credentials,
-        allow_headers=["Content-Type", "Authorization", "X-API-Key"],
-        methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-    )
+    # Browsers may read replies, and open Socket.IO, only from this install's
+    # own pages (backend/utils/cors_policy.py). Every route is covered, not
+    # only /api: a build with an absolute VITE_API_BASE_URL calls top-level
+    # routes on the backend directly.
+    from backend.utils.cors_policy import extra_origins, init_cors
+    allowed_origins = init_cors(app, CORS)
+    app.logger.info(f"CORS: allowing {len(allowed_origins)} origins of this install")
+    if extra_origins():
+        app.logger.info(f"CORS: GUAARDVARK_CORS_ORIGINS adds {', '.join(extra_origins())}")
 
     socketio.init_app(app)
     app.logger.info("CORS and SocketIO configured with secure origins")
+    # Only requests addressed to one of this install's names reach Socket.IO
+    # or any view (backend/utils/host_check.py). Wraps Socket.IO's middleware,
+    # so it must come after socketio.init_app.
+    from backend.utils.host_check import HostCheckMiddleware
+    app.wsgi_app = HostCheckMiddleware(app.wsgi_app)
 
     try:
         from backend.utils.unified_progress_system import get_unified_progress
@@ -936,8 +863,8 @@ def _initialize_app_components(app):
         if app.config.get("SECRET_KEY") == "dev-secret-key":
             security_warnings.append(" Using default secret key - change in production")
         
-        if flask_env == "production" and len(allowed_origins) > 1:
-            security_warnings.append(" Multiple CORS origins in production - restrict to single domain")
+        if flask_env == "production" and extra_origins():
+            security_warnings.append(" GUAARDVARK_CORS_ORIGINS allows extra origins in production - keep only frontends you serve")
         
         max_upload = app.config.get("MAX_CONTENT_LENGTH", 0)
         if max_upload > 500 * 1024 * 1024:
@@ -967,6 +894,11 @@ def _initialize_app_components(app):
         app.logger.debug(
             f"Incoming {request.method} request to {request.path} from {request.remote_addr}"
         )
+
+    # A page on another site may not change anything here, API key or not
+    # (backend/utils/cross_site_guard.py). Runs before the auth guard and every view.
+    from backend.utils.cross_site_guard import refuse_cross_site_request
+    app.before_request(refuse_cross_site_request)
 
     # Protect sensitive endpoints (code execution, backup restore/delete)
     from backend.utils.auth_guard import check_endpoint_auth
@@ -1231,7 +1163,43 @@ def _initialize_app_components(app):
             pass
     atexit.register(_unload_heavy_generators)
 
+    # MCP: keep first-class mcp__<server>__<tool> proxies in sync with server
+    # connections. The service stops its MCP child processes via atexit.
+    # Tools read the project-folder limit from threads without an app
+    # context; load it once here.
+    try:
+        with app.app_context():
+            from backend.utils.settings_utils import get_confine_tool_paths
+            get_confine_tool_paths()
+    except Exception as e:
+        app.logger.warning(f"Could not load the tool path limit setting: {e}")
+
+    try:
+        from backend.tools.mcp_tools import install_proxy_sync
+        install_proxy_sync()
+    except Exception as e:
+        app.logger.warning(f"MCP proxy tool sync unavailable: {e}")
+
     return app
+
+
+def start_mcp_autoconnect(app):
+    """Connect MCP servers marked autoConnect, off the startup path."""
+    from backend import config as _cfg
+
+    if not (_cfg.MCP_ENABLED and _cfg.MCP_AUTOCONNECT):
+        return
+
+    def _run():
+        try:
+            from backend.services.mcp_client_service import get_mcp_service
+            result = get_mcp_service().autoconnect()
+            if result.get("results"):
+                app.logger.info(f"MCP autoconnect: {result['results']}")
+        except Exception as e:
+            app.logger.warning(f"MCP autoconnect failed: {e}")
+
+    threading.Thread(target=_run, name="mcp-autoconnect", daemon=True).start()
 
 app = create_app()
 
@@ -1367,6 +1335,55 @@ try:
                         db.session.commit()
                 except Exception as col_err:
                     app.logger.warning(f"Failed to ensure {_tbl}.{_col} column: {col_err}")
+                    try:
+                        db.session.rollback()
+                    except Exception:
+                        pass
+
+            # Feedback rows learned to name a reply and carry what they taught
+            # (2026-09-22). Additive, nullable; legacy rows keep working.
+            for _col, _ddl in (
+                ("message_id", "ALTER TABLE tool_feedback ADD COLUMN IF NOT EXISTS message_id INTEGER"),
+                ("request_id", "ALTER TABLE tool_feedback ADD COLUMN IF NOT EXISTS request_id VARCHAR(64)"),
+                ("kind", "ALTER TABLE tool_feedback ADD COLUMN IF NOT EXISTS kind VARCHAR(120) DEFAULT 'response'"),
+                ("verdict", "ALTER TABLE tool_feedback ADD COLUMN IF NOT EXISTS verdict VARCHAR(8)"),
+                ("why_text", "ALTER TABLE tool_feedback ADD COLUMN IF NOT EXISTS why_text TEXT"),
+                ("why_tags", "ALTER TABLE tool_feedback ADD COLUMN IF NOT EXISTS why_tags JSON"),
+                ("provenance", "ALTER TABLE tool_feedback ADD COLUMN IF NOT EXISTS provenance JSON"),
+                ("applied", "ALTER TABLE tool_feedback ADD COLUMN IF NOT EXISTS applied JSON"),
+                ("updated_at", "ALTER TABLE tool_feedback ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP"),
+                ("retracted_at", "ALTER TABLE tool_feedback ADD COLUMN IF NOT EXISTS retracted_at TIMESTAMP"),
+            ):
+                try:
+                    from sqlalchemy import text as _sa_text
+                    existing = db.session.execute(_sa_text(
+                        "SELECT column_name FROM information_schema.columns "
+                        "WHERE table_name = 'tool_feedback' AND column_name = :c"
+                    ), {"c": _col}).fetchone()
+                    if existing is None:
+                        app.logger.warning(f"Adding missing tool_feedback.{_col} column (legacy DB)")
+                        db.session.execute(_sa_text(_ddl))
+                        db.session.commit()
+                except Exception as col_err:
+                    app.logger.warning(f"Failed to ensure tool_feedback.{_col} column: {col_err}")
+                    try:
+                        db.session.rollback()
+                    except Exception:
+                        pass
+            for _stmt in (
+                "UPDATE tool_feedback SET verdict = CASE WHEN positive THEN 'up' ELSE 'down' END WHERE verdict IS NULL",
+                "UPDATE tool_feedback SET kind = 'response' WHERE kind IS NULL",
+                "CREATE UNIQUE INDEX IF NOT EXISTS ux_tool_feedback_message_kind "
+                "ON tool_feedback (message_id, kind) WHERE message_id IS NOT NULL",
+                "CREATE INDEX IF NOT EXISTS ix_tool_feedback_request_id ON tool_feedback (request_id)",
+                "CREATE INDEX IF NOT EXISTS ix_tool_feedback_message_id ON tool_feedback (message_id)",
+            ):
+                try:
+                    from sqlalchemy import text as _sa_text
+                    db.session.execute(_sa_text(_stmt))
+                    db.session.commit()
+                except Exception as idx_err:
+                    app.logger.warning(f"tool_feedback reconcile skipped: {idx_err}")
                     try:
                         db.session.rollback()
                     except Exception:
@@ -2615,6 +2632,10 @@ if __name__ == "__main__":
         f"Starting Flask+SocketIO server on {run_host}:{run_port} "
         f"(LLM timeout: {app.config.get('LLM_REQUEST_TIMEOUT', LLM_REQUEST_TIMEOUT)}s)"
     )
+    # With the debug reloader, only the serving child (WERKZEUG_RUN_MAIN=true)
+    # should spawn MCP server processes, not the file-watching parent.
+    if not app.debug or os.environ.get("WERKZEUG_RUN_MAIN") == "true":
+        start_mcp_autoconnect(app)
     socketio.run(app, host=run_host, port=run_port, debug=app.debug,
                  allow_unsafe_werkzeug=True)
 else:

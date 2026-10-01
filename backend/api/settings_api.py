@@ -187,7 +187,7 @@ def get_active_video_model_route():
     overrides = get_active_video_model_overrides()
     resolved = {}
     for role in ("t2v", "i2v", "scene"):
-        mid, err = resolve_active_video_model(role)
+        mid, err = resolve_active_video_model(role, comfyui_down_ok=True)
         resolved[role] = {"model": mid, "error": err}
     return success_response({
         "model": get_active_video_model(),
@@ -349,6 +349,23 @@ def set_advanced_debug():
         )
         return error_response("Failed to update setting", status_code=500)
     return success_response({"advanced_debug": enabled})
+
+
+@settings_bp.route("/confine_tool_paths", methods=["GET"])
+def get_confine_tool_paths_route():
+    from backend.utils.settings_utils import get_confine_tool_paths
+
+    return success_response({"confine_tool_paths": get_confine_tool_paths()})
+
+
+@settings_bp.route("/confine_tool_paths", methods=["POST"])
+def set_confine_tool_paths_route():
+    if not request.is_json:
+        return error_response("Request must be JSON")
+    from backend.utils.settings_utils import get_confine_tool_paths, set_confine_tool_paths
+
+    set_confine_tool_paths(bool(request.get_json().get("confine_tool_paths")))
+    return success_response({"confine_tool_paths": get_confine_tool_paths()})
 
 
 @settings_bp.route("/llm_debug", methods=["GET"])

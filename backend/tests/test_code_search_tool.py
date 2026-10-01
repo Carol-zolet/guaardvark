@@ -43,31 +43,30 @@ def test_explicit_root_wins_and_missing_root_is_refused(tool, tmp_path):
 
 
 def test_falls_back_to_regex_when_the_server_is_absent(tool, tmp_path):
-    with patch.object(cst, "_hybrid_search", lambda root, q, l: None), \
-            patch.object(cst, "_regex_search", lambda q: "backend/a.py:3: def q(): ..."):
-        res = tool.execute(query="q", root=str(tmp_path))
+    with patch.object(cst, "_default_root", lambda: str(tmp_path)), \
+            patch.object(cst, "_hybrid_search", lambda root, q, l: None), \
+            patch.object(cst, "_regex_search", lambda q, limit: ("backend/a.py:3: def q(): ...", q)):
+        res = tool.execute(query="q")
     assert res.success and res.metadata["engine"] == "regex"
 
 
 def test_hybrid_error_result_falls_back(tmp_path):
     class Svc:
-        async def call_tool(self, server, name, args):
+        def call_tool(self, server, name, args, **kwargs):
             return _mcp_err("Invalid arguments: root must be an absolute path")
 
     with patch("backend.services.mcp_client_service.get_mcp_service", lambda: Svc()), \
-            patch("backend.services.mcp_client_service.run_mcp_async", lambda coro: __import__("asyncio").run(coro)), \
             patch("backend.services.mcp_client_service.MCP_ENABLED", True):
         assert cst._hybrid_search(str(tmp_path), "q", 5) is None
 
 
 def test_hybrid_returns_the_server_text(tmp_path):
     class Svc:
-        async def call_tool(self, server, name, args):
+        def call_tool(self, server, name, args, **kwargs):
             assert args == {"root": str(tmp_path), "query": "q", "limit": 5}
             return _mcp_ok("#1 backend/x.py")
 
     with patch("backend.services.mcp_client_service.get_mcp_service", lambda: Svc()), \
-            patch("backend.services.mcp_client_service.run_mcp_async", lambda coro: __import__("asyncio").run(coro)), \
             patch("backend.services.mcp_client_service.MCP_ENABLED", True):
         assert cst._hybrid_search(str(tmp_path), "q", 5) == "#1 backend/x.py"
 
@@ -93,11 +92,10 @@ def test_proxy_reports_mcp_error_as_failure():
     proxy = cls()
 
     class Svc:
-        async def call_tool(self, server, name, args):
+        def call_tool(self, server, name, args, **kwargs):
             return _mcp_err("root: Invalid input: expected string, received undefined")
 
     with patch("backend.services.mcp_client_service.get_mcp_service", lambda: Svc()), \
-            patch("backend.services.mcp_client_service.run_mcp_async", lambda coro: __import__("asyncio").run(coro)), \
             patch("backend.services.mcp_client_service.MCP_ENABLED", True):
         res = proxy.execute(query="q")
     assert not res.success

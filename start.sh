@@ -24,6 +24,7 @@ START_TIME=$(date +%s)
 TOTAL_STEPS=11
 
 FAST_START=0
+FORCE_CLEAN=0
 TEST_MODE=0
 VOICE_CHECK=1
 VOICE_AVAILABLE=1
@@ -52,6 +53,8 @@ for arg in "$@"; do
       echo "Options:"
       echo "  --fast              Reuse the venv and node_modules as they are: no package installs,"
       echo "                     no frontend build, no preflight import check (FAST_START=1)"
+      echo "  --clean             Clear Python bytecode and rebuild the frontend even if the"
+      echo "                     code is unchanged since the last launch"
       echo "  --test              Run with comprehensive health diagnostics"
       echo "  --no-voice          Skip voice API health check"
       echo "  --parallel          Run checks in parallel"
@@ -74,6 +77,7 @@ for arg in "$@"; do
       exit 0
       ;;
     --fast) FAST_START=1 ;;
+    --clean) FORCE_CLEAN=1 ;;
     --external-ollama) EXTERNAL_OLLAMA_FLAG=1 ;;
     --test) TEST_MODE=1 ;;
     --no-voice) VOICE_CHECK=0; VOICE_FLAG_GIVEN=1 ;;
@@ -98,6 +102,18 @@ done
 if { [ -n "$CI" ] || [ -n "$CODEX_ENV" ]; } && [ "${GUAARDVARK_CI_BOOT:-0}" != 1 ]; then
   vader_info "CI or Codex environment detected. Exiting start.sh."
   exit 0
+fi
+
+# Run as root (sudo, or a root shell), the install lands under /root and leaves
+# the venv, node_modules and logs owned by root, so the next start as the normal
+# user cannot write them. The script asks for sudo itself for system packages.
+# Machines where root is the only account (some GPU cloud hosts and containers)
+# opt in with GUAARDVARK_ALLOW_ROOT=1.
+if [ "$(id -u)" = 0 ] && [ "${GUAARDVARK_ALLOW_ROOT:-0}" != 1 ]; then
+  vader_error "start.sh is running as root. Run it as your normal user: ./start.sh"
+  vader_info "It asks for your password itself when it needs to install system packages."
+  vader_info "If root is the only account on this machine: GUAARDVARK_ALLOW_ROOT=1 ./start.sh"
+  exit 1
 fi
 
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
@@ -389,6 +405,30 @@ fi
 
 # host_resolves NAME: does the system resolver answer for NAME? `getent` is glibc
 # only; macOS has none, so without the fallbacks every Mac start reported broken DNS.
+# True when package installs can reach their index. GUAARDVARK_OFFLINE=1 forces
+# "no" (Flight Mode, or a known outage). Behind a proxy, local DNS is the wrong
+# probe (see ensure_backend_python_environment), so a proxy counts as reachable.
+install_network_up() {
+    [ "${GUAARDVARK_OFFLINE:-0}" = "1" ] && return 1
+    [ -n "${https_proxy:-${HTTPS_PROXY:-${http_proxy:-${HTTP_PROXY:-}}}}" ] && return 0
+    host_resolves "$1"
+}
+
+# Fingerprint of the checkout: HEAD, uncommitted edits to tracked files, and the
+# contents of untracked source files. Extra arguments are mixed in (lockfile,
+# build-time env). Prints nothing outside a git checkout, so callers fall back to
+# always clearing/rebuilding there.
+code_fingerprint() {
+    git -C "$SCRIPT_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1 || return 0
+    {
+        git -C "$SCRIPT_DIR" rev-parse HEAD
+        git -C "$SCRIPT_DIR" diff HEAD --binary -- . ':(exclude)docs/local-workspace-only'
+        git -C "$SCRIPT_DIR" ls-files -z --others --exclude-standard -- backend plugins cli scripts frontend/src \
+            | (cd "$SCRIPT_DIR" && xargs -0 -r sha256sum)
+        printf '%s\n' "$@"
+    } 2>/dev/null | sha256sum | cut -d' ' -f1
+}
+
 host_resolves() {
     if command_exists getent; then
         timeout 5 getent hosts "$1" >/dev/null 2>&1
@@ -508,10 +548,14 @@ check_node_version() {
         return 1
     fi
     local ver
-    ver=$(node --version | sed 's/v//')
-    local major=${ver%%.*}
-    if [ "$major" -lt 20 ]; then
-        vader_error "Node.js >=20 required. Install via: sudo apt-get install -y nodejs"
+    ver=$(node --version 2>/dev/null)
+    if ! node_version_supported "$ver"; then
+        vader_error "Node.js $GUAARDVARK_NODE_FLOOR_TEXT required (found ${ver:-none}); the frontend build tool needs it."
+        if is_macos; then
+            vader_info "Upgrade with: brew upgrade node"
+        else
+            vader_info "Install Node.js 22 LTS from https://nodejs.org, then re-run."
+        fi
         return 1
     fi
 }
@@ -1207,6 +1251,9 @@ except Exception:
 # Can we SKIP the bootstrap? Functional AND provably complete. Use this only for
 # the skip decision, never to verify a bootstrap that just ran.
 backend_venv_healthy() {
+    # Set when the only fault is a requirements change since the last bootstrap:
+    # the venv works, it is just behind. Offline, that venv still starts.
+    VENV_REQS_STALE=0
     backend_venv_functional || return 1
 
     # The import probe only names packages from requirements-base.txt. If
@@ -1227,7 +1274,10 @@ backend_venv_healthy() {
     recorded="$(awk -F: '/^reqs:/ {print $2; exit}' "$BOOTSTRAP_STAMP" 2>/dev/null || true)"
     if [ -n "$recorded" ]; then
         current="$(venv_reqs_fingerprint)"
-        [ "$recorded" = "$current" ] || return 1
+        if [ "$recorded" != "$current" ]; then
+            VENV_REQS_STALE=1
+            return 1
+        fi
     fi
     return 0
 }
@@ -1380,6 +1430,14 @@ ensure_backend_python_environment() {
         needed=1
     elif ! backend_venv_healthy; then
         needed=1
+    fi
+
+    # A working venv whose requirements changed is updated when the network is
+    # there; without it, start on what is installed rather than refuse to start.
+    if [ "$needed" -eq 1 ] && [ "${VENV_REQS_STALE:-0}" -eq 1 ] && ! install_network_up pypi.org; then
+        vader_warn "Requirements changed since the last install, but the package index is unreachable."
+        vader_info "Starting on the installed packages; the next ./start.sh with a network connection updates them."
+        return 0
     fi
 
     if [ "$needed" -eq 1 ]; then
@@ -1570,22 +1628,44 @@ ensure_frontend_deps() {
         return 0
     fi
 
+    # The stamp records the Node version node_modules was installed with: npm
+    # picks optional native packages (rolldown's binding) for that version, so a
+    # different Node needs a fresh install. An empty stamp from before this was
+    # recorded is adopted as-is, unless this run replaced Node.
+    local cur_node stamp_node="" node_changed=0
+    cur_node=$(node --version 2>/dev/null)
+    [ -f "$stamp" ] && stamp_node=$(cat "$stamp" 2>/dev/null)
+    if [ "${GUAARDVARK_NODE_REPLACED:-0}" = 1 ] || { [ -n "$stamp_node" ] && [ "$stamp_node" != "$cur_node" ]; }; then
+        node_changed=1
+    fi
+
     # Run npm ci (lockfile-strict, same strategy as scripts/dep_reconciler/reconcilers/frontend.py)
-    # only when truly needed: missing node_modules, or lockfile newer than our stamp.
-    if [ ! -d "$nm" ] || [ ! -f "$stamp" ] || [ "$lock" -nt "$stamp" 2>/dev/null ]; then
+    # only when truly needed: missing node_modules, lockfile newer than our stamp, or a new Node.
+    if [ ! -d "$nm" ] || [ ! -f "$stamp" ] || [ "$lock" -nt "$stamp" 2>/dev/null ] || [ "$node_changed" -eq 1 ]; then
+        # npm ci deletes node_modules before downloading, so offline it would
+        # leave the UI with nothing. Keep the installed tree until the registry
+        # is reachable; the stamp stays old, so the next online start updates it.
+        if [ -d "$nm" ] && ! install_network_up registry.npmjs.org; then
+            vader_warn "Frontend lockfile changed, but the npm registry is unreachable — keeping the installed node_modules."
+            return 0
+        fi
         vader_info "Ensuring frontend dependencies (using npm ci for lockfile safety)..."
         if (cd "$FRONTEND_DIR" && npm ci >> "$SETUP_LOG" 2>&1); then
-            touch "$stamp" 2>/dev/null || true
+            printf '%s\n' "$cur_node" > "$stamp" 2>/dev/null || true
+            GUAARDVARK_NODE_REPLACED=0
             vader_success "Frontend node_modules ready"
         else
             vader_warn "npm ci failed — trying npm install (may touch package-lock.json)"
             if (cd "$FRONTEND_DIR" && npm install >> "$SETUP_LOG" 2>&1); then
-                touch "$stamp" 2>/dev/null || true
+                printf '%s\n' "$cur_node" > "$stamp" 2>/dev/null || true
+                GUAARDVARK_NODE_REPLACED=0
             else
                 vader_error "Frontend dependency installation failed. See $SETUP_LOG"
                 return 1
             fi
         fi
+    elif [ -z "$stamp_node" ]; then
+        printf '%s\n' "$cur_node" > "$stamp" 2>/dev/null || true
     fi
     return 0
 }
@@ -1708,7 +1788,7 @@ if [ "${GUAARDVARK_OS:-linux}" = linux ] && declare -F ensure_node_npm >/dev/nul
     rm -f "$CACHE_DIR/node_check" "$CACHE_DIR/npm_check" 2>/dev/null || true
 fi
 if ! check_with_cache "node_check" check_node_version; then
-    vader_error "Node.js 20+ required. Exiting."
+    vader_error "Node.js $GUAARDVARK_NODE_FLOOR_TEXT required. Exiting."
     exit 1
 fi
 if ! check_with_cache "npm_check" check_npm; then
@@ -1879,10 +1959,18 @@ source "$VENV_DIR/bin/activate" || { vader_error "Failed to activate venv"; exit
 # This is the key part of the strong fix: after creation (or if broken) we now ensure
 # the venv actually has the packages via ensure_backend_python_environment.
 if ! ensure_backend_python_environment; then
+  if [ "${VENV_REQS_STALE:-0}" -eq 1 ] && backend_venv_functional; then
+    # The update failed part-way (network dropped mid-download), but the
+    # previous install still imports. Start on it; the stamp is unchanged, so
+    # the next ./start.sh retries the update.
+    vader_warn "Dependency update did not finish; starting on the previously installed packages."
+    source "$VENV_DIR/bin/activate" || { vader_error "Failed to activate venv"; exit 1; }
+  else
     vader_error "Python bootstrap failed. Cannot continue."
     # ensure_... already deactivated on its error path
     cd "$SCRIPT_DIR"
     exit 1
+  fi
 fi
 
 # The ensure function manages its own activate/deactivate when it performs work.
@@ -1949,6 +2037,14 @@ if [ "$FAST_START" -ne 1 ]; then
         check_frontend_build
         BUILD_STATUS=$?
 
+        # A fresh clone has no node_modules yet: they are installed in step 8,
+        # and the frontend is built before it is served, so a build here can
+        # only fail.
+        if [ "$BUILD_STATUS" -ne 0 ] && [ ! -d "$FRONTEND_DIR/node_modules" ]; then
+            vader_info "Frontend dependencies not installed yet - the build runs after they are."
+            BUILD_STATUS=3  # no case below: nothing to do here
+        fi
+
         case $BUILD_STATUS in
             0)
                 vader_info "Frontend build is up to date"
@@ -1956,8 +2052,11 @@ if [ "$FAST_START" -ne 1 ]; then
             1)
                 if [ "$AUTO_BUILD_FRONTEND" -eq 1 ]; then
                     vader_info "Frontend changes detected - rebuilding..."
-                    (cd "$FRONTEND_DIR" && $NPM_CMD run build >> "$SETUP_LOG" 2>&1)
-                    vader_success "Frontend rebuilt successfully"
+                    if (cd "$FRONTEND_DIR" && $NPM_CMD run build >> "$SETUP_LOG" 2>&1); then
+                        vader_success "Frontend rebuilt successfully"
+                    else
+                        vader_warn "Frontend rebuild failed. See $SETUP_LOG"
+                    fi
                 else
                     vader_warn "Frontend build is stale (src newer than dist). Run: (cd frontend && npm run build)"
                 fi
@@ -1965,8 +2064,11 @@ if [ "$FAST_START" -ne 1 ]; then
             2)
                 if [ "$AUTO_BUILD_FRONTEND" -eq 1 ]; then
                     vader_info "Frontend dist missing - building..."
-                    (cd "$FRONTEND_DIR" && $NPM_CMD run build >> "$SETUP_LOG" 2>&1)
-                    vader_success "Frontend built successfully"
+                    if (cd "$FRONTEND_DIR" && $NPM_CMD run build >> "$SETUP_LOG" 2>&1); then
+                        vader_success "Frontend built successfully"
+                    else
+                        vader_warn "Frontend build failed. See $SETUP_LOG"
+                    fi
                 else
                     vader_warn "Frontend dist missing. Run: (cd frontend && npm run build)"
                 fi
@@ -2444,10 +2546,19 @@ cd "$BACKEND_DIR" || { vader_error "Failed to cd to $BACKEND_DIR"; exit 1; }
 
 # Clear stale Python bytecode cache (prevents import errors after file sync)
 # Scan entire project (not just backend/) — scripts/, plugins/, cli/ also have Python
-PYCACHE_COUNT=$(find "$GUAARDVARK_ROOT" -path "*/venv" -prune -o -path "*/node_modules" -prune -o -type d -name "__pycache__" -print 2>/dev/null | wc -l)
-if [ "$PYCACHE_COUNT" -gt 0 ]; then
-    find "$GUAARDVARK_ROOT" -path "*/venv" -prune -o -path "*/node_modules" -prune -o -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null
-    vader_info "Cleared $PYCACHE_COUNT __pycache__ directories"
+# Only when the code changed since the last launch (or --clean): an unchanged
+# checkout keeps its bytecode, which saves recompiling on every boot.
+PYCACHE_FP="$(code_fingerprint)"
+PYCACHE_STAMP="$VENV_DIR/.guaardvark_pycache_fp"
+if [ "$FORCE_CLEAN" -eq 0 ] && [ -n "$PYCACHE_FP" ] && [ "$(cat "$PYCACHE_STAMP" 2>/dev/null)" = "$PYCACHE_FP" ]; then
+    vader_info "Code unchanged since last launch — keeping the Python bytecode cache"
+else
+    PYCACHE_COUNT=$(find "$GUAARDVARK_ROOT" -path "*/venv*" -prune -o -path "*/.venv" -prune -o -path "*/node_modules" -prune -o -type d -name "__pycache__" -print 2>/dev/null | wc -l)
+    if [ "$PYCACHE_COUNT" -gt 0 ]; then
+        find "$GUAARDVARK_ROOT" -path "*/venv*" -prune -o -path "*/.venv" -prune -o -path "*/node_modules" -prune -o -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null
+        vader_info "Cleared $PYCACHE_COUNT __pycache__ directories"
+    fi
+    [ -n "$PYCACHE_FP" ] && [ -d "$VENV_DIR" ] && printf '%s\n' "$PYCACHE_FP" > "$PYCACHE_STAMP"
 fi
 
 if [ ! -f "$VENV_DIR/bin/activate" ]; then
@@ -2928,9 +3039,18 @@ else
     fi
 fi
 
-vader_info "Building frontend (production) before serving..."
-if (cd "$FRONTEND_DIR" && $NPM_CMD run build >> "$FRONTEND_LOG_FILE" 2>&1); then
+# The dev server below serves src/ directly; this build proves the code still
+# compiles and keeps a last-good dist. Skip it when neither the code, the
+# lockfile nor the build-time VITE_* env changed since the last good build.
+FRONTEND_BUILD_STAMP="$FRONTEND_DIR/dist/.build_fp"
+FRONTEND_FP="$(code_fingerprint "$(sha256sum "$FRONTEND_DIR/package-lock.json" 2>/dev/null)" "$(env | grep '^VITE_' | sort)")"
+if [ "$FORCE_CLEAN" -eq 0 ] && [ -n "$FRONTEND_FP" ] && [ -f "$FRONTEND_DIR/dist/index.html" ] \
+   && [ "$(cat "$FRONTEND_BUILD_STAMP" 2>/dev/null)" = "$FRONTEND_FP" ]; then
+    vader_info "Frontend unchanged since the last good build — skipping the build"
+elif vader_info "Building frontend (production) before serving..." \
+   && (cd "$FRONTEND_DIR" && $NPM_CMD run build >> "$FRONTEND_LOG_FILE" 2>&1); then
     vader_success "Frontend build complete"
+    [ -n "$FRONTEND_FP" ] && printf '%s\n' "$FRONTEND_FP" > "$FRONTEND_BUILD_STAMP"
 elif [ -f "$FRONTEND_DIR/dist/index.html" ]; then
     vader_error "Frontend build FAILED — serving the LAST-GOOD (stale) dist. Code is NOT current. Fix the build; see $FRONTEND_LOG_FILE"
 else
