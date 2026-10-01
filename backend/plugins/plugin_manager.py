@@ -1309,7 +1309,13 @@ class PluginManager:
                     # plugin's info), so a credential in a plugin's reply
                     # never travels on.
                     from backend.utils.secret_redaction import redact_fields
-                    data = redact_fields(response.json())
+                    # Answering 200 is the health signal. Some services reply
+                    # with a page rather than JSON (ComfyUI's "/").
+                    try:
+                        body = response.json()
+                    except ValueError:
+                        body = None
+                    data = redact_fields(body) if isinstance(body, dict) else {'status': 'healthy'}
                     data['plugin_id'] = plugin_id
                     return data
                 else:

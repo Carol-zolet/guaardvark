@@ -311,6 +311,7 @@ jobs:
           source backend/venv/bin/activate
           python -m pytest --timeout=900 -q \
             backend/tests/test_profiles.py \
+            backend/tests/test_plugin_health_non_json.py \
             backend/tests/test_demo_steps_keep_coordinates.py \
             backend/tests/test_cast_training_settings_keep_identity.py \
             backend/tests/test_celery_dispatch.py \
