@@ -40,6 +40,10 @@
   `GUAARDVARK_POSTGRES_PUBLISH_HOST`, `GUAARDVARK_REDIS_PUBLISH_HOST` and
   `GUAARDVARK_OLLAMA_PUBLISH_HOST` in `.env` publish one more widely on purpose (INSTALL.md,
   Docker, "Ports").
+- **The web terminal listens on 127.0.0.1.** `scripts/terminal_server.sh` started ttyd, a writable
+  shell, on every interface. It now listens on `127.0.0.1` (`GUAARDVARK_TERMINAL_INTERFACE` opens
+  it), refuses a websocket opened by a page from another origin (`--check-origin`), and writes its
+  per-install password file unreadable to others from the moment it is created.
 - **The Vision Pipeline, Video Editor and the Discord bot's health port listen on 127.0.0.1.** They
   listened on every interface with no login, so anyone on the network could start the camera and
   read its frames, or run editor jobs. Every caller is the backend on the same machine.

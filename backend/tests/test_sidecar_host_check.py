@@ -372,6 +372,14 @@ def test_no_plugin_server_listens_on_every_interface_by_default():
         assert '--host "$BIND_HOST"' in text
 
 
+def test_the_web_terminal_listens_on_loopback_and_checks_origin():
+    text = (ROOT / "scripts/terminal_server.sh").read_text()
+    assert 'TERMINAL_INTERFACE="${GUAARDVARK_TERMINAL_INTERFACE:-127.0.0.1}"' in text
+    assert '--interface "$TERMINAL_INTERFACE"' in text and "--interface 0.0.0.0" not in text
+    assert "--check-origin" in text
+    assert '(umask 077 && echo "${user}:${pass}" > "$AUTH_FILE")' in text
+
+
 def test_docker_publishes_its_database_queue_and_ollama_on_loopback_only():
     import yaml
 
