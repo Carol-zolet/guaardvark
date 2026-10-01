@@ -135,7 +135,7 @@ Every plugin server is called by the backend on the same machine, so each listen
 | GPU Embedding | 8204 | `PLUGIN_GPU_EMBEDDING_HOST=0.0.0.0` |
 | Discord bot health | 8200 | `DISCORD_HEALTH_HOST=0.0.0.0` |
 
-None of these servers has a login of its own; opening one to the network opens it to everyone on that network. The Swarm (8210) runs coding agents in your repositories and stays on `127.0.0.1`.
+Most of these servers have no login of their own; opening one to the network opens it to everyone on that network. Upscaling and the Vision Pipeline answer every route but `/health` only with the token in `data/.upscaling_internal_secret` or `data/.vision_pipeline_internal_secret` (sent as `Authorization: Bearer <token>`), which the backend sends for you; another machine calling them needs that token. The Swarm (8210) runs coding agents in your repositories and stays on `127.0.0.1`.
 
 The optional web terminal (`scripts/terminal_server.sh start`, ttyd on port 7682, needs `ttyd` installed) is a shell on this machine. It listens on `127.0.0.1` and asks for the user `gvk` and a password made on its first start, kept in `data/terminal/.terminal_auth` (`scripts/terminal_server.sh regenerate-credentials` makes a new one). `GUAARDVARK_TERMINAL_INTERFACE=0.0.0.0` opens it to the network; anyone who can read that password, or watch the process list on this machine, can then use your shell from there. Each answers only requests addressed to an IP address, `localhost` or one of this machine's names, as the backend does (see `host_not_allowed` under Troubleshooting); a caller that uses another name for this machine needs that name in `GUAARDVARK_CORS_ORIGINS`.
 

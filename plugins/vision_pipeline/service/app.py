@@ -60,16 +60,18 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-# Added last, so it runs first: a request addressed to a name that is not
-# this machine's (a page re-pointed at 127.0.0.1) is refused before CORS or
-# any route sees it. The camera and its frames are behind this port.
-app.add_middleware(_guard.HostCheckASGIMiddleware)
-
 # --- Bearer token security ---
-# Required on POST /frame, POST /analyze, PUT /config. The token is in
-# data/.vision_pipeline_internal_secret, which the backend reads too
-# (backend/utils/vision_context_utils.py); no reply carries it.
+# Every route but /health needs the token: the camera, its frames and the
+# scene context are behind this port, and only the backend calls it. The
+# token is in data/.vision_pipeline_internal_secret, which the backend reads
+# too (backend/utils/vision_context_utils.py); no reply carries it. POST
+# /frame, POST /analyze and PUT /config still check it themselves too.
 TOKEN_NAME = "vision_pipeline"
+app.add_middleware(_guard.BearerTokenASGIMiddleware, name=TOKEN_NAME)
+# Added last, so it runs first: a request addressed to a name that is not
+# this machine's (a page re-pointed at 127.0.0.1) is refused before the token
+# gate, CORS or any route sees it.
+app.add_middleware(_guard.HostCheckASGIMiddleware)
 
 
 def _auth_token() -> str:
@@ -186,7 +188,8 @@ class BenchmarkRequest(BaseModel):
 
 @app.get("/health")
 def health():
-    """Status only; the backend relays this reply to browsers."""
+    """Status only, and the one route open without the token (start.sh and
+    the Plugins page probe it); the backend relays this reply to browsers."""
     return {
         "status": _health_status,
         "uptime_seconds": round(time.time() - _start_time, 1),

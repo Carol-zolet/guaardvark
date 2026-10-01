@@ -22,13 +22,14 @@ no __init__. The three files import only the standard library and each other;
 backend/tests/test_sidecar_host_check.py loads them with the backend package
 blocked to keep it that way.
 
-Token files: a plugin whose routes act on files or devices, and which only the
-backend calls (upscaling, vision pipeline), checks a bearer token on those
-routes. The token lives in data/.<plugin>_internal_secret, readable by this
-user only, and both sides read it from there, so neither a reply nor the
-network carries it. The plugin creates it when missing (internal_token); the
-backend only reads it (read_internal_token): a plugin that is not running has
-nothing to call. The swarm plugin keeps its own data/.swarm_internal_secret.
+Token files: a plugin that only the backend calls and whose routes act on
+files or devices (upscaling, vision pipeline) refuses every route but /health
+without a bearer token (BearerTokenASGIMiddleware). The token lives in
+data/.<plugin>_internal_secret, readable by this user only, and both sides
+read it from there, so neither a reply nor the network carries it. The plugin
+creates it when missing (internal_token); the backend only reads it
+(read_internal_token): a plugin that is not running has nothing to call. The
+swarm plugin keeps its own data/.swarm_internal_secret and gate.
 """
 
 from __future__ import annotations
@@ -122,3 +123,51 @@ def bearer_matches(name: str, authorization: Optional[str]) -> bool:
         return False
     expected = internal_token(name)
     return bool(expected) and hmac.compare_digest(value[7:].encode(), expected.encode())
+
+
+class BearerTokenASGIMiddleware:
+    """ASGI middleware that refuses, with 401, every request and websocket
+    not carrying the plugin's token, except a GET or HEAD of ``open_paths``:
+    /health, which scripts/start.sh and the Plugins page probe without it and
+    which reports status only. Add it before the Host check, so that check
+    runs first:
+
+        app.add_middleware(guard.BearerTokenASGIMiddleware, name="upscaling")
+        app.add_middleware(guard.HostCheckASGIMiddleware)
+
+    Every other caller is the backend, which sends the token from the file.
+    """
+
+    def __init__(self, app, name: str, open_paths=("/health",)):
+        token_path(name)
+        self.app = app
+        self.name = name
+        self.open_paths = frozenset(open_paths)
+
+    async def __call__(self, scope, receive, send):
+        kind = scope.get("type")
+        if kind not in ("http", "websocket"):
+            await self.app(scope, receive, send)
+            return
+        if kind == "http" and scope.get("method") in ("GET", "HEAD") and scope.get("path") in self.open_paths:
+            await self.app(scope, receive, send)
+            return
+        headers = scope.get("headers") or ()
+        values = [v.decode("latin-1") for k, v in headers if k.lower() == b"authorization"]
+        if len(values) == 1 and bearer_matches(self.name, values[0]):
+            await self.app(scope, receive, send)
+            return
+        if kind == "websocket":
+            await send({"type": "websocket.close", "code": 1008})
+            return
+        body = b'{"detail": "Invalid or missing bearer token"}'
+        await send({
+            "type": "http.response.start",
+            "status": 401,
+            "headers": [
+                (b"content-type", b"application/json"),
+                (b"content-length", str(len(body)).encode()),
+                (b"www-authenticate", b"Bearer"),
+            ],
+        })
+        await send({"type": "http.response.body", "body": body})

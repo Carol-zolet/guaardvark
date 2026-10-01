@@ -32,6 +32,12 @@
   status only. The backend also masks any credential-named field in a plugin health reply it
   relays. Restart the upscaling and Vision Pipeline plugins after updating, or their protected
   routes refuse the backend's calls until you do.
+- **Upscaling and the Vision Pipeline answer only the backend.** Every route but `/health` now
+  needs the plugin's token, as the swarm's routes already did: before, only their write routes
+  did, and anything on the machine could list upscale jobs (with their file paths), read the
+  camera's latest frame and scene, or start and stop the camera. The backend sends the token on
+  every call (the Upscaling page, the Plugins page's camera buttons, chat's vision context, the
+  GPU notices), so nothing changes in the UI; no page loads these plugins directly.
 - **Docker publishes PostgreSQL, Redis and Ollama on 127.0.0.1 only.** `docker-compose.yml`
   published all three on every interface of the Docker host, so anyone on the network could log
   in to the database with the stock password, queue Celery tasks through Redis, or use Ollama.

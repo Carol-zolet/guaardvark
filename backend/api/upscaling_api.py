@@ -64,9 +64,10 @@ def _start_upscaling_for_job():
 
 
 def _proxy_get(path: str, timeout: int = UPSCALING_TIMEOUT):
-    """Proxy a GET request to the upscaling service."""
+    """Proxy a GET request to the upscaling service with auth (every route
+    but /health needs it)."""
     try:
-        resp = requests.get(f"{UPSCALING_URL}{path}", timeout=timeout)
+        resp = requests.get(f"{UPSCALING_URL}{path}", headers=_auth_headers(), timeout=timeout)
         return resp.json(), resp.status_code
     except requests.ConnectionError:
         return {"error": "Upscaling service not running"}, 503

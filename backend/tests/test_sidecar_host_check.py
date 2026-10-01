@@ -436,6 +436,63 @@ def test_the_plugin_creates_its_token_readable_by_this_user_only(token_dir):
         sidecar_guard.token_path("../escape")
 
 
+def test_the_token_gate_opens_only_health_without_the_token(token_dir):
+    from starlette.applications import Starlette
+    from starlette.responses import JSONResponse
+    from starlette.routing import Route
+    from starlette.testclient import TestClient
+
+    async def ok(request):
+        return JSONResponse({"ok": True})
+
+    app = Starlette(routes=[Route(p, ok, methods=["GET", "POST"]) for p in ("/health", "/jobs", "/camera/start")])
+    app.add_middleware(sidecar_guard.BearerTokenASGIMiddleware, name="upscaling")
+    client = TestClient(app, base_url="http://127.0.0.1:8202")
+    token = sidecar_guard.internal_token("upscaling")
+    good = {"Authorization": f"Bearer {token}"}
+
+    assert client.get("/health").status_code == 200
+    assert client.post("/health").status_code == 401
+    for path in ("/jobs", "/camera/start"):
+        for method in ("GET", "POST"):
+            refused = client.request(method, path)
+            assert refused.status_code == 401 and refused.headers["www-authenticate"] == "Bearer"
+            assert client.request(method, path, headers={"Authorization": "Bearer wrong"}).status_code == 401
+            assert client.request(method, path, headers=good).status_code == 200
+
+
+@pytest.mark.parametrize("path, wiring", [
+    ("plugins/upscaling/service/app.py", "app.add_middleware(guard.BearerTokenASGIMiddleware, name=TOKEN_NAME)"),
+    ("plugins/vision_pipeline/service/app.py", "app.add_middleware(_guard.BearerTokenASGIMiddleware, name=TOKEN_NAME)"),
+])
+def test_upscaling_and_vision_gate_every_route_behind_the_host_check(path, wiring):
+    source = (ROOT / path).read_text()
+    assert source.index("CORSMiddleware,") < source.index(wiring) < source.index("HostCheckASGIMiddleware)")
+
+
+def test_every_backend_call_to_vision_or_upscaling_sends_the_token():
+    # /health is the one route that does not need it (liveness probes).
+    callers = {
+        "backend/utils/vision_context_utils.py": ("{VISION_PIPELINE_URL}/context", "{VISION_PIPELINE_URL}/frame/latest",
+                                                  "{VISION_PIPELINE_URL}/analyze"),
+        "backend/api/plugins_api.py": ("{VISION_PIPELINE_URL}/camera/start", "{VISION_PIPELINE_URL}/camera/stop",
+                                       "{VISION_PIPELINE_URL}/camera/status"),
+        "backend/services/gpu_resource_coordinator.py": ("localhost:8201/gpu/contention",),
+        "backend/services/offline_image_generator.py": ("localhost:8201/gpu/contention",),
+    }
+    for path, urls in callers.items():
+        source = (ROOT / path).read_text()
+        for url in urls:
+            assert source.count(f'{url}"') == 1, (path, url)
+            call = source[source.index(f'{url}"'):][:200]
+            assert "vision_pipeline_headers()" in call or "_vision_headers()" in call, (path, url)
+    upscaling = (ROOT / "backend/api/upscaling_api.py").read_text()
+    calls = [upscaling[m.start():m.start() + 250] for m in re.finditer(r'f"\{UPSCALING_URL\}', upscaling)]
+    assert len(calls) >= 6
+    for call in calls:
+        assert "headers=_auth_headers()" in call or call.startswith('f"{UPSCALING_URL}/health"'), call
+
+
 def test_the_backend_reads_tokens_from_their_files_not_from_a_reply(token_dir, monkeypatch):
     from backend.api import upscaling_api
     from backend.utils import vision_context_utils
@@ -445,11 +502,11 @@ def test_the_backend_reads_tokens_from_their_files_not_from_a_reply(token_dir, m
 
     monkeypatch.setattr(upscaling_api.requests, "get", no_handshake)
     monkeypatch.setattr(vision_context_utils.requests, "get", no_handshake)
-    assert upscaling_api._auth_headers() == {} and vision_context_utils._auth_headers() == {}
+    assert upscaling_api._auth_headers() == {} and vision_context_utils.vision_pipeline_headers() == {}
     up = sidecar_guard.internal_token("upscaling")
     vision = sidecar_guard.internal_token("vision_pipeline")
     assert upscaling_api._auth_headers() == {"Authorization": f"Bearer {up}"}
-    assert vision_context_utils._auth_headers() == {"Authorization": f"Bearer {vision}"}
+    assert vision_context_utils.vision_pipeline_headers() == {"Authorization": f"Bearer {vision}"}
 
 
 def test_a_token_in_a_plugins_health_reply_is_not_relayed(monkeypatch):

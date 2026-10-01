@@ -20,7 +20,7 @@ from fastapi.responses import FileResponse
 from starlette.background import BackgroundTask
 from pydantic import BaseModel
 
-from service.auth import auth_token, guard, verify_token
+from service.auth import TOKEN_NAME, auth_token, guard, verify_token
 from service.config import UpscalingConfig, load_config
 from service.health import get_health_status
 from service.jobs import JobManager
@@ -158,9 +158,13 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+# Every route but /health needs the token, the reads included: job lists
+# name files on this machine, and only the backend (which sends the token)
+# calls this service. The routes that act still check it themselves too.
+app.add_middleware(guard.BearerTokenASGIMiddleware, name=TOKEN_NAME)
 # Added last, so it runs first: a request addressed to a name that is not
-# this machine's (a page re-pointed at 127.0.0.1) is refused before CORS or
-# any route sees it.
+# this machine's (a page re-pointed at 127.0.0.1) is refused before the token
+# gate, CORS or any route sees it.
 app.add_middleware(guard.HostCheckASGIMiddleware)
 
 
@@ -609,9 +613,10 @@ def _send_callback(event: str, payload: dict):
 
 # --- Endpoints ---
 
-# Status only. The bearer token the protected routes check is never in a
-# reply: the backend reads it from data/.upscaling_internal_secret
-# (service/auth.py), and the backend relays this reply to browsers.
+# Status only, and the one route open without the token (start.sh and the
+# Plugins page probe it). The token is never in a reply: the backend reads it
+# from data/.upscaling_internal_secret (service/auth.py), and the backend
+# relays this reply to browsers.
 @app.get("/health")
 def health():
     return get_health_status(

@@ -54,6 +54,16 @@ class TestHealthEndpoint:
         resp = client.post("/camera/start", json={}, headers={"Host": "evil.example:8201"})
         assert resp.status_code == 421
 
+    @pytest.mark.parametrize("method, path", [
+        ("GET", "/status"), ("GET", "/context"), ("GET", "/frame/latest"), ("GET", "/camera/status"),
+        ("POST", "/camera/start"), ("POST", "/camera/stop"), ("POST", "/stream/start"),
+        ("POST", "/gpu/contention"), ("GET", "/benchmark/results"), ("GET", "/config"),
+    ])
+    def test_every_route_but_health_needs_the_token(self, client, method, path):
+        for token in ("", "Bearer wrong"):
+            resp = client.request(method, path, json={}, headers={"Authorization": token})
+            assert resp.status_code == 401
+
 class TestStreamLifecycle:
     def test_start_stop_stream(self, client):
         resp = client.post("/stream/start", json={"source_type": "camera"})

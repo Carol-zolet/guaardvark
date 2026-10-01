@@ -41,7 +41,7 @@ def test_a_rebound_name_is_refused(client):
 
 
 def test_models_endpoint(client):
-    resp = client.get("/models")
+    resp = client.get("/models", headers=AUTH_HEADER)
     assert resp.status_code == 200
     data = resp.json()
     assert "downloaded" in data
@@ -49,16 +49,28 @@ def test_models_endpoint(client):
 
 
 def test_config_endpoint(client):
-    resp = client.get("/config")
+    resp = client.get("/config", headers=AUTH_HEADER)
     assert resp.status_code == 200
     data = resp.json()
     assert "default_model" in data
 
 
 def test_jobs_endpoint_empty(client):
-    resp = client.get("/jobs")
+    resp = client.get("/jobs", headers=AUTH_HEADER)
     assert resp.status_code == 200
     assert isinstance(resp.json(), list)
+
+
+@pytest.mark.parametrize("method, path", [
+    ("GET", "/models"), ("GET", "/config"), ("GET", "/jobs"), ("GET", "/jobs/x"),
+    ("POST", "/models/download"), ("PUT", "/config"), ("DELETE", "/jobs"),
+])
+def test_every_route_but_health_needs_the_token(client, method, path):
+    resp = client.request(method, path)
+    assert resp.status_code == 401
+    assert resp.headers["www-authenticate"] == "Bearer"
+    wrong = client.request(method, path, headers={"Authorization": "Bearer wrong"})
+    assert wrong.status_code == 401
 
 
 def test_upscale_image_requires_auth(client):
@@ -82,7 +94,7 @@ def test_upscale_video_validates_input(client):
 
 
 def test_job_not_found(client):
-    resp = client.get("/jobs/nonexistent")
+    resp = client.get("/jobs/nonexistent", headers=AUTH_HEADER)
     assert resp.status_code == 404
 
 
