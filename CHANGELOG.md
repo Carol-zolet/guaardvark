@@ -110,6 +110,52 @@
   is picked, and is never changed on its own. Cloned voices are not offered: a Cast member has no
   reference clip to clone from. `GET /api/audio-foundry/voices` now answers while Audio Foundry is
   stopped, from the catalog in the checkout, with `plugin_running: false`.
+- **Cast: unsaved edits are no longer wiped by the page's refresh.** The Cast member page reloaded
+  the member every 30 seconds, and every 5 seconds while samples generated or a LoRA trained, and
+  reset the Overview and training-settings forms each time, so a name, description, voice, bible
+  or hyperparameter left unsaved was lost. A refresh now updates only the fields the person has
+  not touched. When a field being edited was saved with another value elsewhere, the page says so
+  and offers *Reload* or *Keep mine* instead of choosing. The Overview's Save sends only the changed
+  fields, and leaving the page with unsaved edits asks first (links, the page's back arrow, closing
+  or reloading the tab; the browser's own Back button is not covered). The page now polls only while training or
+  sample generation is under way, and refreshes when its tab is shown again.
+- **Film Crew: the "Regenerate shot" dialog survives the storyboard refresh.** The refresh that
+  runs for a minute after a shot regen replaced the storyboard with a spinner every 5 seconds,
+  closing a regen dialog opened for the next shot and losing its prompt. It now refreshes in place.
+- **Cast: saving training settings or training keeps the identity sync.** Both replaced the cast
+  member's stored settings with the six hyperparameters, dropping the "grounded from photos" flag,
+  the vision tags and marks, the class token, the manual-edit flag and the post-train smoke score.
+  The Overview then warned that the bible might not match the photos, and every Train re-ran the
+  vision sync from the photos and rewrote the bible. The hyperparameters are now merged into the
+  stored settings. Train also stores the settings it was started with when no identity sync runs.
+- **Music Video: unsaved plan edits survive a change saved elsewhere.** When any cut's prompt or
+  the treatment changed on the server (another tab, an agent), the next 5-second refresh threw
+  away every unsaved prompt and treatment edit. Now only untouched fields update, and an edited
+  field changed elsewhere shows *Reload* / *Keep mine*. Save sends only the changed fields and
+  keeps the edits if it fails. Regenerate asks before discarding edits. Approving, opening
+  another video, or leaving the page with unsaved edits asks first. *Regen this storyboard* uses
+  the cut's edited prompt, as its caption said.
+- **Interconnector: typing in the client settings no longer contacts the master.** On an enabled
+  client node, every keystroke in Node Name, Master Server Address or Master API Key re-registered
+  with the master using the half-typed value, sending the API key to partial addresses such as
+  `ht` or `http://10.0.0`. Registration and the heartbeat now follow the saved configuration and
+  re-register when it is saved.
+- **Interconnector: auto-sync settings take effect on Save, and each registration is sent once.**
+  Turning on Enable Auto-Sync, or changing its interval or entities, started syncing from the
+  form, before Save or Cancel. Auto-sync now follows the saved configuration. Opening the
+  settings registered a client node with the master twice (three times when the master handed
+  back a new node id) and saving registered it twice; each now registers once.
+- **Training → Demonstrations: unsaved steps edits are kept.** Collapsing a row or pressing the
+  list's refresh button discarded the steps being edited, and after *Save Steps* re-opening the
+  row showed the steps from before the save. Edits now stay until saved, a refresh updates only
+  rows without edits, steps changed elsewhere under an edit are reported and the edit is kept,
+  and a save updates the list.
+- **Training → Demonstrations: Save Steps keeps click positions.** The steps editor shows a
+  click's position as `"coordinates": [x, y]`, but saving read only `coordinates_x` /
+  `coordinates_y`, so every save erased the recorded positions (replay finds its targets by
+  vision and was not affected; the stored record of where each click landed was). `PUT
+  /api/agent-control/learn/demonstrations/<id>/steps` now takes either shape, and refuses
+  coordinates that are not `[x, y]` or null without changing anything.
 - **Audio Studio: withdraw consent for a voice clip, or delete it.** "Manage imported clips" under
   the reference clip lists each clip and whether consent is recorded. *Withdraw consent* removes
   the record and keeps the clip, which is not cloned again until consent is confirmed; *Delete

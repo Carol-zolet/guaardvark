@@ -63,11 +63,16 @@ const FilmCrewPage = () => {
     }
   }, []);
 
-  const fetchDetail = useCallback(async (id) => {
+  // `quiet` refreshes the production already on screen without the loading
+  // spinner. The spinner replaces the whole detail view, which unmounts the
+  // storyboard grid and with it an open "Regenerate shot" dialog and the
+  // prompt being typed there. The 5 s poll and the refresh after a shot regen
+  // (both run while the person may be typing the next override) stay quiet.
+  const fetchDetail = useCallback(async (id, { quiet = false } = {}) => {
     if (!id) return;
     detailRequestId.current += 1;
     const myRequestId = detailRequestId.current;
-    setLoadingDetail(true);
+    if (!quiet) setLoadingDetail(true);
     try {
       const data = await getProduction(id);
       // Drop the response if a newer fetch was kicked off while we were
@@ -102,7 +107,7 @@ const FilmCrewPage = () => {
     if (active) {
       interval = setInterval(async () => {
         await fetchProductions();
-        await fetchDetail(selectedProdId);
+        await fetchDetail(selectedProdId, { quiet: true });
         if (productionDetail.current_stage === 'awaiting_approval' && regenPolling) {
           regenPollCount.current += 1;
           if (regenPollCount.current >= 12) {
@@ -156,7 +161,7 @@ const FilmCrewPage = () => {
     setError(null);
     const result = await regenerateShot(selectedProdId, shotId, data);
     noteDispatch(selectedProdId, result);
-    await fetchDetail(selectedProdId);
+    await fetchDetail(selectedProdId, { quiet: true });
     if (result?.regen_job_id) {
       regenPollCount.current = 0;
       setRegenPolling(true);

@@ -260,8 +260,12 @@ def update_subject(subject_id):
             cfg["bible_manual_override"] = True
             s.training_settings_json = cfg
     if "training_settings" in body:
-        from backend.services.lora_training_settings import normalize_training_settings
-        s.training_settings_json = normalize_training_settings(body["training_settings"])
+        # Merge, not replace: the same JSON holds the identity flags and the
+        # smoke score (see merge_training_settings).
+        from backend.services.lora_training_settings import merge_training_settings
+        s.training_settings_json = merge_training_settings(
+            s.training_settings_json, body["training_settings"],
+        )
     db.session.commit()
     return jsonify(_serialize(s))
 
@@ -756,8 +760,12 @@ def dispatch_train(subject_id: int):
 
     body = request.get_json(silent=True) or {}
     if body.get("training_settings"):
-        from backend.services.lora_training_settings import normalize_training_settings
-        s.training_settings_json = normalize_training_settings(body["training_settings"])
+        # Merge, not replace: the same JSON holds bible_vision_grounded (without
+        # it every run re-syncs identity from the photos) and the smoke score.
+        from backend.services.lora_training_settings import merge_training_settings
+        s.training_settings_json = merge_training_settings(
+            s.training_settings_json, body["training_settings"],
+        )
 
     # Gate on media model registry: Z-Image/FLUX train backends land next;
     # only train_ready profiles (currently sdxl-legacy PEFT) may dispatch.
@@ -782,6 +790,10 @@ def dispatch_train(subject_id: int):
     merged = dict(s.training_settings_json or {})
     merged.update(train_cfg)
     s.training_settings_json = merged
+    # Into the transaction now: the refresh after the identity check below
+    # reloads the row, and would otherwise discard these settings whenever no
+    # sync ran (and so nothing committed them).
+    db.session.flush()
 
     # Vision-ground identity before captions/train when refs exist and ungrounded.
     refs = list(s.ref_image_paths or [])
