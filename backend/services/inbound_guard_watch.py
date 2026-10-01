@@ -269,7 +269,11 @@ def _sweep(paths: Optional[Iterable[str]]) -> Dict:
         hold_rank = guard.engine().SEVERITY_RANK[rules.policy.get("hold_at", "medium")]
         raise_now = attribution in ("out-of-band", "new-file") and any(
             guard.engine().SEVERITY_RANK[f.severity] >= hold_rank for f in fresh)
+        was_held = row.status == "held" and row.scan_id
         row.sha256, row.size, row.mtime, row.attribution = sha, st.st_size, st.st_mtime, attribution
+        if was_held and not raise_now:
+            guard.mark(row.scan_id, "clear", by="source watch",
+                       note="the file changed again and no longer holds what was flagged")
         if raise_now:
             verdict = guard.engine().scan([change], source="watch", subject=f"{attribution} change: {rel}",
                                           mode=guard.get_mode())
@@ -283,9 +287,11 @@ def _sweep(paths: Optional[Iterable[str]]) -> Dict:
             row.status = "clean"
             row.accepted = json.dumps(sorted(accepted | set(prints)))
 
-    if paths is None:
+    if full:
         for rel, row in list(rows.items()):
             if rel not in files and not (guard.REPO_ROOT / rel).exists():
+                if row.status == "held" and row.scan_id:
+                    guard.mark(row.scan_id, "clear", by="source watch", note="the file was removed")
                 db.session.delete(row)
                 summary["deleted"] += 1
     db.session.commit()

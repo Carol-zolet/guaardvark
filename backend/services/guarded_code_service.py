@@ -159,6 +159,11 @@ def protected_file_reason(relative_path: str) -> str | None:
     normalized = relative_path.replace("\\", "/").strip("/")
     if not normalized:
         return None
+    from backend.services.inbound_guard_service import guard_file_reason
+
+    guard_reason = guard_file_reason(normalized)
+    if guard_reason:
+        return guard_reason
     basename = normalized.rsplit("/", 1)[-1]
     for protected in PROTECTED_FILES:
         protected_norm = protected.replace("\\", "/").strip("/")
