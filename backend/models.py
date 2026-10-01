@@ -3277,6 +3277,57 @@ class Subject(db.Model):
         }
 
 
+class SubjectLora(db.Model):
+    """One LoRA a Cast member holds for one base model (trained here or imported).
+
+    A member can hold a LoRA per base (Z-Image Turbo, FLUX.1 Dev, ...). The
+    current LoRA for a base is its highest ``version``; lower versions are kept
+    as history. ``Subject.lora_path`` stays the member's default LoRA and is the
+    only thing read by code that predates this table. Which row a render uses is
+    decided in ``backend.services.cast_lora_selection``; write rows through its
+    ``record_subject_lora`` so versions and the default stay consistent.
+    """
+    __tablename__ = "subject_loras"
+
+    id = db.Column(db.Integer, primary_key=True)
+    subject_id = db.Column(
+        db.Integer,
+        db.ForeignKey("subjects.id", name="fk_subject_lora_subject_id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    base_model_id = db.Column(db.String(64), nullable=False)
+    lora_path = db.Column(db.String(512), nullable=False)
+    # Per (subject, base) counter, independent of the file name's _v<n>.
+    version = db.Column(db.Integer, nullable=False, default=1)
+    # Token this LoRA was trained on; NULL means the member's own trigger_word.
+    trigger_word = db.Column(db.String(64), nullable=True)
+    source = db.Column(db.String(16), nullable=False, default="trained")  # trained | imported
+    created_at = db.Column(db.DateTime, nullable=False, default=utcnow)
+
+    subject = db.relationship(
+        "Subject", backref=db.backref("lora_versions", cascade="all, delete-orphan")
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "subject_id", "base_model_id", "version", name="uq_subject_lora_base_version"
+        ),
+    )
+
+    def to_dict(self) -> dict:
+        return {
+            "id": self.id,
+            "subject_id": self.subject_id,
+            "base_model_id": self.base_model_id,
+            "lora_path": self.lora_path,
+            "version": self.version,
+            "trigger_word": self.trigger_word,
+            "source": self.source,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+        }
+
+
 class SubjectSample(db.Model):
     """One reference-sheet image for a Subject — output of the Character Generator.
 

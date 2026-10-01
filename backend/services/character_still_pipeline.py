@@ -138,11 +138,17 @@ def render_character_still(
     enhance: str = "none",
     keep_pipeline: bool = True,
     hold_gpu: bool = False,
+    image_model: str | None = None,
 ) -> StillResult:
     """Render one identity-locked still. Never raises — returns StillResult.
 
     ``apply_subject_loras=False`` still routes by subject/LoRA family but loads
     no adapters (Cast base sheet / explorative regen).
+
+    ``image_model`` is the model the person picked (None or "auto" for none).
+    Members holding LoRAs for several bases render with the one for that model,
+    and the render is refused when a member has none; see
+    ``cast_lora_selection``.
     """
     from backend.services.cast_lock import apply_lock, resolve_lora_strength
     from backend.services.image_prompt_sanitize import sanitize_image_prompt
@@ -157,6 +163,29 @@ def render_character_still(
     subjs = list(subjects or [])
     if subject_ids and not subjs:
         subjs = _subjects_from_ids(subject_ids)
+
+    if subjs:
+        from backend.services.cast_lora_selection import CastLoraRefusal, select_cast_loras
+        try:
+            selection = select_cast_loras(subjs, image_model, pin_paths=list(lora_paths or []))
+        except CastLoraRefusal as e:
+            return StillResult(
+                success=False,
+                error=str(e),
+                prompt_used=base,
+                metadata={"source": source, "subject_ids": list(subject_ids or [])},
+            )
+        except Exception as e:
+            log.warning("Cast LoRA selection failed (%s); using default LoRAs", e)
+            selection = None
+        if selection is not None and not selection.legacy:
+            subjs = selection.subjects
+            # Paths passed for these same members are a fallback for a failed
+            # member lookup; the selection has already chosen theirs.
+            lora_paths = [
+                p for p in (lora_paths or [])
+                if (p or "").strip() not in selection.member_paths
+            ]
 
     paths: list[str] = []
     lock = ""
