@@ -147,3 +147,34 @@ def redact_secrets(text: str) -> str:
     for pattern in SECRET_PATTERNS:
         out = pattern.regex.sub(pattern.replacement, out)
     return out
+
+
+_SECRET_KEY = re.compile(r"[A-Za-z0-9_.\-]*" + _SECRET_KEY_END, re.IGNORECASE)
+
+
+def _holds_a_value(value) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, str):
+        bare = value.strip().lower()
+        return bare not in _EMPTY_VALUES and not set(bare) <= {"*"} and not set(bare) <= {"•"}
+    return True
+
+
+def redact_fields(value):
+    """A copy of a JSON-shaped value (a plugin's health or status reply, say)
+    for a reply that leaves this process: the value under every key named
+    like a credential (auth_token, api_key, password, ...) becomes REDACTED,
+    and every other string goes through ``redact_secrets``, which catches a
+    DSN's password or a bearer header inside a message."""
+    if isinstance(value, dict):
+        return {
+            key: REDACTED if isinstance(key, str) and _SECRET_KEY.fullmatch(key) and _holds_a_value(item)
+            else redact_fields(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [redact_fields(item) for item in value]
+    if isinstance(value, str):
+        return redact_secrets(value)
+    return value

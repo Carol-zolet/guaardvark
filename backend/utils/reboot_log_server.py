@@ -16,6 +16,9 @@ A reply names the requesting page in Access-Control-Allow-Origin only when
 the page is one of this install's frontend origins, which reboot_api.py passes
 as --allow-origin, so no other page can read the log. POST /shutdown is
 refused to a page on any other origin; the backend's own call sends no Origin.
+A page whose DNS name was re-pointed at 127.0.0.1 counts as same-origin and
+needs no CORS, so a request addressed to a name that is not this machine's
+is refused first, by the backend's Host rule (backend/utils/host_check.py).
 """
 
 import argparse
@@ -27,6 +30,15 @@ import time
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 
+if __package__:
+    from . import host_check
+else:
+    # Run as a script by reboot_api.py: backend/utils is sys.path[0], and the
+    # backend package (stopping as this starts) is not imported.
+    import sidecar_guard
+
+    host_check = sidecar_guard.host_check
+
 ANSI_RE = re.compile(r'\x1b\[[0-9;]*[a-zA-Z]|\x1b\].*?\x07')
 
 
@@ -36,12 +48,30 @@ class RebootLogHandler(BaseHTTPRequestHandler):
     max_lifetime = 300
     allowed_origins: frozenset = frozenset()
 
+    def _host_refused(self) -> bool:
+        """Answer 421 and return True when the request is addressed to a
+        name that is not this machine's."""
+        host_header = host_check.single_host(self.headers.get_all("Host") or [])
+        if host_check.host_allowed(host_header):
+            return False
+        body = host_check.refusal_body(host_header)
+        self.send_response(421)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+        return True
+
     def do_OPTIONS(self):
+        if self._host_refused():
+            return
         self.send_response(204)
         self._cors()
         self.end_headers()
 
     def do_GET(self):
+        if self._host_refused():
+            return
         path = urlparse(self.path).path
         if path == "/log":
             self._handle_log()
@@ -52,6 +82,8 @@ class RebootLogHandler(BaseHTTPRequestHandler):
             self.send_error(404)
 
     def do_POST(self):
+        if self._host_refused():
+            return
         if urlparse(self.path).path != "/shutdown":
             self.send_error(404)
             return

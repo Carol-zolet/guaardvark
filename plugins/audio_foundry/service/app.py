@@ -6,8 +6,11 @@ return 501 because no backends are registered yet. /health and /status work.
 """
 from __future__ import annotations
 
+import importlib.util
 import logging
+import sys
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Any, Optional
 
 from fastapi import FastAPI, HTTPException
@@ -85,14 +88,34 @@ class MusicRequest(BaseModel):
 
 # ---------- app setup --------------------------------------------------------
 
+_GUARD_MODULE = "guaardvark_sidecar_guard"
+
+
+def _load_guard():
+    """backend/utils/sidecar_guard.py, loaded by path: this service runs in
+    its own venv, outside the backend package."""
+    loaded = sys.modules.get(_GUARD_MODULE)
+    if loaded is not None:
+        return loaded
+    path = Path(__file__).resolve().parents[3] / "backend" / "utils" / "sidecar_guard.py"
+    spec = importlib.util.spec_from_file_location(_GUARD_MODULE, path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    sys.modules[_GUARD_MODULE] = module
+    return module
+
+
 # No CORS middleware: browsers never call this service. The Studio goes
 # through the backend's /api/audio-foundry proxy, and every other caller is a
-# process on this machine (scripts/start.sh binds 127.0.0.1).
+# process on this machine (scripts/start.sh binds 127.0.0.1). A page whose
+# name was re-pointed at 127.0.0.1 is still a browser on this machine, so the
+# Host check refuses any request addressed to a name that is not this one's.
 app = FastAPI(
     title="Audio Foundry",
     version="0.1.0",
     description="Audio generation plugin for Guaardvark (voiceover, SFX, music).",
 )
+app.add_middleware(_load_guard().HostCheckASGIMiddleware)
 
 _config = load_config()
 

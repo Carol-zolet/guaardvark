@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import pytest
 
-from backend.utils.secret_redaction import SECRET_PATTERNS, redact_secrets
+from backend.utils.secret_redaction import SECRET_PATTERNS, redact_fields, redact_secrets
 
 # Secrets are assembled from pieces so no scanner mistakes this file for a leak.
 _HF = "hf_" + "AbCdEfGhIjKlMnOpQrStUvWx12"
@@ -113,3 +113,30 @@ def test_every_pattern_has_a_row_in_the_table():
 def test_redaction_is_stable_when_applied_twice():
     for _, text, _, expected in MASKED:
         assert redact_secrets(expected) == expected
+
+
+def test_a_plugin_reply_keeps_its_status_and_loses_its_credentials():
+    token = "Zm9vYmFyYmF6cXV4" * 2
+    reply = {
+        "status": "healthy",
+        "auth_token": token,
+        "token": token,
+        "gpu": {"name": "GPU", "vram_total_mb": 16000, "api_key": token},
+        "backends": [{"name": "kokoro", "password": token, "loaded": True}],
+        "max_tokens": 4096,
+        "total_tokens": 12,
+        "token_count": 3,
+        "secret_count": 0,
+        "database": "postgresql://guaardvark:" + token + "@localhost/guaardvark",
+        "empty_token": "",
+        "unset_api_key": None,
+    }
+    out = redact_fields(reply)
+
+    assert token not in repr(out)
+    assert out["status"] == "healthy" and out["gpu"]["vram_total_mb"] == 16000
+    assert out["auth_token"] == out["token"] == out["gpu"]["api_key"] == out["backends"][0]["password"] == "***"
+    assert (out["max_tokens"], out["total_tokens"], out["token_count"], out["secret_count"]) == (4096, 12, 3, 0)
+    assert out["database"] == "postgresql://guaardvark:***@localhost/guaardvark"
+    assert out["empty_token"] == "" and out["unset_api_key"] is None
+    assert reply["auth_token"] == token

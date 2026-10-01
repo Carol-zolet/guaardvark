@@ -84,7 +84,7 @@ def test_voices_route_marks_installed_packs_and_sends_no_cors(monkeypatch):
 
     monkeypatch.setattr("backends.hub_weights.cached_hub_file",
                         lambda repo, f: "/cache/x" if f == "voices/af_heart.pt" else None)
-    r = TestClient(app).get("/voices", headers={"Origin": "http://elsewhere.example"})
+    r = TestClient(app, base_url="http://127.0.0.1:8206").get("/voices", headers={"Origin": "http://elsewhere.example"})
     assert r.status_code == 200
     assert "access-control-allow-origin" not in r.headers
     voices = {v["id"]: v["installed"] for g in r.json()["kokoro"]["groups"] for v in g["voices"]}

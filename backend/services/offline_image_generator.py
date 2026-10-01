@@ -2261,8 +2261,10 @@ Negative Prompt: {negative_prompt}""",
         """Best-effort notification to vision pipeline. Fire and forget."""
         try:
             import requests as req
+            from backend.utils.vision_context_utils import vision_pipeline_headers
             req.post("http://localhost:8201/gpu/contention",
-                     json={"source": "image_gen", "action": action}, timeout=1)
+                     json={"source": "image_gen", "action": action},
+                     headers=vision_pipeline_headers(), timeout=1)
         except Exception:
             pass
 
