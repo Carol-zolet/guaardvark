@@ -130,6 +130,26 @@ def test_a_worker_keeps_celerys_result_retries():
     assert app.conf.task_publish_retry_policy == PUBLISH_RETRY_POLICY
 
 
+def test_a_failing_task_marks_its_progress_entry(monkeypatch):
+    """backend/celery_app.py's task_failure receiver is still connected after
+    create_celery_app returns (Celery holds receivers weakly by default)."""
+    import gc
+
+    from celery.signals import task_failure
+
+    import backend.celery_app  # noqa: F401 - connects the receiver
+    from backend.utils import unified_progress_system as ups
+
+    gc.collect()
+    monkeypatch.setattr(ups.UnifiedProgressSystem, "_emit_event", lambda *a, **k: None)
+    progress = ups.get_unified_progress()
+    pid = progress.create_process(ups.ProcessType.FILE_GENERATION, "failing task")
+    task_failure.send(sender=None, task_id="celery-id-x", exception=ValueError("boom"),
+                      kwargs={"job_id": pid})
+    event = progress.get_process(pid)
+    assert event.status.value == "error" and "boom" in event.message
+
+
 def test_the_result_channel_failure_is_reported_as_not_started():
     import redis
 

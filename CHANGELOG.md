@@ -25,6 +25,9 @@
   backend tracks the job, from its progress record otherwise) and 404 for an id nothing knows.
   `GET /api/jobs/unified:<id>`, which `llx job status` uses, also never found a live progress job;
   it does now.
+- **A failed background task now shows its reason instead of sitting at 0 %.** An earlier release
+  said so, but the worker's handler for it was connected in a way Python discarded at once, so it
+  never ran. It is kept now, as is the worker's runtime-audit flush on shutdown.
 - **The backend answers only to this install's names.** A site can point its DNS name at the
   Guaardvark machine's address after its page has loaded (DNS rebinding). The browser then treats
   the backend as that site's own, so the page could read every reply and, from the Guaardvark

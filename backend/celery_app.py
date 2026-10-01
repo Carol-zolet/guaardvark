@@ -300,10 +300,13 @@ def create_celery_app():
 
     # A task that raises must not leave its progress entry parked at 0 %: mark it
     # errored with the exception text so the UI shows a failure, not a stall.
+    # Receivers here are local to create_celery_app, and Celery holds receivers
+    # weakly by default, so each is connected with weak=False or it is
+    # collected as soon as this function returns and never runs.
     try:
         from celery.signals import task_failure
 
-        @task_failure.connect
+        @task_failure.connect(weak=False)
         def _surface_task_failure(sender=None, task_id=None, exception=None, kwargs=None, **_ignored):
             try:
                 from backend.utils.progress_failure import mark_progress_failed
@@ -319,8 +322,6 @@ def create_celery_app():
     try:
         from celery.signals import celeryd_init
 
-        # weak=False: Celery holds receivers weakly by default, and this one is
-        # local to create_celery_app.
         @celeryd_init.connect(weak=False)
         def _worker_result_retries(sender=None, conf=None, **_ignored):
             restore_worker_result_retries(conf if conf is not None else celery_app.conf)
@@ -334,7 +335,7 @@ def create_celery_app():
     try:
         from celery.signals import worker_process_shutdown
 
-        @worker_process_shutdown.connect
+        @worker_process_shutdown.connect(weak=False)
         def _flush_runtime_hits_on_shutdown(**_kwargs):
             try:
                 with minimal_app.app_context():
