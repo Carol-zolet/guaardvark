@@ -52,6 +52,13 @@
   The Overview then warned that the bible might not match the photos, and every Train re-ran the
   vision sync from the photos and rewrote the bible. The hyperparameters are now merged into the
   stored settings. Train also stores the settings it was started with when no identity sync runs.
+- **Music Video: unsaved plan edits survive a change saved elsewhere.** When any cut's prompt or
+  the treatment changed on the server (another tab, an agent), the next 5-second refresh threw
+  away every unsaved prompt and treatment edit. Now only untouched fields update, and an edited
+  field changed elsewhere shows *Reload* / *Keep mine*. Save sends only the changed fields and
+  keeps the edits if it fails. Regenerate asks before discarding edits. Approving, opening
+  another video, or leaving the page with unsaved edits asks first. *Regen this storyboard* uses
+  the cut's edited prompt, as its caption said.
 - **Audio Studio: withdraw consent for a voice clip, or delete it.** "Manage imported clips" under
   the reference clip lists each clip and whether consent is recorded. *Withdraw consent* removes
   the record and keeps the clip, which is not cloned again until consent is confirmed; *Delete

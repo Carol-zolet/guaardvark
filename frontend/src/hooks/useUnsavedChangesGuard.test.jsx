@@ -126,6 +126,49 @@ describe("useUnsavedChangesGuard", () => {
     expect(unload()).toBe(false);
   });
 
+  it("keeps asking while any of several guards holds, released in either order", () => {
+    let setA;
+    let setB;
+    const Guard = ({ when }) => {
+      useUnsavedChangesGuard(when);
+      return null;
+    };
+    const Rows = () => {
+      const [a, setAState] = useState(true);
+      const [b, setBState] = useState(true);
+      setA = setAState;
+      setB = setBState;
+      navigate = useNavigate();
+      return (
+        <>
+          <Guard when={a} />
+          <Guard when={b} />
+        </>
+      );
+    };
+    confirmSpy.mockReturnValue(false);
+    render(
+      <MemoryRouter initialEntries={["/rows"]}>
+        <Where />
+        <Routes>
+          <Route path="/rows" element={<Rows />} />
+          <Route path="*" element={<Other />} />
+        </Routes>
+      </MemoryRouter>,
+    );
+    act(() => setA(false));
+    act(() => navigate("/away"));
+    expect(confirmSpy).toHaveBeenCalledTimes(1);
+    act(() => setA(true));
+    act(() => setB(false));
+    act(() => navigate("/away"));
+    expect(confirmSpy).toHaveBeenCalledTimes(2);
+    act(() => setA(false));
+    act(() => navigate("/away"));
+    expect(confirmSpy).toHaveBeenCalledTimes(2);
+    expect(screen.getByTestId("where").textContent).toBe("/away");
+  });
+
   it("stops asking once the page is gone", () => {
     confirmSpy.mockReturnValue(true);
     renderAt("/cast/7");

@@ -30,6 +30,44 @@ export const leavesPath = (to, currentPathname) => {
   return trimSlash(next) !== trimSlash(currentPathname || '/');
 };
 
+// Several guards can be active at once (one per row of a list, say), and they
+// mount and unmount in any order. The navigator is therefore wrapped once,
+// while at least one guard holds it, and asks a single question for all.
+const holds = new WeakMap(); // navigator -> { messages: Set<ref>, original }
+
+const holdNavigator = (navigator, messageRef) => {
+  let hold = holds.get(navigator);
+  if (!hold) {
+    const original = { push: navigator.push, replace: navigator.replace, go: navigator.go };
+    const messages = new Set();
+    const ask = () => window.confirm(messages.values().next().value.current);
+    // The history's own location is in the same terms as the `to` it is
+    // handed (basename included), unlike useLocation().
+    const currentPathname = () => navigator.location?.pathname ?? window.location.pathname;
+    const mayLeave = (to) => !leavesPath(to, currentPathname()) || ask();
+
+    navigator.push = (to, ...rest) => {
+      if (mayLeave(to)) original.push.call(navigator, to, ...rest);
+    };
+    navigator.replace = (to, ...rest) => {
+      if (mayLeave(to)) original.replace.call(navigator, to, ...rest);
+    };
+    navigator.go = (delta) => {
+      if (!delta || ask()) original.go.call(navigator, delta);
+    };
+    hold = { messages, original };
+    holds.set(navigator, hold);
+  }
+  hold.messages.add(messageRef);
+  return () => {
+    hold.messages.delete(messageRef);
+    if (hold.messages.size === 0) {
+      Object.assign(navigator, hold.original);
+      holds.delete(navigator);
+    }
+  };
+};
+
 const useUnsavedChangesGuard = (when, message = DEFAULT_UNSAVED_MESSAGE) => {
   const { navigator } = useContext(UNSAFE_NavigationContext);
   const messageRef = useRef(message);
@@ -48,27 +86,7 @@ const useUnsavedChangesGuard = (when, message = DEFAULT_UNSAVED_MESSAGE) => {
 
   useEffect(() => {
     if (!when || !navigator) return undefined;
-    const { push, replace, go } = navigator;
-    // The history's own location is in the same terms as the `to` it is
-    // handed (basename included), unlike useLocation().
-    const currentPathname = () => navigator.location?.pathname ?? window.location.pathname;
-    const mayLeave = (to) =>
-      !leavesPath(to, currentPathname()) || window.confirm(messageRef.current);
-
-    navigator.push = (to, ...rest) => {
-      if (mayLeave(to)) push.call(navigator, to, ...rest);
-    };
-    navigator.replace = (to, ...rest) => {
-      if (mayLeave(to)) replace.call(navigator, to, ...rest);
-    };
-    navigator.go = (delta) => {
-      if (!delta || window.confirm(messageRef.current)) go.call(navigator, delta);
-    };
-    return () => {
-      navigator.push = push;
-      navigator.replace = replace;
-      navigator.go = go;
-    };
+    return holdNavigator(navigator, messageRef);
   }, [when, navigator]);
 };
 

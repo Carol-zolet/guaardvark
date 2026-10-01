@@ -23,6 +23,7 @@ import {
 import { SubjectThumb } from '../components/filmcrew/CastLibraryView';
 import DragDropImageUpload from '../components/filmcrew/DragDropImageUpload';
 import CastVoicePicker from '../components/filmcrew/CastVoicePicker';
+import ChangedElsewhereNotice from '../components/common/ChangedElsewhereNotice';
 import useServerSyncedForm from '../hooks/useServerSyncedForm';
 import useUnsavedChangesGuard from '../hooks/useUnsavedChangesGuard';
 
@@ -96,31 +97,6 @@ const StatusChip = ({ status }) => {
     : status === 'cancelled' ? 'default'
     : status === 'generating' ? 'warning' : 'default';
   return <Chip size="small" label={status} color={color} />;
-};
-
-/**
- * Shown when fields the person is editing were saved with other values from
- * somewhere else (another tab, the Casting Director, a sync). The page never
- * picks a side on its own.
- */
-const ChangedElsewhereNotice = ({ conflicts, labels, onReload, onKeep }) => {
-  const keys = Object.keys(conflicts || {});
-  if (!keys.length) return null;
-  const names = keys.map((k) => labels[k] || k).join(', ');
-  return (
-    <Alert
-      severity="warning"
-      action={(
-        <Box sx={{ display: 'flex', gap: 0.5 }}>
-          <Button color="inherit" size="small" onClick={onReload}>Reload</Button>
-          <Button color="inherit" size="small" onClick={onKeep}>Keep mine</Button>
-        </Box>
-      )}
-    >
-      {names} changed elsewhere while you were editing. Reload to take the saved
-      version, or keep your edit and save it over that change.
-    </Alert>
-  );
 };
 
 /** Training-lifecycle chip for a generated sample (approved / training / trained). */
