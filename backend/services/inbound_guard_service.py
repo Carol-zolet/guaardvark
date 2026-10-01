@@ -148,6 +148,29 @@ def engine():
     return guard
 
 
+_rules_cache: Dict[str, Any] = {}
+
+
+def rules():
+    """The rule data, reloaded when the file changes."""
+    guard_engine = engine()
+    path = guard_engine.rules.RULES_FILE
+    stamp = path.stat().st_mtime
+    if _rules_cache.get("stamp") != stamp:
+        _rules_cache.update(stamp=stamp, rules=guard_engine.RuleSet.load())
+    return _rules_cache["rules"]
+
+
+def guard_file_reason(relative_path: str) -> Optional[str]:
+    """While the guard is on, its own files and the portability guard's are off limits to autonomous edits."""
+    if not is_on():
+        return None
+    if rules().matches(relative_path, ["@outbound_guard", "@inbound_guard"]):
+        return (f"'{relative_path}' is part of a guard. While the inbound guard is on, it can only be "
+                "changed through git, where the change is judged before it lands.")
+    return None
+
+
 def relative(path: str | Path) -> str:
     p = Path(path)
     try:
