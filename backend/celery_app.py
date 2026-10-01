@@ -579,6 +579,8 @@ def create_celery_app():
         from backend import extensions as _ext
         for _ext_id, _mods in _ext.register_tasks(_ext.discover(), celery_app).items():
             logger.info("extension %s: %d task module(s) registered", _ext_id, len(_mods))
+        # Workers write code too (generated-code tasks, self-improvement).
+        _ext.register_inbound_guard(_ext.discover())
     except Exception as e:  # noqa: BLE001
         logger.error("Extension task registration failed: %s", e, exc_info=True)
 

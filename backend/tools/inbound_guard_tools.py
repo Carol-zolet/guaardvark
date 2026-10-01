@@ -63,7 +63,8 @@ class CheckInboundChangeTool(BaseTool):
             if rng:
                 if not _RANGE.match(rng):
                     return ToolResult(success=False, error="range must be a revision or A..B / A...B")
-                verdict = engine.scan_diff(guard.REPO_ROOT, [rng], source="check", subject=rng, mode="observe")
+                verdict = engine.scan_diff(guard.REPO_ROOT, [rng], source="check", subject=rng, mode="observe",
+                                           scanners=guard.scanners())
             elif filepath and new_text is not None:
                 path, rel = resolve_repo_path(filepath)
                 current = path.read_text(encoding="utf-8", errors="replace") if path.is_file() else None
@@ -74,7 +75,8 @@ class CheckInboundChangeTool(BaseTool):
                     change = guard.change_for_replacement(path, current, old_text, new_text)
                 else:
                     change = guard.change_for_file(path, current, new_text)
-                verdict = engine.scan([change], source="check", subject=rel, mode="observe", repo=guard.REPO_ROOT)
+                verdict = engine.scan([change], source="check", subject=rel, mode="observe", repo=guard.REPO_ROOT,
+                                      scanners=guard.scanners())
             else:
                 return ToolResult(success=False, error="Give range, or filepath with new_text.")
         except GuardedCodeError as exc:
