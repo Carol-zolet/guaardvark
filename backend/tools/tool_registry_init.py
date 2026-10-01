@@ -119,6 +119,13 @@ def register_code_tools() -> List[str]:
         _tool_categories["search_codebase"] = category
         logger.debug("Registered: SearchCodebaseTool")
 
+        from backend.tools.inbound_guard_tools import CheckInboundChangeTool
+
+        register_tool(CheckInboundChangeTool())
+        registered.append("check_inbound_change")
+        _tool_categories["check_inbound_change"] = category
+        logger.debug("Registered: CheckInboundChangeTool")
+
         from backend.tools.agent_tools.code_manipulation_tools import CODE_MANIPULATION_TOOLS
 
         for tool in CODE_MANIPULATION_TOOLS:

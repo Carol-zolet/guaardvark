@@ -1174,6 +1174,12 @@ def _initialize_app_components(app):
             get_confine_tool_paths()
     except Exception as e:
         app.logger.warning(f"Could not load the tool path limit setting: {e}")
+    try:
+        with app.app_context():
+            from backend.services.inbound_guard_service import get_mode
+            get_mode()
+    except Exception as e:
+        app.logger.warning(f"Could not load the inbound guard mode: {e}")
 
     try:
         from backend.tools.mcp_tools import install_proxy_sync

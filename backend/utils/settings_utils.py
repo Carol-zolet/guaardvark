@@ -155,6 +155,8 @@ ENV_VAR_MAP = {
     "media_cast_train_base": "GUAARDVARK_CAST_TRAIN_BASE",
     "media_max_quality_model": "GUAARDVARK_MAX_QUALITY_MODEL",
     "confine_tool_paths": "GUAARDVARK_CONFINE_TOOL_PATHS",
+    # The same variable git hooks read, so one line in .env sets both sides.
+    "inbound_guard_mode": "GUAARDVARK_INBOUND_GUARD",
 }
 
 _BOOL_TRUTHY = {"true", "1", "yes"}

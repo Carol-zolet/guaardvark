@@ -149,6 +149,8 @@ MUTATION_PROTECTED_PREFIXES = (
     '/api/automation/mcp/reload-config',
     # Turning the project-folder limit off widens what tools may read.
     '/api/settings/confine_tool_paths',
+    # Switching the inbound guard off, or approving a change it held, lets code in.
+    '/api/settings/inbound_guard',
     # Persists the product profile into .env.
     '/api/settings/profile',
     '/api/memory',

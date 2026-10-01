@@ -193,7 +193,10 @@ def list_pending_fixes():
         query = query.filter_by(status=status_filter)
     limit = min(int(request.args.get("limit", 50)), 100)
     fixes = query.limit(limit).all()
-    return success_response(data=[f.to_dict() for f in fixes])
+    from backend.services import inbound_guard_service
+
+    inbound = inbound_guard_service.verdicts_for_fixes([f.id for f in fixes])
+    return success_response(data=[{**f.to_dict(), "inbound": inbound.get(f.id)} for f in fixes])
 
 
 @self_improvement_bp.route("/pending-fixes/<int:fix_id>/approve", methods=["POST"])
@@ -212,6 +215,9 @@ def approve_fix(fix_id):
     fix.review_notes = data.get("notes", "")
     fix.reviewed_at = datetime.now()
     db.session.commit()
+    from backend.services import inbound_guard_service
+
+    inbound_guard_service.resolve_for_fix(fix.id, "approve", by=fix.reviewed_by, note=fix.review_notes)
     return success_response(data=fix.to_dict(), message="Fix approved")
 
 
@@ -229,6 +235,9 @@ def reject_fix(fix_id):
     fix.review_notes = data.get("notes", "")
     fix.reviewed_at = datetime.now()
     db.session.commit()
+    from backend.services import inbound_guard_service
+
+    inbound_guard_service.resolve_for_fix(fix.id, "reject", by=fix.reviewed_by, note=fix.review_notes)
     return success_response(data=fix.to_dict(), message="Fix rejected")
 
 
@@ -247,10 +256,14 @@ def apply_fix(fix_id):
             return error_response("Fix is missing original or new content", 400)
         from backend.services.guarded_code_service import GuardedCodeError, apply_exact_replacement
 
+        # The approval above is a person's answer to an inbound-guard hold on
+        # this edit; a block still needs its own approval.
         apply_result = apply_exact_replacement(
             fix.file_path,
             fix.original_content,
             fix.proposed_new_content,
+            origin="approved_fix",
+            human_approved=True,
         )
         fix.review_notes = (
             (fix.review_notes or "")

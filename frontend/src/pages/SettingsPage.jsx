@@ -24,6 +24,7 @@ import ManageBackupsModal from "../components/modals/ManageBackupsModal";
 import PurgeIndexModal from "../components/modals/PurgeIndexModal";
 import ThemeSelectorModal from "../components/modals/ThemeSelectorModal";
 import UncleClaudeSection from "../components/settings/UncleClaudeSection";
+import InboundGuardSection from "../components/settings/InboundGuardSection";
 import AgentDisplaySection from "../components/settings/AgentDisplaySection";
 import KillSwitchModal from "../components/modals/KillSwitchModal";
 import RebootProgressModal from "../components/modals/RebootProgressModal";
@@ -3189,6 +3190,7 @@ const SettingsPage = () => {
       description="The mentor, what it remembers, where it can see."
     >
       <UncleClaudeSection />
+      <InboundGuardSection />
       <Cluster
         label="Memory"
         note="facts, preferences and lessons the agent has learned"
