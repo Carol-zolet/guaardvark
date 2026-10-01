@@ -64,6 +64,11 @@
   with the master using the half-typed value, sending the API key to partial addresses such as
   `ht` or `http://10.0.0`. Registration and the heartbeat now follow the saved configuration and
   re-register when it is saved.
+- **Interconnector: auto-sync settings take effect on Save, and each registration is sent once.**
+  Turning on Enable Auto-Sync, or changing its interval or entities, started syncing from the
+  form, before Save or Cancel. Auto-sync now follows the saved configuration. Opening the
+  settings registered a client node with the master twice (three times when the master handed
+  back a new node id) and saving registered it twice; each now registers once.
 - **Training → Demonstrations: unsaved steps edits are kept.** Collapsing a row or pressing the
   list's refresh button discarded the steps being edited, and after *Save Steps* re-opening the
   row showed the steps from before the save. Edits now stay until saved, a refresh updates only
