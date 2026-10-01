@@ -2,8 +2,9 @@
 
 The inbound guard judges changes at the doors it knows about — merges, its own
 edits, the editor. This sweeps the code itself, so a change that came in some
-other way is seen too. It covers every file the Interconnector serves to other
-machines plus the surfaces listed under "watch" in inbound_rules.json (ComfyUI
+other way is seen too. It covers the checkout's code (tracked, and untracked
+files git does not ignore), every file the Interconnector serves to other
+machines, and the surfaces listed under "watch" in inbound_rules.json (ComfyUI
 custom nodes, extensions, the agent's notes and MCP server list).
 
 Each file keeps its last judged state in ``inbound_baselines``. A sweep hashes
@@ -92,6 +93,32 @@ def _sync_files() -> Dict[str, Optional[str]]:
     return {f["path"]: f.get("hash") for f in files if f.get("path")}
 
 
+def _checkout_files(rules) -> Dict[str, Optional[str]]:
+    """Everything git tracks plus untracked files it does not ignore, limited to code-like files.
+
+    The sync set alone misses code that never travels (a loose module beside
+    the packages it imports, a test, a frontend file).
+    """
+    suffixes = tuple(rules.data.get("watch", {}).get("suffixes", [".py", ".js"]))
+    # Only vendored trees here: git already leaves out what the clone ignores,
+    # and a tracked directory named data/ or build/ can hold real code.
+    skip = {"node_modules", "venv", ".venv", "__pycache__"}
+    guard.engine()
+    from scripts.inbound_guard.sources import git
+
+    try:
+        out = git(guard.REPO_ROOT, "ls-files", "-z", "--cached", "--others", "--exclude-standard")
+    except Exception as exc:
+        logger.warning("source watch: could not list the checkout: %s", exc)
+        return {}
+    found: Dict[str, Optional[str]] = {}
+    for raw in out.split(b"\0"):
+        rel = raw.decode("utf-8", "replace")
+        if rel and rel.endswith(suffixes) and not (set(rel.split("/")[:-1]) & skip):
+            found[rel] = None
+    return found
+
+
 def _surface_files(rules) -> Dict[str, Optional[str]]:
     """Untracked code surfaces from the rule data, walked without leaving them."""
     watch = rules.data.get("watch", {})
@@ -171,7 +198,8 @@ def _sweep(paths: Optional[Iterable[str]]) -> Dict:
     seeding = not rows
     full = paths is None or seeding  # the first sweep always covers everything
     if full:
-        files = _sync_files()
+        files = _checkout_files(rules)
+        files.update(_sync_files())
         files.update(_surface_files(rules))
     else:
         files = {p: None for p in paths}
