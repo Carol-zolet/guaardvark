@@ -6,6 +6,7 @@ from pathlib import Path
 from flask import Blueprint, current_app, request, jsonify, send_file
 from werkzeug.utils import secure_filename
 
+from backend.celery_dispatch import TaskNotStarted, mark_progress_not_started
 from backend.models import db, Subject, SubjectSample
 
 bp = Blueprint("cast_library_api", __name__, url_prefix="/api/cast-library")
@@ -674,7 +675,11 @@ def dispatch_generate_samples(subject_id: int):
         f"Character reference sheet generation for subject {subject_id}",
         additional_data={"subject_id": subject_id, "operation": "generate_samples", "kind": "cast_character_gen", "use_trained_lora": use_lora, "append": append},
     )
-    task = celery.send_task("character.generate_samples", args=[subject_id, job_id, use_lora, append])
+    try:
+        task = celery.send_task("character.generate_samples", args=[subject_id, job_id, use_lora, append])
+    except TaskNotStarted as e:
+        mark_progress_not_started(job_id, e)
+        raise
     # Persist celery id so /generate/cancel can revoke the worker without inspect.
     try:
         progress.update_process(
@@ -896,10 +901,14 @@ def dispatch_regen_sample(subject_id: int, sample_id: int):
         f"Regen sample {sample_id} for cast subject {subject_id}",
         additional_data={"subject_id": subject_id, "sample_id": sample_id, "operation": "regen_sample", "kind": "cast_character_gen"},
     )
-    task = celery.send_task(
-        "character.regen_sample",
-        args=[sample_id, prompt_override, seed, job_id],
-    )
+    try:
+        task = celery.send_task(
+            "character.regen_sample",
+            args=[sample_id, prompt_override, seed, job_id],
+        )
+    except TaskNotStarted as e:
+        mark_progress_not_started(job_id, e)
+        raise
     try:
         progress.update_process(
             job_id, 1, "Queued for regen",

@@ -2,6 +2,41 @@
 
 ## Unreleased
 
+- **Starting a background task no longer hangs when Redis is down.** A request that hands work to
+  the Celery worker (indexing, a Film Crew or music video step, a training job, Cast samples, a
+  timeline render, a bulk import) waited 19 s and then failed with Celery's "The Celery application
+  must be restarted" when Redis was stopped, and for minutes when Redis's address did not answer.
+  Sending now gives up within about half a second (Redis stopped) or 7 s (no answer), and says which
+  task was not started and that Redis is not reachable. Routes answer 503 `task_queue_unreachable`.
+  Film Crew and music video steps that move a project forward answer as before, with
+  `dispatched: false` and a `warning`, and resume when Guaardvark restarts. A training export,
+  import or resume puts the job back as it was instead of marking a finished job failed; parse and
+  filter jobs are marked failed with the reason instead of sitting at pending; an indexed document
+  is marked ERROR (Resume pending indexing re-queues it) instead of staying INDEXING; Cast sample
+  runs, renders and bulk imports close their progress entry with the reason. Workers still wait for
+  Redis as long as it takes and still retry storing a result for about 20 s.
+- **The web UI says when background work did not start.** A Film Crew or music video step that
+  was saved but not queued shows its warning on that production or music video (creating it,
+  re-dispatching, confirming casting, approving, re-analyzing, re-planning, regenerating a shot);
+  casting stops at a subject whose LoRA training was not queued. Any request Redis did not take
+  shows "Not started: Guaardvark's background queue (Redis) is not reachable", with the advice to
+  run `./start.sh` on the Guaardvark machine, instead of an internal task name.
+- **`flask celery-health` answers in one line.** It prints `up: <answer>`, or `down: <reason>` and
+  exits 1: Redis not reachable, or no worker answered the ping within 5 s. With Redis stopped it
+  printed a traceback.
+- **`GET /api/settings/security/check` works.** It imported a module that does not exist and
+  answered 500 every time. It now reports, without returning any key, whether an API key is set,
+  tool-endpoint protection, the Host and origin checks, debug mode, web access, tool file access,
+  and the addresses the backend, web UI, Redis, PostgreSQL and each plugin listen on, with a
+  warning for any of the others that other machines can reach.
+- **`GET /api/generate/status?job_id=…` works.** It called a progress method that did not exist and
+  answered 500 every time. It now answers the job's status, progress and message (live while the
+  backend tracks the job, from its progress record otherwise) and 404 for an id nothing knows.
+  `GET /api/jobs/unified:<id>`, which `llx job status` uses, also never found a live progress job;
+  it does now.
+- **A failed background task now shows its reason instead of sitting at 0 %.** An earlier release
+  said so, but the worker's handler for it was connected in a way Python discarded at once, so it
+  never ran. It is kept now, as is the worker's runtime-audit flush on shutdown.
 - **The backend answers only to this install's names.** A site can point its DNS name at the
   Guaardvark machine's address after its page has loaded (DNS rebinding). The browser then treats
   the backend as that site's own, so the page could read every reply and, from the Guaardvark

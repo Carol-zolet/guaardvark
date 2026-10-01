@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { formatUiError } from "../utils/uiError";
+import { dispatchWarning } from "../api/taskQueue";
 import {
   Box,
   Typography,
@@ -39,6 +40,9 @@ const FilmCrewPage = () => {
   const [retrying, setRetrying] = useState(false);
   const [deleting, setDeleting] = useState(false);
   const [error, setError] = useState(null);
+  // A step the backend saved but could not queue ({dispatched: false,
+  // warning}); shown on the production it belongs to.
+  const [notice, setNotice] = useState(null);
   const [createDialogOpen, setCreateDialogOpen] = useState(false);
   const [regenPolling, setRegenPolling] = useState(false);
 
@@ -124,10 +128,16 @@ const FilmCrewPage = () => {
     setTab(0); // Switch to Productions tab if we were in Cast Library
   };
 
+  const noteDispatch = (id, result) => {
+    const warning = dispatchWarning(result);
+    if (warning) setNotice({ id, text: warning });
+  };
+
   const handleCreateProduction = async (data) => {
     const newProd = await createProduction(data);
     await fetchProductions();
     handleProductionSelect(newProd.id);
+    noteDispatch(newProd.id, newProd);
   };
 
   const handleApprove = async () => {
@@ -135,11 +145,12 @@ const FilmCrewPage = () => {
     setApproving(true);
     setError(null);
     try {
-      await approveStoryboard(selectedProdId);
+      const result = await approveStoryboard(selectedProdId);
+      noteDispatch(selectedProdId, result);
       await fetchDetail(selectedProdId);
       await fetchProductions();
     } catch (err) {
-      setError('Failed to approve storyboard');
+      setError(formatUiError(err?.response?.data?.error) || 'Failed to approve storyboard');
     } finally {
       setApproving(false);
     }
@@ -149,6 +160,7 @@ const FilmCrewPage = () => {
     if (!selectedProdId) return;
     setError(null);
     const result = await regenerateShot(selectedProdId, shotId, data);
+    noteDispatch(selectedProdId, result);
     await fetchDetail(selectedProdId, { quiet: true });
     if (result?.regen_job_id) {
       regenPollCount.current = 0;
@@ -161,7 +173,8 @@ const FilmCrewPage = () => {
     setRetrying(true);
     setError(null);
     try {
-      await retryProduction(id);
+      const result = await retryProduction(id);
+      noteDispatch(id, result);
       await fetchDetail(id);
       await fetchProductions();
     } catch (err) {
@@ -230,10 +243,15 @@ const FilmCrewPage = () => {
                 production={productionDetail}
                 loading={loadingDetail}
                 error={error}
+                notice={notice && notice.id === selectedProdId ? notice.text : null}
+                onDismissNotice={() => setNotice(null)}
                 approving={approving}
                 retrying={retrying}
                 deleting={deleting}
-                onCastingConfirmed={() => fetchDetail(selectedProdId)}
+                onCastingConfirmed={(warning) => {
+                  if (warning) setNotice({ id: selectedProdId, text: warning });
+                  return fetchDetail(selectedProdId);
+                }}
                 onRegenerateShot={handleRegen}
                 onApproveStoryboard={handleApprove}
                 onRetry={handleRetry}
