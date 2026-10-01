@@ -404,13 +404,32 @@ def test_no_plugin_lets_any_page_read_its_replies():
 
 # ---- credentials stay out of replies ------------------------------------------
 
+def _code_words(path, function):
+    """Names, attributes and string constants used by `function`, docstring left out."""
+    tree = ast.parse((ROOT / path).read_text())
+    node = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == function)
+    body = node.body[1:] if ast.get_docstring(node) is not None else node.body
+    words = set()
+    for stmt in body:
+        for n in ast.walk(stmt):
+            if isinstance(n, ast.Name):
+                words.add(n.id)
+            elif isinstance(n, ast.Attribute):
+                words.add(n.attr)
+            elif isinstance(n, ast.Constant) and isinstance(n.value, str):
+                words.add(n.value)
+    return words
+
+
 def test_health_replies_carry_no_token():
-    upscaling = (ROOT / "plugins/upscaling/service/app.py").read_text()
-    vision = (ROOT / "plugins/vision_pipeline/service/app.py").read_text()
-    health = upscaling[upscaling.index('@app.get("/health")'):upscaling.index('@app.get("/models")')]
-    assert "token" not in health
-    health = vision[vision.index('@app.get("/health")'):vision.index('@app.get("/status")')]
-    assert "token" not in health
+    for path, function in (
+        ("plugins/upscaling/service/app.py", "health"),
+        ("plugins/upscaling/service/health.py", "get_health_status"),
+        ("plugins/vision_pipeline/service/app.py", "health"),
+    ):
+        words = _code_words(path, function)
+        assert words, (path, function)
+        assert not [w for w in words if "token" in w.lower()], (path, function)
 
 
 @pytest.fixture
