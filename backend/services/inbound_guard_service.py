@@ -223,10 +223,8 @@ def check(changes: List[Any], *, source: str, subject: str, mode: Optional[str] 
     if mode == "off":
         return None
     try:
-        with _registry_lock:
-            scanners = list(_scanners.items())
         verdict = engine().scan(changes, source=source, subject=subject, mode=mode, repo=REPO_ROOT,
-                                scanners=scanners)
+                                scanners=scanners())
     except Exception as exc:
         logger.error("inbound guard: scan failed for %s: %s", subject, exc, exc_info=True)
         if mode == "enforce":
@@ -413,6 +411,12 @@ def register_inbound_listener(name: str, fn: Listener) -> None:
 def unregister_inbound_listener(name: str) -> bool:
     with _registry_lock:
         return _listeners.pop(name, None) is not None
+
+
+def scanners() -> list:
+    """Registered extension scanners as (name, fn), for any caller that runs a scan."""
+    with _registry_lock:
+        return list(_scanners.items())
 
 
 def registered() -> dict:

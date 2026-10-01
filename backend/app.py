@@ -1111,6 +1111,8 @@ def _initialize_app_components(app):
             # A blueprint import error becomes a warning in discovery; without
             # this, a vertical's every route 404s behind a clean startup.
             app.logger.error("extension %s: no routes mounted under %s — check its api/ imports", _e.id, ", ".join(_missing))
+    for _ext_id, _err in _ext.register_inbound_guard(_extensions).items():
+        _ext.record(_ext_id, "inbound_guard", _err is None, _err)
 
     # Resume any in-flight video projects (productions + music videos, + future kinds)
     # after a crash. DB-driven — no in-memory state to lose. One registry-driven pass,
