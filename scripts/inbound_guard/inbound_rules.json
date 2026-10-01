@@ -27,7 +27,7 @@
     "tests": ["tests/*", "*/tests/*", "*/__tests__/*", "*/test_*.py", "*_test.py", "*.test.js", "*.test.jsx", "*.test.ts", "*.test.tsx", "*.spec.js", "*.spec.ts", "*/conftest.py"],
     "docs": ["*.md", "*.rst", "docs/*"],
     "outbound_guard": ["scripts/check_portable.sh", "scripts/pre-commit", "scripts/commit-msg", "scripts/pre-push"],
-    "inbound_guard": ["scripts/check_inbound.py", "scripts/inbound_guard/*", "scripts/hooks/*", "scripts/install_hooks.sh", ".github/workflows/inbound-guard.yml", "backend/services/inbound_guard_service.py", "backend/services/inbound_guard_watch.py", "backend/api/inbound_guard_api.py"],
+    "inbound_guard": ["scripts/check_inbound.py", "scripts/inbound_guard/*", "scripts/hooks/*", "scripts/install_hooks.sh", ".github/workflows/inbound-guard.yml", "backend/services/inbound_guard_service.py", "backend/services/inbound_guard_watch.py", "backend/services/inbound_guard_posture.py", "backend/api/inbound_guard_api.py"],
     "security_policy": ["backend/utils/auth_guard.py", "backend/mcp/config.py", "backend/services/mcp_policy.py", "backend/services/tool_execution_guard.py", "backend/services/guarded_code_service.py"],
     "steering": ["CLAUDE.md", "*/CLAUDE.md", "AGENTS.md", "*/AGENTS.md", "AGENT_GUIDE.md", ".agents/*", ".claude/*", "*/SKILL.md", "backend/rule_bundles/*", "backend/lesson_bundles/*", "backend/seed_rules.json", "data/agent/*", "data/config/mcp_servers.json"],
     "python_deps": ["requirements*.txt", "*/requirements*.txt", "constraints*.txt", "*/constraints*.txt"],
@@ -185,6 +185,12 @@
     "skip_dirs": [".git", "__pycache__", "node_modules", "venv", ".venv", "dist", "build", "data", "logs", "cache", ".cache"],
     "max_bytes": 2097152,
     "interval_seconds": 600
+  },
+
+  "posture": {
+    "_doc": "Where the posture checks look for pickle-format model files (loading one can run code).",
+    "model_dirs": ["data/models", "plugins/comfyui/ComfyUI/models"],
+    "pickle_suffixes": [".ckpt", ".pt", ".pth", ".bin", ".pkl", ".pickle"]
   },
 
   "network": {
