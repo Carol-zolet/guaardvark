@@ -15,6 +15,11 @@
   is marked ERROR (Resume pending indexing re-queues it) instead of staying INDEXING; Cast sample
   runs, renders and bulk imports close their progress entry with the reason. Workers still wait for
   Redis as long as it takes and still retry storing a result for about 20 s.
+- **`GET /api/settings/security/check` works.** It imported a module that does not exist and
+  answered 500 every time. It now reports, without returning any key, whether an API key is set,
+  tool-endpoint protection, the Host and origin checks, debug mode, web access, tool file access,
+  and the addresses the backend, web UI, Redis, PostgreSQL and each plugin listen on, with a
+  warning for any of the others that other machines can reach.
 - **The backend answers only to this install's names.** A site can point its DNS name at the
   Guaardvark machine's address after its page has loaded (DNS rebinding). The browser then treats
   the backend as that site's own, so the page could read every reply and, from the Guaardvark
