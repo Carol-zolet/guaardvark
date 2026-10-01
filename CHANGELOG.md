@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- **An inbound guard reads code before it lands.** `scripts/check_inbound.py` is the
+  counterpart of the portability guard: it reads the lines a change adds and says whether
+  they may land, should be held for a person to read, or must be refused. It looks at
+  edits to the guards, CI and security policy; agent instructions; hosted AI and telemetry
+  clients, new outside hosts and TLS checks turned off; code that runs text or unpickles;
+  hidden characters and encoded strings; new or unpinned dependencies; and symlinks,
+  pickles and binaries. Pull requests get a report-only check that uses the base branch's
+  copy. In a clone, `scripts/install_hooks.sh` installs both guards' hooks; the inbound one
+  is off until `git config inboundguard.mode observe` (record what fetches, merges and
+  cherry-picks bring to `main`) or `enforce` (also refuse a held merge until that exact
+  change is approved).
 - **Starting a background task no longer hangs when Redis is down.** A request that hands work to
   the Celery worker (indexing, a Film Crew or music video step, a training job, Cast samples, a
   timeline render, a bulk import) waited 19 s and then failed with Celery's "The Celery application

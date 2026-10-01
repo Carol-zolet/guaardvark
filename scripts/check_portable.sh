@@ -30,11 +30,8 @@
 #   scripts/.portable-local-patterns   content patterns (box nicknames, ...)
 #   scripts/.portable-local-paths      whole files that may never be committed
 #
-# Install the hooks (works from a worktree, where .git is a file and every
-# worktree shares the main repo's one hooks directory):
-#   for h in pre-commit commit-msg pre-push; do
-#     ln -sf ../../scripts/$h "$(git rev-parse --git-common-dir)/hooks/$h"
-#   done
+# Install the hooks, these and the inbound guard's, with scripts/install_hooks.sh
+# (works from a worktree: every worktree shares the main repo's hooks directory).
 #
 # Exits non-zero on a finding.
 set -uo pipefail
