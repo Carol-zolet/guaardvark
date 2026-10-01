@@ -338,6 +338,7 @@ jobs:
             extensions/_template/tests \
             backend/tests/api/test_batch_image_path_safety.py \
             backend/tests/api/test_cast_library_import_lora.py \
+            backend/tests/services/test_cast_lora_selection.py \
             backend/tests/test_search_code_budget_and_globs.py \
             backend/tests/test_search_codebase_scope.py \
             backend/tests/api/test_chat_export_api.py \

@@ -329,6 +329,7 @@ def _apply_character_casting(data: Dict[str, Any], params: Dict[str, Any]) -> No
     from backend.models import Subject, db
 
     trained_ids: list[int] = []
+    trained_subjects: list = []
     loras: list[str] = []
     untrained: list[str] = []
     missing: list[str] = []
@@ -349,6 +350,7 @@ def _apply_character_casting(data: Dict[str, Any], params: Dict[str, Any]) -> No
             untrained.append(getattr(s, "name", None) or str(sid))
             continue
         trained_ids.append(sid)
+        trained_subjects.append(s)
         loras.append(s.lora_path)
 
     if not trained_ids:
@@ -362,6 +364,21 @@ def _apply_character_casting(data: Dict[str, Any], params: Dict[str, Any]) -> No
         raise ValueError(
             "Character cast failed — " + ("; ".join(parts) or "no valid subject_ids")
         )
+
+    if trained_subjects:
+        # A member holding LoRAs for several bases renders with the one for the
+        # picked model; a member with none for it is refused here, before queueing.
+        from backend.services.cast_lora_selection import (
+            CastLoraRefusal,
+            select_cast_loras,
+            selected_lora_paths,
+        )
+        try:
+            selection = select_cast_loras(trained_subjects, params.get("model"))
+        except CastLoraRefusal as e:
+            raise ValueError(str(e)) from e
+        if not selection.legacy:
+            loras = selected_lora_paths(selection)
 
     params["subject_ids"] = trained_ids
     params["loras"] = loras

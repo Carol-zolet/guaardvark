@@ -337,6 +337,12 @@ def _keyframe_cast_context(
             if sub is not None:
                 subjects.append(sub)
                 subject_ids.append(int(sid))
+        try:
+            from backend.services.cast_lora_selection import select_cast_loras
+            subjects = select_cast_loras(subjects).subjects
+        except Exception as e:
+            # A refusal is raised again, with its message, by the keyframe render.
+            log.info("music_video %s: cast LoRA selection: %s", mv.id, e)
         subj_paths, _lock = subjects_to_lock(subjects, include_bible=False)
         lora_paths.extend(subj_paths)
 

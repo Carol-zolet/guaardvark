@@ -273,7 +273,9 @@ class ImageGeneratorTool(BaseTool):
             description=(
                 "Model to use. Default 'auto' — recommended; the system auto-picks the best "
                 "downloaded model for the prompt (usually Z-Image-Turbo or SDXL). "
-                "With subject_ids, base is taken from the character's train family (Z-Image/SDXL/FLUX). "
+                "With subject_ids, keep 'auto': each character renders on the base model of its "
+                "own LoRA. A named model must be one every character has a LoRA for, or the "
+                "render is refused. "
                 "Only override when the user names a specific model: 'krea2-turbo', 'zimage-turbo', "
                 "'sd-xl', 'sdxl-turbo', 'realistic-vision', 'epic-realism'."
             ),
@@ -383,6 +385,7 @@ class ImageGeneratorTool(BaseTool):
                     output_path=out,
                     style=style,
                     keep_pipeline=False,
+                    image_model=model,
                 )
                 results = [still]
                 cast_used = True
