@@ -81,8 +81,15 @@ const InterconnectorSettings = () => {
     sync_entities: ["clients", "projects", "websites"],
   });
 
-  // Track last-saved config for cancel/revert
+  // Last-saved config: the ref backs Cancel; the state drives what runs
+  // against the master (registration, heartbeat), so typing into the form
+  // never contacts it with half-typed values.
   const savedConfigRef = useRef(null);
+  const [savedConfig, setSavedConfig] = useState(null);
+  const rememberSaved = (cfg) => {
+    savedConfigRef.current = { ...cfg };
+    setSavedConfig({ ...cfg });
+  };
 
   // State for status
   const [status, setStatus] = useState(null);
@@ -186,9 +193,12 @@ const InterconnectorSettings = () => {
     return () => clearInterval(interval);
   }, [config.is_enabled]);
 
-  // Client node: Automatic registration and heartbeat
+  // Client node: automatic registration and heartbeat, from the saved
+  // configuration only. Re-registers when a save changes it, not while the
+  // URL, key or name fields are being typed into.
   useEffect(() => {
-    if (!config.is_enabled || config.node_mode !== "client") {
+    const config = savedConfig; // the saved copy, not the form being edited
+    if (!config?.is_enabled || config.node_mode !== "client") {
       return;
     }
 
@@ -196,7 +206,6 @@ const InterconnectorSettings = () => {
       return;
     }
 
-    // Register with master on mount or when config changes
     const registerClient = async () => {
       try {
         // Get the actual network IP from the backend
@@ -322,7 +331,7 @@ const InterconnectorSettings = () => {
       isMounted = false;
       clearInterval(heartbeatInterval);
     };
-  }, [config.is_enabled, config.node_mode, config.master_url, config.master_api_key, config.node_name, config.sync_entities, nodeId]);
+  }, [savedConfig, nodeId]);
 
   // Auto-fill node name from system branding name when node_name is empty
   useEffect(() => {
@@ -373,7 +382,7 @@ const InterconnectorSettings = () => {
       } else if (response.data?.config) {
         const loadedConfig = response.data.config;
         setConfig(loadedConfig);
-        savedConfigRef.current = { ...loadedConfig };
+        rememberSaved(loadedConfig);
 
         // If client mode and enabled, trigger immediate registration
         if (loadedConfig.is_enabled && loadedConfig.node_mode === "client" && 
@@ -564,7 +573,7 @@ const InterconnectorSettings = () => {
       }
       const newConfig = response.data?.config || response.config || configToSave;
       setConfig(newConfig);
-      savedConfigRef.current = { ...newConfig };
+      rememberSaved(newConfig);
       showMessage("Network Interconnector disabled", "success");
     } catch (error) {
       setConfig(prev => ({ ...prev, is_enabled: true }));
@@ -623,10 +632,8 @@ const InterconnectorSettings = () => {
         setConfig(response.config);
       }
       
-      // Update savedConfigRef so Cancel reverts to this state
-      savedConfigRef.current = { ...config, ...configToSave };
-      if (response.data?.config) savedConfigRef.current = { ...response.data.config };
-      else if (response.config) savedConfigRef.current = { ...response.config };
+      // Cancel reverts to this, and registration with the master now runs from it.
+      rememberSaved(response.data?.config || response.config || { ...config, ...configToSave });
 
       showMessage("Configuration saved successfully", "success");
 

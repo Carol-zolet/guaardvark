@@ -59,6 +59,11 @@
   keeps the edits if it fails. Regenerate asks before discarding edits. Approving, opening
   another video, or leaving the page with unsaved edits asks first. *Regen this storyboard* uses
   the cut's edited prompt, as its caption said.
+- **Interconnector: typing in the client settings no longer contacts the master.** On an enabled
+  client node, every keystroke in Node Name, Master Server Address or Master API Key re-registered
+  with the master using the half-typed value, sending the API key to partial addresses such as
+  `ht` or `http://10.0.0`. Registration and the heartbeat now follow the saved configuration and
+  re-register when it is saved.
 - **Audio Studio: withdraw consent for a voice clip, or delete it.** "Manage imported clips" under
   the reference clip lists each clip and whether consent is recorded. *Withdraw consent* removes
   the record and keeps the clip, which is not cloned again until consent is confirmed; *Delete
