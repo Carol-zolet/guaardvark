@@ -61,6 +61,10 @@ PUBLISH_RETRY_POLICY = {
 # 1 s apart) is what a worker keeps for storing results.
 RESULT_RETRY_POLICY = dict(PUBLISH_RETRY_POLICY)
 
+# Not bounded: a Redis that accepts connections but never replies still holds
+# a send, since the broker connection has no read timeout (kombu's default) and
+# adding one would change the connection the worker consumes on as well.
+
 QUEUE_UNREACHABLE_CODE = "task_queue_unreachable"
 _REASON_LIMIT = 200
 
@@ -184,6 +188,40 @@ class GuaardvarkCelery(Celery):
                 raise
             logger.warning("%s", failure)
             raise failure from exc
+
+
+HEALTH_PING_TASK = "backend.celery_tasks_isolated.ping"
+
+
+def _one_line(text: str) -> str:
+    return " ".join(str(text).split())
+
+
+def ping_worker(app, timeout: float = 5.0) -> tuple[bool, str]:
+    """Send the health ping and wait for a worker's answer.
+
+    Returns (True, "up: <answer>") or (False, "down: <reason>"), one line
+    either way, for `flask celery-health`.
+    """
+    from celery.exceptions import TimeoutError as ResultTimeout
+
+    try:
+        result = app.send_task(HEALTH_PING_TASK, queue="health")
+    except TaskNotStarted as e:
+        return False, f"down: {e.why}. Start Redis (./start.sh starts it)."
+    try:
+        answer = result.get(timeout=timeout)
+    except ResultTimeout:
+        return False, (
+            f"down: Redis took the ping but no worker answered within {timeout:g} s; "
+            "the Celery worker is not running (./start.sh starts it) or is busy with a long task."
+        )
+    except Exception as e:  # noqa: BLE001 - reported as the reason
+        failure = not_started(HEALTH_PING_TASK, app, e)
+        if failure is not None:
+            return False, f"down: {failure.why}. Start Redis (./start.sh starts it)."
+        return False, _one_line(f"down: {type(e).__name__}: {e}")
+    return True, _one_line(f"up: {answer}")
 
 
 def register_flask_handler(flask_app) -> None:

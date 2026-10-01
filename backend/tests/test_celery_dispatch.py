@@ -167,6 +167,16 @@ def test_the_result_channel_failure_is_reported_as_not_started():
     assert not_started("x.task", app, ValueError("bad arguments")) is None
 
 
+def test_celery_health_says_down_in_one_line():
+    from backend.celery_dispatch import ping_worker
+
+    start = time.monotonic()
+    ok, line = ping_worker(_app(REFUSED))
+    assert ok is False and time.monotonic() - start < 3.0
+    assert line.startswith("down: Guaardvark's background queue (Redis at 127.0.0.1:1) is not reachable")
+    assert "\n" not in line and "./start.sh" in line
+
+
 def test_the_queue_address_never_carries_credentials():
     app = GuaardvarkCelery("address-test", broker="redis://user:secret@redis.example:6380/2", set_as_current=False)
     assert queue_address(app) == "redis.example:6380"

@@ -2544,13 +2544,13 @@ def db_health_cli():
 
 @app.cli.command("celery-health")
 def celery_health_cli():
-    result = celery.send_task('backend.celery_tasks_isolated.ping', queue='health')
-    try:
-        response = result.get(timeout=5)
-    except Exception as exc:
-        print(json.dumps({"status": "down", "error": str(exc)}))
-        return
-    print(json.dumps({"status": "up", "result": response}))
+    """One line, "up: <answer>" or "down: <reason>"; exit status 1 when down."""
+    from backend.celery_dispatch import ping_worker
+
+    ok, line = ping_worker(celery)
+    print(line)
+    if not ok:
+        sys.exit(1)
 
 
 @app.cli.command("list-routes")

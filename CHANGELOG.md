@@ -21,6 +21,9 @@
   casting stops at a subject whose LoRA training was not queued. Any request Redis did not take
   shows "Not started: Guaardvark's background queue (Redis) is not reachable", with the advice to
   run `./start.sh` on the Guaardvark machine, instead of an internal task name.
+- **`flask celery-health` answers in one line.** It prints `up: <answer>`, or `down: <reason>` and
+  exits 1: Redis not reachable, or no worker answered the ping within 5 s. With Redis stopped it
+  printed a traceback.
 - **`GET /api/settings/security/check` works.** It imported a module that does not exist and
   answered 500 every time. It now reports, without returning any key, whether an API key is set,
   tool-endpoint protection, the Host and origin checks, debug mode, web access, tool file access,
