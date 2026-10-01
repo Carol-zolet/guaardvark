@@ -194,7 +194,8 @@ def _sweep(paths: Optional[Iterable[str]]) -> Dict:
     started = time.monotonic()
     rules = _rules()
     max_bytes = int(rules.data.get("watch", {}).get("max_bytes", 2 * 1024 * 1024))
-    rows = {r.path: r for r in db.session.query(InboundBaseline).all()}
+    # Posture snapshots share the table under "@posture/" paths; the file sweep leaves them alone.
+    rows = {r.path: r for r in db.session.query(InboundBaseline).all() if not r.path.startswith("@")}
     seeding = not rows
     full = paths is None or seeding  # the first sweep always covers everything
     if full:
