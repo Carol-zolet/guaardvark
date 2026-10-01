@@ -15,6 +15,12 @@
   is marked ERROR (Resume pending indexing re-queues it) instead of staying INDEXING; Cast sample
   runs, renders and bulk imports close their progress entry with the reason. Workers still wait for
   Redis as long as it takes and still retry storing a result for about 20 s.
+- **The web UI says when background work did not start.** A Film Crew or music video step that
+  was saved but not queued shows its warning on that production or music video (creating it,
+  re-dispatching, confirming casting, approving, re-analyzing, re-planning, regenerating a shot);
+  casting stops at a subject whose LoRA training was not queued. Any request Redis did not take
+  shows "Not started: Guaardvark's background queue (Redis) is not reachable", with the advice to
+  run `./start.sh` on the Guaardvark machine, instead of an internal task name.
 - **`GET /api/settings/security/check` works.** It imported a module that does not exist and
   answered 500 every time. It now reports, without returning any key, whether an API key is set,
   tool-endpoint protection, the Host and origin checks, debug mode, web access, tool file access,

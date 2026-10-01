@@ -29,8 +29,9 @@ def _not_started(job, what: str, exc: Exception):
     job.status = "failed"
     job.error_message = f"Failed to start {what} task: {exc}"
     db.session.commit()
-    status = 503 if isinstance(exc, TaskNotStarted) else 500
-    return error_response(f"Failed to start {what}: {exc}", status)
+    if isinstance(exc, TaskNotStarted):
+        return error_response(f"Failed to start {what}: {exc}", 503, exc.code)
+    return error_response(f"Failed to start {what}: {exc}", 500)
 
 
 def _put_back(job, before, what: str, exc: Exception):
@@ -39,7 +40,7 @@ def _put_back(job, before, what: str, exc: Exception):
     and stage it had, and the step can be started again."""
     job.status, job.pipeline_stage = before
     db.session.commit()
-    return error_response(f"Failed to start {what}: {exc}", 503)
+    return error_response(f"Failed to start {what}: {exc}", 503, exc.code)
 
 
 @training_bp.route("/jobs", methods=["GET"])

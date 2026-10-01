@@ -137,7 +137,7 @@ def queue_address(app) -> str:
 
 
 class TaskNotStarted(OperationalError):
-    """The task queue did not take a task, so it will not run.
+    """The background queue did not take a task, so it will not run.
 
     An OperationalError, as kombu raises for an unreachable broker, so code
     written against kombu still catches it.
@@ -157,7 +157,7 @@ class TaskNotStarted(OperationalError):
     @property
     def why(self) -> str:
         """The cause alone, for a caller that words "X was not started" itself."""
-        return f"Guaardvark's task queue (Redis at {self.queue}) is not reachable ({self.reason})"
+        return f"Guaardvark's background queue (Redis at {self.queue}) is not reachable ({self.reason})"
 
 
 def not_started(task_name: str, app, exc: BaseException) -> Optional[TaskNotStarted]:

@@ -203,7 +203,7 @@ def test_try_dispatch_reports_why_an_agent_did_not_start():
             raise TaskNotStarted(f"music_video.run_{agent_name}", "localhost:6379", "Connection refused")
 
     warning = Service(None).try_dispatch(7, "clip_generator")
-    assert warning.startswith("The clip generator was not started: Guaardvark's task queue")
+    assert warning.startswith("The clip generator was not started: Guaardvark's background queue")
     assert "localhost:6379" in warning and "./start.sh" in warning
     assert dispatch_report(warning) == {"dispatched": False, "warning": warning}
     assert dispatch_report(None) == {"dispatched": True}

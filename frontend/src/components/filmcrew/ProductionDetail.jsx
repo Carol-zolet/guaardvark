@@ -17,6 +17,8 @@ const ProductionDetail = ({
   production,
   loading,
   error,
+  notice,
+  onDismissNotice,
   approving,
   onCastingConfirmed,
   onRegenerateShot,
@@ -62,6 +64,11 @@ const ProductionDetail = ({
   return (
     <Box sx={{ p: 3, height: '100%', overflowY: 'auto' }}>
       {error && <Alert severity="error" sx={{ mb: 2 }}>{error}</Alert>}
+      {notice && (
+        <Alert severity="warning" sx={{ mb: 2 }} onClose={onDismissNotice}>
+          {notice}
+        </Alert>
+      )}
       <Box sx={{ mb: 3, display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 2 }}>
         <Box>
           <Typography variant="h4" gutterBottom>{production.name}</Typography>

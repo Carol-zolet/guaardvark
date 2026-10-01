@@ -2,6 +2,7 @@
 // Version 1.0: Centralized API client logic.
 
 import { announceRefusal, authRefusalCode, describeAuthRefusal, isBackendUrl } from "./apiAuth";
+import { isQueueUnreachable, QUEUE_UNREACHABLE_MESSAGE } from "./taskQueue";
 
 // Default to '/api' so requests use the Vite proxy during development
 // Strip any trailing slash to avoid double slashes or Flask 405 errors
@@ -63,8 +64,12 @@ export const handleResponse = async (response, options = {}) => {
         ? authRefusalCode(errorData)
         : null;
     const rejected = Boolean(refusal && errorData.credential_rejected);
+    // Background work that Redis did not take: say so in the UI's words
+    // (taskQueue.js); the server's text stays in error.data.
+    const queueDown = response.status === 503 && isQueueUnreachable(errorData);
     const errorMessage =
       (refusal && describeAuthRefusal(refusal, rejected)) ||
+      (queueDown && QUEUE_UNREACHABLE_MESSAGE) ||
       (typeof nested === "string" && nested) ||
       (typeof nested?.message === "string" && nested.message) ||
       (typeof errorData?.message === "string" && errorData.message) ||
@@ -72,6 +77,7 @@ export const handleResponse = async (response, options = {}) => {
     const error = new Error(errorMessage);
     error.status = response.status;
     error.data = errorData;
+    if (queueDown) error.queueUnreachable = true;
     if (refusal) {
       error.authRefused = refusal;
       // ApiKeyRefusalNotice tells pages that only log their errors.
