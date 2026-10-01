@@ -1178,8 +1178,11 @@ def _initialize_app_components(app):
         with app.app_context():
             from backend.services.inbound_guard_service import get_mode
             get_mode()
+        # Importing the watch registers its listener; the thread sweeps only while the guard is on.
+        from backend.services import inbound_guard_watch
+        inbound_guard_watch.start_background(app)
     except Exception as e:
-        app.logger.warning(f"Could not load the inbound guard mode: {e}")
+        app.logger.warning(f"Could not start the inbound guard: {e}")
 
     try:
         from backend.tools.mcp_tools import install_proxy_sync

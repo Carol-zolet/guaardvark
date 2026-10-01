@@ -185,10 +185,32 @@ function ReviewDialog({ open, onClose, onChanged }) {
   );
 }
 
+const describeSweep = (sweep) => {
+  if (!sweep?.at) return "No sweep yet.";
+  const parts = [`Last sweep ${new Date(sweep.at).toLocaleTimeString()}: ${sweep.files} files`];
+  if (sweep.seeded) parts.push(`first read of the code (${sweep.audit_findings || 0} existing findings to read once)`);
+  else parts.push(`${sweep.changed} changed`);
+  if (sweep.held) parts.push(`${sweep.held} held`);
+  return parts.join(", ") + ".";
+};
+
 export default function InboundGuardSection() {
   const [state, setState] = useState(null);
   const [error, setError] = useState(null);
   const [reviewOpen, setReviewOpen] = useState(false);
+  const [sweeping, setSweeping] = useState(false);
+
+  const sweepNow = async () => {
+    setSweeping(true);
+    try {
+      await inboundGuardService.sweep();
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setSweeping(false);
+      load();
+    }
+  };
 
   const load = useCallback(async () => {
     try {
@@ -228,7 +250,16 @@ export default function InboundGuardSection() {
           label={open > 0 ? `${open} waiting` : "nothing waiting"}
         />
         <ActionButton kind="link" onClick={() => setReviewOpen(true)}>Review held changes</ActionButton>
+        <ActionButton
+          onClick={sweepNow}
+          loading={sweeping}
+          disabled={(state?.mode || "off") === "off"}
+          tooltip="Read every watched file that changed since the last sweep: this checkout's code, ComfyUI custom nodes, extensions, the agent's notes."
+        >
+          Sweep now
+        </ActionButton>
       </Line>
+      <Hint>{describeSweep(state?.sweep)}</Hint>
       <Hint>
         Git hooks {state?.git?.installed ? `installed (${state.git.mode})` : "not installed — run scripts/install_hooks.sh"}
         {scanners.length ? ` · extra checks from ${scanners.join(", ")}` : ""}

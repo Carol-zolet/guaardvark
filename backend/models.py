@@ -3713,3 +3713,24 @@ class InboundScan(db.Model):
         if include_payload:
             out["payload"] = json.loads(self.payload) if self.payload else None
         return out
+
+
+class InboundBaseline(db.Model):
+    """The last judged state of one watched file, so the source watch reads only what changed.
+
+    ``accepted`` holds fingerprints of findings already reviewed or present when
+    the watch started; a later change raises only findings outside that set.
+    ``status``: clean, held (new findings waiting in the review list) or approved.
+    """
+    __tablename__ = "inbound_baselines"
+
+    id = db.Column(db.Integer, primary_key=True)
+    path = db.Column(db.String(1024), nullable=False, unique=True, index=True)
+    sha256 = db.Column(db.String(64), nullable=False)
+    size = db.Column(db.BigInteger)
+    mtime = db.Column(db.Float)
+    status = db.Column(db.String(10), nullable=False, default="clean")
+    attribution = db.Column(db.String(20))  # seed, git, product, out-of-band, approved
+    accepted = db.Column(db.Text, nullable=False, default="[]")
+    scan_id = db.Column(db.Integer)
+    updated_at = db.Column(db.DateTime, default=utcnow, onupdate=utcnow)

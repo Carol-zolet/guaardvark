@@ -69,6 +69,7 @@ def scan(
     rules = rules or RuleSet.load()
     deadline = time.monotonic() + budget_seconds if budget_seconds else None
     ignored = ignored_paths(repo, (c.path for c in changes)) if repo else set()
+
     def loader(change: Change, which: str = "new") -> Optional[str]:
         return blob_text(repo, change, which)
 

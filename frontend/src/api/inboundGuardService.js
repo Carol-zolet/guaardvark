@@ -32,6 +32,10 @@ export const inboundGuardService = {
     return post(`${ROOT}/scans/${id}/decide`, { decision, note, override_block: overrideBlock });
   },
 
+  async sweep() {
+    return post(`${ROOT}/sweep`, {});
+  },
+
   async approveGit(digest, note = "") {
     return post(`${ROOT}/git/${encodeURIComponent(digest)}/approve`, { note });
   },
