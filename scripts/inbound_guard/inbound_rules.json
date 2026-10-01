@@ -178,6 +178,15 @@
     {"paths": ["backend/mcp/config.py"], "names": ["DEFAULT_DENY_CATEGORIES"]}
   ],
 
+  "watch": {
+    "_doc": "What the source watch reads beyond the files the Interconnector serves: code that runs in-process or steers agents but is not tracked by git.",
+    "surfaces": ["plugins/comfyui/ComfyUI/custom_nodes", "extensions", "data/agent/self_knowledge.md", "data/config/mcp_servers.json"],
+    "suffixes": [".py", ".js", ".mjs", ".cjs", ".jsx", ".ts", ".tsx", ".sh", ".json", ".md", ".txt", ".toml", ".cfg", ".yml", ".yaml"],
+    "skip_dirs": [".git", "__pycache__", "node_modules", "venv", ".venv", "dist", "build", "data", "logs", "cache", ".cache"],
+    "max_bytes": 2097152,
+    "interval_seconds": 600
+  },
+
   "network": {
     "_doc": "Hosts a new URL in code may name without a hold. Downloads behind a visible Install, the project's own sites and package registries. Loopback, private ranges and reserved example names are never flagged.",
     "approved_hosts": [

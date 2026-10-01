@@ -25,12 +25,15 @@ def get_state():
         open_count = db.session.query(InboundScan.id).filter_by(status="open").count()
     except Exception as exc:
         logger.warning("inbound guard: could not count open verdicts: %s", exc)
+    from backend.services import inbound_guard_watch
+
     return success_response({
         "mode": guard.get_mode(),
         "modes": list(guard.MODES),
         "open": open_count,
         "providers": guard.registered(),
         "git": guard.git_hooks_status(),
+        "sweep": inbound_guard_watch.last_summary(),
     })
 
 
@@ -103,3 +106,13 @@ def approve_git(digest):
         return error_response("Not a verdict digest", 400)
     guard.approve_git(digest, str(data.get("by") or "operator"), str(data.get("note") or ""))
     return success_response({"digest": digest, "approved": True})
+
+
+@inbound_guard_bp.route("/sweep", methods=["POST"])
+def sweep_now():
+    """Read every watched file that changed since the last sweep, now."""
+    from backend.services import inbound_guard_watch
+
+    if not guard.is_on():
+        return error_response("The inbound guard is off; turn it on to sweep.", 409)
+    return success_response(inbound_guard_watch.sweep())

@@ -121,6 +121,15 @@ def set_mode(mode: str) -> str:
         git(REPO_ROOT, "config", "inboundguard.mode", mode)
     except Exception as exc:
         logger.warning("inbound guard: saved the mode, but not into git config: %s", exc)
+    if mode != "off":
+        try:
+            from flask import current_app
+
+            from backend.services import inbound_guard_watch
+
+            inbound_guard_watch.start_background(current_app._get_current_object())
+        except Exception as exc:
+            logger.warning("inbound guard: could not start the source watch: %s", exc)
     return mode
 
 
@@ -502,6 +511,11 @@ def decide(scan_id: int, decision: str, *, by: str, note: str = "", override_blo
     row.decided_at = datetime.now()
     row.decision_note = note
     db.session.commit()
+
+    if decision == "approve" and row.source == "watch":
+        from backend.services import inbound_guard_watch
+
+        inbound_guard_watch.approve_held(row.id)
 
     landed_paths: List[str] = []
     if decision == "approve" and row.payload:
