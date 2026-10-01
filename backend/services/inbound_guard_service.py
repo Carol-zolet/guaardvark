@@ -620,3 +620,54 @@ def verdicts_for_fixes(fix_ids: List[int]) -> Dict[int, dict]:
     for row in rows:
         out[row.pending_fix_id] = row.to_dict()
     return out
+
+
+def guard_file_write(path: str | Path, new_text: str, *, source: str, subject: str):
+    """Judge a whole-file write a caller is about to make; None when off or outside the checkout.
+
+    Raises InboundRefused when enforcing and the write may not land. Writes
+    outside this checkout are not its code and are not read.
+    """
+    if not is_on():
+        return None
+    target = Path(path).resolve()
+    try:
+        target.relative_to(REPO_ROOT)
+    except ValueError:
+        return None
+    old = target.read_text(encoding="utf-8", errors="replace") if target.is_file() else None
+    return check_and_gate([change_for_file(target, old, new_text)], source=source, subject=subject,
+                          payload={"kind": "write_file", "path": relative(target), "content": new_text})
+
+
+RESTORE_GROUPS = ("code", "steering", "dependencies", "workflows")
+RESTORE_MAX_BYTES = 2 * 1024 * 1024
+
+
+def guard_restore(members: List[tuple], project_root: Path):
+    """Judge the files a backup restore would write over this checkout's code.
+
+    ``members`` are (archive name, extracted temp path). Only files the rules
+    have something to say about are read: code, agent instructions,
+    dependencies and workflows, up to 2 MB each.
+    """
+    if not is_on():
+        return None
+    rules = engine().RuleSet.load()
+    changes = []
+    for name, temp in members:
+        rel = Path(name).as_posix()
+        if not any(rules.in_group(rel, group) for group in RESTORE_GROUPS):
+            continue
+        temp = Path(temp)
+        if not temp.is_file() or temp.stat().st_size > RESTORE_MAX_BYTES:
+            continue
+        new = temp.read_text(encoding="utf-8", errors="replace")
+        dest = project_root / rel
+        old = dest.read_text(encoding="utf-8", errors="replace") if dest.is_file() else None
+        if old == new:
+            continue
+        changes.append(engine().change_from_texts(rel, old, new))
+    if not changes:
+        return None
+    return check_and_gate(changes, source="backup_restore", subject=f"backup restore ({len(changes)} code file(s))")
