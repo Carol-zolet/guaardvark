@@ -69,6 +69,12 @@
   row showed the steps from before the save. Edits now stay until saved, a refresh updates only
   rows without edits, steps changed elsewhere under an edit are reported and the edit is kept,
   and a save updates the list.
+- **Training → Demonstrations: Save Steps keeps click positions.** The steps editor shows a
+  click's position as `"coordinates": [x, y]`, but saving read only `coordinates_x` /
+  `coordinates_y`, so every save erased the recorded positions (replay finds its targets by
+  vision and was not affected; the stored record of where each click landed was). `PUT
+  /api/agent-control/learn/demonstrations/<id>/steps` now takes either shape, and refuses
+  coordinates that are not `[x, y]` or null without changing anything.
 - **Audio Studio: withdraw consent for a voice clip, or delete it.** "Manage imported clips" under
   the reference clip lists each clip and whether consent is recorded. *Withdraw consent* removes
   the record and keeps the clip, which is not cloned again until consent is confirmed; *Delete
