@@ -43,6 +43,9 @@
   fields, and leaving the page with unsaved edits asks first (links, the page's back arrow, closing
   or reloading the tab; the browser's own Back button is not covered). The page now polls only while training or
   sample generation is under way, and refreshes when its tab is shown again.
+- **Film Crew: the "Regenerate shot" dialog survives the storyboard refresh.** The refresh that
+  runs for a minute after a shot regen replaced the storyboard with a spinner every 5 seconds,
+  closing a regen dialog opened for the next shot and losing its prompt. It now refreshes in place.
 - **Audio Studio: withdraw consent for a voice clip, or delete it.** "Manage imported clips" under
   the reference clip lists each clip and whether consent is recorded. *Withdraw consent* removes
   the record and keeps the clip, which is not cloned again until consent is confirmed; *Delete
