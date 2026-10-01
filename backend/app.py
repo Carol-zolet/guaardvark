@@ -132,6 +132,7 @@ except Exception as _e:
     logging.getLogger(__name__).warning(f"Plugin-runner sidecar failed to start: {_e}")
     # Non-fatal — plugin_manager will fall back to direct subprocess.run
 
+from backend.celery_dispatch import TaskNotStarted, register_flask_handler as register_celery_dispatch_handler
 from backend.utils.clock import utcnow
 from backend.utils.chat_utils import (
     DEFAULT_FALLBACK_SYSTEM_PROMPT,
@@ -2032,6 +2033,13 @@ def health_celery():
         }
 
         return _cache_and_return((jsonify({"status": "up", **worker_info}), 200), "up")
+    except TaskNotStarted as exc:
+        # Redis itself did not answer; asking the workers would go through it too.
+        return _cache_and_return((jsonify({
+            "status": "down",
+            "error": str(exc),
+            "suggestion": "Start Redis and the Celery worker (./start.sh starts both).",
+        }), 503), "down")
     except Exception as exc:
         error_msg = str(exc)
 
@@ -2232,6 +2240,10 @@ def handle_sqlalchemy_db_error(e):
         else "A database error occurred."
     )
     return jsonify({"error": "Database Error", "message": msg}), 500
+
+
+# A task Redis did not take answers 503 with the reason (backend/celery_dispatch.py).
+register_celery_dispatch_handler(app)
 
 
 @app.errorhandler(500)

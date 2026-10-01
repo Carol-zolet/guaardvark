@@ -181,8 +181,13 @@ def _dispatch_first_stage(svc, row_id: int, agent: str):
     if not svc.advance_if_predecessor(row_id, expected_predecessor="draft"):
         # Another worker moved the new row first, so the stage is its to run.
         return False, "another worker already moved the project past its first stage"
+    from backend.celery_dispatch import TaskNotStarted
+
     try:
         svc.dispatch_agent(row_id, agent)
+    except TaskNotStarted as e:
+        logger.warning("%s dispatch failed for %s: %s", agent, row_id, e)
+        return False, e.why
     except Exception as e:  # noqa: BLE001 - reported to the caller, not raised
         logger.warning("%s dispatch failed for %s: %s", agent, row_id, e)
         return False, f"the task queue did not take it ({str(e) or type(e).__name__})"

@@ -50,6 +50,14 @@ def stage_prep_enabled() -> bool:
     return os.environ.get(STAGE_PREP_ENV, "0").strip().lower() in ("1", "true", "yes", "on")
 
 
+def dispatch_report(warning: str | None) -> dict:
+    """Response fields for a route that tried to dispatch an agent:
+    ``dispatched``, and ``warning`` (from try_dispatch) when it was not."""
+    if warning:
+        return {"dispatched": False, "warning": warning}
+    return {"dispatched": True}
+
+
 def _coerce_error(error):
     """Make ``error`` safe for the SQLAlchemy JSON column.
 
@@ -165,6 +173,25 @@ class PipelineService:
             self.prepare_stage(row)
         from backend.celery_app import celery
         celery.send_task(f"{self.task_namespace}.run_{agent_name}", args=[row_id])
+
+    def try_dispatch(self, row_id: int, agent_name: str) -> str | None:
+        """dispatch_agent for a route that has already moved the row forward:
+        None when the agent was queued, otherwise why it was not, worded for
+        the response. The row keeps its stage either way; resume_all
+        dispatches it when Guaardvark next starts."""
+        from backend.celery_dispatch import TaskNotStarted
+
+        try:
+            self.dispatch_agent(row_id, agent_name)
+        except Exception as e:  # noqa: BLE001 - reported to the caller, not raised
+            log.warning("%s %s: %s dispatch failed: %s", self.task_namespace, row_id, agent_name, e)
+            why = e.why if isinstance(e, TaskNotStarted) else (str(e) or type(e).__name__)
+            step = agent_name.replace("_", " ")
+            return (
+                f"The {step} was not started: {why}. Nothing is lost: it starts when "
+                "Guaardvark is restarted (./start.sh)."
+            )
+        return None
 
     def resume_all(self) -> int:
         """Boot-time resume. Dispatch the agent for each non-terminal row's stage.

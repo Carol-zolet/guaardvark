@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- **Starting a background task no longer hangs when Redis is down.** A request that hands work to
+  the Celery worker (indexing, a Film Crew or music video step, a training job, Cast samples, a
+  timeline render, a bulk import) waited 19 s and then failed with Celery's "The Celery application
+  must be restarted" when Redis was stopped, and for minutes when Redis's address did not answer.
+  Sending now gives up within about half a second (Redis stopped) or 7 s (no answer), and says which
+  task was not started and that Redis is not reachable. Routes answer 503 `task_queue_unreachable`.
+  Film Crew and music video steps that move a project forward answer as before, with
+  `dispatched: false` and a `warning`, and resume when Guaardvark restarts. A training export,
+  import or resume puts the job back as it was instead of marking a finished job failed; parse and
+  filter jobs are marked failed with the reason instead of sitting at pending; an indexed document
+  is marked ERROR (Resume pending indexing re-queues it) instead of staying INDEXING; Cast sample
+  runs, renders and bulk imports close their progress entry with the reason. Workers still wait for
+  Redis as long as it takes and still retry storing a result for about 20 s.
 - **The backend answers only to this install's names.** A site can point its DNS name at the
   Guaardvark machine's address after its page has loaded (DNS rebinding). The browser then treats
   the backend as that site's own, so the page could read every reply and, from the Guaardvark

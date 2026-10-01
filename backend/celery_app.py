@@ -1,8 +1,13 @@
 import os
 import logging
 
-from celery import Celery
 from flask import Flask
+
+from backend.celery_dispatch import (
+    GuaardvarkCelery,
+    apply_sender_bounds,
+    restore_worker_result_retries,
+)
 
 # Under memory pressure the kernel must kill THIS worker, never the desktop
 # (2026-08-04 client box lockups). Early, before any heavy allocation.
@@ -50,7 +55,7 @@ def create_celery_app():
     broker_url = os.environ.get("CELERY_BROKER_URL", "redis://localhost:6379/0")
     result_backend = os.environ.get("CELERY_RESULT_BACKEND", "redis://localhost:6379/0")
 
-    celery_app = Celery(
+    celery_app = GuaardvarkCelery(
         __name__,
         broker=broker_url,
         backend=result_backend,
@@ -58,6 +63,8 @@ def create_celery_app():
 
     try:
         celery_app.conf.update(
+        # A worker reconnects to Redis for as long as it takes. Sending a task
+        # is bounded separately (apply_sender_bounds below).
         broker_connection_retry_on_startup=True,
         broker_connection_retry=True,
         broker_connection_max_retries=None,  # retry forever
@@ -249,6 +256,9 @@ def create_celery_app():
             task_default_exchange_type='direct',
             task_default_routing_key='default',
         )
+        # Sending a task fails within seconds when Redis is down instead of
+        # holding the caller (backend/celery_dispatch.py has the numbers).
+        apply_sender_bounds(celery_app.conf)
         logger.info("Celery configuration updated successfully")
     except Exception as e:
         logger.error(f"Error updating Celery configuration: {e}")
@@ -303,6 +313,19 @@ def create_celery_app():
                 pass
     except Exception:  # noqa: BLE001
         pass
+
+    # A worker stores task results with Celery's own retries; the bound on
+    # sending is for the processes that wait on a send.
+    try:
+        from celery.signals import celeryd_init
+
+        # weak=False: Celery holds receivers weakly by default, and this one is
+        # local to create_celery_app.
+        @celeryd_init.connect(weak=False)
+        def _worker_result_retries(sender=None, conf=None, **_ignored):
+            restore_worker_result_retries(conf if conf is not None else celery_app.conf)
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"Could not register worker result-retry setup: {e}")
 
     # Flush the runtime-liveness buffer when a worker child recycles
     # (max_tasks_per_child=50) or the worker shuts down, so a recycling child
