@@ -4,7 +4,10 @@
 
   "policy": {
     "hold_at": "medium",
-    "block_at": "critical"
+    "block_at": "critical",
+    "sources": {
+      "code_editor": {"hold_at": "critical", "_doc": "a person typing in the editor: only a block refuses; findings are still recorded"}
+    }
   },
 
   "caps": {

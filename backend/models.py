@@ -3656,3 +3656,60 @@ class SuspendedChatState(db.Model):
 
 
 
+
+
+class InboundScan(db.Model):
+    """One inbound-guard verdict on a change that tried to land in this checkout.
+
+    Rows with a hold or block stay "open" until a person approves or rejects them.
+    ``payload`` carries what is needed to land a held change that has no other
+    home (a new file, a delete, a rename); a held edit to an existing file lives
+    as a PendingFix and is linked by ``pending_fix_id`` instead.
+    """
+    __tablename__ = "inbound_scans"
+
+    id = db.Column(db.Integer, primary_key=True)
+    created_at = db.Column(db.DateTime, default=utcnow, index=True)
+    source = db.Column(db.String(40), nullable=False)
+    subject = db.Column(db.String(500), nullable=False)
+    mode = db.Column(db.String(10), nullable=False)
+    verdict = db.Column(db.String(10), nullable=False)
+    top_severity = db.Column(db.String(10))
+    digest = db.Column(db.String(40), nullable=False, index=True)
+    findings = db.Column(db.Text, nullable=False, default="[]")
+    providers = db.Column(db.Text)
+    errors = db.Column(db.Text)
+    files = db.Column(db.Integer, default=0)
+    added_lines = db.Column(db.Integer, default=0)
+    status = db.Column(db.String(12), nullable=False, default="open", index=True)  # open, clear, approved, rejected
+    payload = db.Column(db.Text)
+    pending_fix_id = db.Column(db.Integer, index=True)
+    decided_by = db.Column(db.String(80))
+    decided_at = db.Column(db.DateTime)
+    decision_note = db.Column(db.Text)
+
+    def to_dict(self, include_payload: bool = False) -> dict:
+        out = {
+            "id": self.id,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "source": self.source,
+            "subject": self.subject,
+            "mode": self.mode,
+            "verdict": self.verdict,
+            "top_severity": self.top_severity,
+            "digest": self.digest,
+            "findings": json.loads(self.findings or "[]"),
+            "providers": json.loads(self.providers or "[]"),
+            "errors": json.loads(self.errors or "[]"),
+            "files": self.files,
+            "added_lines": self.added_lines,
+            "status": self.status,
+            "pending_fix_id": self.pending_fix_id,
+            "decided_by": self.decided_by,
+            "decided_at": self.decided_at.isoformat() if self.decided_at else None,
+            "decision_note": self.decision_note,
+            "landable": bool(self.payload),
+        }
+        if include_payload:
+            out["payload"] = json.loads(self.payload) if self.payload else None
+        return out

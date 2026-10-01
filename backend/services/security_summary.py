@@ -292,6 +292,27 @@ def _setting_checks() -> list[dict]:
             "Not limited to the project folder. Settings can limit file-reading tools to "
             "it and GUAARDVARK_ALLOWED_PATHS.",
         ))
+    from backend.services.inbound_guard_service import get_mode
+
+    mode = get_mode()
+    if mode == "enforce":
+        checks.append(_check(
+            "inbound_guard", "Inbound guard", OK,
+            "Enforcing: code the product writes into its own checkout is read first, and risky "
+            "changes wait for approval.",
+        ))
+    elif mode == "observe":
+        checks.append(_check(
+            "inbound_guard", "Inbound guard", INFO,
+            "Observing: code the product writes into its own checkout is read and recorded, "
+            "but nothing is held.",
+        ))
+    else:
+        checks.append(_check(
+            "inbound_guard", "Inbound guard", INFO,
+            "Off. Settings can have the product read code before it writes it into its own "
+            "checkout, and hold risky changes for approval.",
+        ))
     return checks
 
 

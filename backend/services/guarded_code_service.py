@@ -678,8 +678,15 @@ def apply_exact_replacement(
     max_bytes: int = 10 * 1024 * 1024,
     expected_hash: Optional[str] = None,
     expected_mtime: Optional[float] = None,
+    origin: str = "self_code",
+    human_approved: bool = False,
 ) -> GuardedEditResult:
     """Apply one exact replacement after all guarded-code checks.
+
+    The inbound guard reads the change last, once the text to replace is
+    settled. ``origin`` names the path it came by in the guard's record;
+    ``human_approved`` says a person already approved this edit (an approved
+    pending fix), which answers a hold but not a block.
 
     Optional drift protection:
     - expected_hash: sha256 of the content the caller read. If the on-disk
@@ -775,6 +782,9 @@ def apply_exact_replacement(
     updated_content = current_content.replace(old_text, new_text)
     diff = build_unified_diff(relative_path, old_text, new_text)
 
+    verdict = _inbound_gate(file_path, relative_path, current_content, old_text, new_text,
+                            origin=origin, human_approved=human_approved, dry_run=dry_run)
+
     if dry_run:
         # Dry run syntax check
         if not verify_syntax(file_path, updated_content):
@@ -819,6 +829,12 @@ def apply_exact_replacement(
         _restore_from_backup(file_path, current_content, "restore after post-write verification mismatch")
         raise GuardedCodeError("Post-write verification failed; edit was rolled back.", "VERIFY_FAILED", 500)
 
+    if verdict is not None:
+        from backend.services import inbound_guard_service
+
+        inbound_guard_service.landed([str(file_path)], source=origin, subject=f"{origin}: {relative_path}",
+                                     verdict=verdict)
+
     return GuardedEditResult(
         file_path=str(file_path),
         relative_path=relative_path,
@@ -831,6 +847,52 @@ def apply_exact_replacement(
         },
     )
 
+
+
+def _inbound_gate(file_path: Path, relative_path: str, current: str, old_text: str, new_text: str, *,
+                  origin: str, human_approved: bool, dry_run: bool):
+    """Ask the inbound guard about one replacement; None when the guard is off.
+
+    While enforcing, a block is refused. A hold on a direct edit becomes a
+    pending fix, so the change waits for a person instead of being lost.
+    """
+    from backend.services import inbound_guard_service as guard
+
+    if not guard.is_on():
+        return None
+    try:
+        change = guard.change_for_replacement(file_path, current, old_text, new_text)
+        verdict = guard.check([change], source=origin, subject=f"{origin}: {relative_path}", keep=not dry_run)
+        guard.gate(verdict, human_approved=human_approved)
+        if human_approved and verdict is not None and verdict.verdict == "hold" and verdict.scan_id:
+            guard.mark(verdict.scan_id, "approved", by="pending fix approval")
+    except guard.InboundRefused as refused:
+        if refused.held and not dry_run and refused.verdict is not None:
+            fix_id = _stage_held_edit(file_path, relative_path, old_text, new_text, refused)
+            guard.link_pending_fix(refused.scan_id, fix_id)
+            raise GuardedCodeError(f"{refused} The edit is waiting as pending fix #{fix_id}.",
+                                   refused.code, 409) from refused
+        raise GuardedCodeError(str(refused), refused.code, 409 if refused.held else 403) from refused
+    return verdict
+
+
+def _stage_held_edit(file_path: Path, relative_path: str, old_text: str, new_text: str, refused) -> int:
+    from backend.models import PendingFix, db
+
+    worst = refused.verdict.findings[0] if refused.verdict.findings else None
+    pending = PendingFix(
+        file_path=str(file_path),
+        original_content=old_text,
+        proposed_new_content=new_text,
+        proposed_diff=build_unified_diff(relative_path, old_text, new_text),
+        fix_description="Held by the inbound guard"
+        + (f": {worst.severity} {worst.rule} — {worst.why}" if worst else "."),
+        severity=(worst.severity if worst and worst.severity in ("critical", "high", "medium", "low") else "medium"),
+        status="proposed",
+    )
+    db.session.add(pending)
+    db.session.commit()
+    return pending.id
 
 
 def stage_pending_fix(
@@ -875,6 +937,20 @@ def stage_pending_fix(
     if run_id is None:
         logger.info("PendingFix staged without run_id (ad-hoc/manual from guarded; per team audit intentional for non-SI proposals)")
 
+    # The inbound guard reads the proposal now, so its verdict sits beside the
+    # diff when a person reviews it. A blocked proposal is not staged at all.
+    from backend.services import inbound_guard_service as guard
+
+    verdict = None
+    if guard.is_on():
+        change = guard.change_for_replacement(file_path, current_content, old_text, new_text)
+        try:
+            verdict = guard.check([change], source="proposal", subject=f"proposal: {relative_path}")
+            if verdict is not None and verdict.enforced and verdict.verdict == "block":
+                guard.gate(verdict)
+        except guard.InboundRefused as refused:
+            raise GuardedCodeError(str(refused), refused.code, 403) from refused
+
     pending = PendingFix(
         run_id=run_id,
         file_path=str(file_path),
@@ -887,4 +963,6 @@ def stage_pending_fix(
     )
     db.session.add(pending)
     db.session.commit()
+    if verdict is not None:
+        guard.link_pending_fix(getattr(verdict, "scan_id", None), pending.id)
     return pending.id

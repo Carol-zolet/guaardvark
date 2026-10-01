@@ -38,7 +38,8 @@ def git_mode(repo: Path) -> str:
 
 def thresholds(policy: Dict, source: str) -> Dict[str, str]:
     merged = {"hold_at": policy.get("hold_at", "medium"), "block_at": policy.get("block_at", "critical")}
-    merged.update(policy.get("sources", {}).get(source, {}))
+    override = policy.get("sources", {}).get(source, {})
+    merged.update({k: v for k, v in override.items() if k in ("hold_at", "block_at")})
     return merged
 
 
