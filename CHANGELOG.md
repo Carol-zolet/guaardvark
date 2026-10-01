@@ -64,6 +64,11 @@
   with the master using the half-typed value, sending the API key to partial addresses such as
   `ht` or `http://10.0.0`. Registration and the heartbeat now follow the saved configuration and
   re-register when it is saved.
+- **Training → Demonstrations: unsaved steps edits are kept.** Collapsing a row or pressing the
+  list's refresh button discarded the steps being edited, and after *Save Steps* re-opening the
+  row showed the steps from before the save. Edits now stay until saved, a refresh updates only
+  rows without edits, steps changed elsewhere under an edit are reported and the edit is kept,
+  and a save updates the list.
 - **Audio Studio: withdraw consent for a voice clip, or delete it.** "Manage imported clips" under
   the reference clip lists each clip and whether consent is recorded. *Withdraw consent* removes
   the record and keeps the clip, which is not cloned again until consent is confirmed; *Delete
