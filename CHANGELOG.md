@@ -13,6 +13,13 @@
   is off until `git config inboundguard.mode observe` (record what fetches, merges and
   cherry-picks bring to `main`) or `enforce` (also refuse a held merge until that exact
   change is approved).
+- **Settings → Agents → Inbound guard.** One switch (Off / Observe / Enforce) for the guard inside
+  the product too: edits Guaardvark makes to its own code, the code editor's file actions, swarm
+  merges, generated-code tasks and backup restores are read before they land, and in Enforce a
+  risky edit waits as a pending fix with the findings beside its diff. A source watch sweeps the
+  checkout every ten minutes for changes that came in any other way, and an Interconnector master
+  holds back files that are waiting for review. Extensions can add checks through
+  `extensions/<id>/inbound_guard.py`.
 - **Starting a background task no longer hangs when Redis is down.** A request that hands work to
   the Celery worker (indexing, a Film Crew or music video step, a training job, Cast samples, a
   timeline render, a bulk import) waited 19 s and then failed with Celery's "The Celery application
