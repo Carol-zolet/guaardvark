@@ -312,3 +312,101 @@ def test_reimport_bumps_version(client):
         )
         assert resp.status_code == 200, resp.get_json()
         assert resp.get_json()["subject"]["lora_version"] == expected_version
+
+
+def _import(client, subject_id, keys, base_model_id, trigger_word, filename="lora.safetensors"):
+    data = _build_safetensors(keys)
+    return client.post(
+        f"/api/cast-library/subjects/{subject_id}/import-lora",
+        data={
+            "lora_file": (io.BytesIO(data), filename),
+            "base_model_id": base_model_id,
+            "trigger_word": trigger_word,
+        },
+        content_type="multipart/form-data",
+    )
+
+
+def test_first_import_records_row_and_becomes_default(client):
+    """record_subject_lora, not a bare field replace — see the maintainer's
+    phase 2 split on issue #245 (subject_loras, one row per base)."""
+    subject_id = _create_subject(client)
+    resp = _import(client, subject_id, _zimage_keys(), "zimage-turbo", "caroline_1")
+    assert resp.status_code == 200, resp.get_json()
+    subject = resp.get_json()["subject"]
+    assert subject["lora_path"].endswith("subject_%d_imported_v1.safetensors" % subject_id)
+    assert subject["trigger_word"] == "caroline_1"
+    rows = subject["lora_versions"]
+    assert len(rows) == 1
+    assert rows[0]["base_model_id"] == "zimage-turbo"
+    assert rows[0]["version"] == 1
+    assert rows[0]["source"] == "imported"
+    assert rows[0]["trigger_word"] == "caroline_1"
+    assert rows[0]["lora_path"] == subject["lora_path"]
+
+
+def test_import_for_a_second_base_adds_row_without_replacing_default(client):
+    """A member's first LoRA becomes its default; importing for a base it
+    doesn't have yet adds a row and leaves the existing default alone."""
+    subject_id = _create_subject(client)
+    first = _import(client, subject_id, _zimage_keys(), "zimage-turbo", "caroline_1")
+    default_path = first.get_json()["subject"]["lora_path"]
+
+    second = _import(client, subject_id, _flux_keys(), "flux-dev", "caroline_2")
+    assert second.status_code == 200, second.get_json()
+    subject = second.get_json()["subject"]
+    # The Z-Image default is untouched: still the member's default LoRA/trigger.
+    assert subject["lora_path"] == default_path
+    assert subject["trigger_word"] == "caroline_1"
+    rows = {r["base_model_id"]: r for r in subject["lora_versions"]}
+    assert set(rows) == {"zimage-turbo", "flux-dev"}
+    assert rows["flux-dev"]["trigger_word"] == "caroline_2"
+    assert rows["flux-dev"]["lora_path"] != default_path
+
+
+def test_reimport_same_base_adds_version_and_stays_default(client):
+    subject_id = _create_subject(client)
+    _import(client, subject_id, _zimage_keys(), "zimage-turbo", "caroline_1")
+    resp = _import(client, subject_id, _zimage_keys(), "zimage-turbo", "caroline_1b")
+    assert resp.status_code == 200, resp.get_json()
+    subject = resp.get_json()["subject"]
+    rows = [r for r in subject["lora_versions"] if r["base_model_id"] == "zimage-turbo"]
+    assert len(rows) == 2
+    assert {r["version"] for r in rows} == {1, 2}
+    assert subject["lora_path"] == max(rows, key=lambda r: r["version"])["lora_path"]
+    assert subject["trigger_word"] == "caroline_1b"
+
+
+def test_make_default_switches_the_default_lora(client):
+    subject_id = _create_subject(client)
+    first = _import(client, subject_id, _zimage_keys(), "zimage-turbo", "caroline_1")
+    default_path = first.get_json()["subject"]["lora_path"]
+    second = _import(client, subject_id, _flux_keys(), "flux-dev", "caroline_2")
+    flux_path = next(
+        r["lora_path"] for r in second.get_json()["subject"]["lora_versions"]
+        if r["base_model_id"] == "flux-dev"
+    )
+    assert flux_path != default_path
+
+    resp = client.post(f"/api/cast-library/subjects/{subject_id}/loras/flux-dev/make-default")
+    assert resp.status_code == 200, resp.get_json()
+    subject = resp.get_json()["subject"]
+    assert subject["lora_path"] == flux_path
+
+    # Switching back: zimage-turbo's row is untouched by the flux switch above.
+    back = client.post(f"/api/cast-library/subjects/{subject_id}/loras/zimage-turbo/make-default")
+    assert back.status_code == 200, back.get_json()
+    assert back.get_json()["subject"]["lora_path"] == default_path
+
+
+def test_make_default_refuses_unknown_base(client):
+    subject_id = _create_subject(client)
+    _import(client, subject_id, _zimage_keys(), "zimage-turbo", "caroline_1")
+    resp = client.post(f"/api/cast-library/subjects/{subject_id}/loras/flux-dev/make-default")
+    assert resp.status_code == 400
+    assert "flux" in resp.get_json()["error"].lower()
+
+
+def test_make_default_unknown_subject_returns_404(client):
+    resp = client.post("/api/cast-library/subjects/99999/loras/zimage-turbo/make-default")
+    assert resp.status_code == 404
