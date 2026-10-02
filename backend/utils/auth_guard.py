@@ -151,6 +151,8 @@ MUTATION_PROTECTED_PREFIXES = (
     '/api/settings/confine_tool_paths',
     # Switching the inbound guard off, or approving a change it held, lets code in.
     '/api/settings/inbound_guard',
+    # Approving or applying a staged fix writes code into the checkout.
+    '/api/self-improvement/pending-fixes',
     # Persists the product profile into .env.
     '/api/settings/profile',
     '/api/memory',

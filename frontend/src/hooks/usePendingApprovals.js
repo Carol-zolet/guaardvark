@@ -1,27 +1,48 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { fetchPublishes } from "../api/connectionsService";
+import { inboundGuardService } from "../api/inboundGuardService";
+import { isActionable } from "../api/heldChanges";
 
 // A pending publish has no Task row until it is approved, so it is invisible to
 // the jobs API. The queue and the sidebar badge both read the publish records
-// directly, and share this hook so they cannot disagree about the count.
+// directly, and share this hook so they cannot disagree about the count. Code
+// the inbound guard holds waits on the same person, so it counts here too.
 const POLL_MS = 30000;
 const LIMIT = 200;
 
 /**
- * Track publishes awaiting approval.
+ * Track publishes awaiting approval and code changes the inbound guard holds.
  *
  * @param {object}  options
- * @param {boolean} options.notify  raise a desktop notification when the count rises
- * @returns {{count: number, pending: object[], loading: boolean, error: string|null, refresh: function}}
+ * @param {boolean} options.notify  raise a desktop notification when a count rises
+ * @returns {{count: number, pending: object[], held: object[], loading: boolean, heldLoading: boolean,
+ *            error: string|null, refresh: function}}
  */
 export const usePendingApprovals = ({ notify = false } = {}) => {
   const [pending, setPending] = useState([]);
+  const [held, setHeld] = useState([]);
   const [loading, setLoading] = useState(true);
+  const [heldLoading, setHeldLoading] = useState(true);
   const [error, setError] = useState(null);
   // Notify on a rising edge only — a poll that finds the same queue is not news.
   const previousCount = useRef(null);
+  const previousHeld = useRef(null);
 
-  const refresh = useCallback(async () => {
+  const refreshHeld = useCallback(async () => {
+    try {
+      const res = await inboundGuardService.listScans("open", LIMIT, { git: false });
+      const rows = (res?.data?.scans || []).filter(isActionable);
+      setHeld(rows);
+      return rows;
+    } catch {
+      // The guard may be off or the route refused; publishes still count.
+      return null;
+    } finally {
+      setHeldLoading(false);
+    }
+  }, []);
+
+  const refreshPublishes = useCallback(async () => {
     try {
       const rows = await fetchPublishes({
         status: "awaiting_approval",
@@ -38,15 +59,29 @@ export const usePendingApprovals = ({ notify = false } = {}) => {
     }
   }, []);
 
+  const refresh = useCallback(
+    async () => (await Promise.all([refreshPublishes(), refreshHeld()]))[0],
+    [refreshPublishes, refreshHeld],
+  );
+
   useEffect(() => {
     let active = true;
     const tick = async () => {
-      const rows = await refresh();
-      if (!active || rows === null) return;
-      const previous = previousCount.current;
-      previousCount.current = rows.length;
-      if (notify && previous !== null && rows.length > previous) {
-        raiseDesktopNotification(rows.length - previous, rows);
+      const [rows, heldRows] = await Promise.all([refreshPublishes(), refreshHeld()]);
+      if (!active) return;
+      if (rows !== null) {
+        const previous = previousCount.current;
+        previousCount.current = rows.length;
+        if (notify && previous !== null && rows.length > previous) {
+          raiseDesktopNotification(rows.length - previous, rows);
+        }
+      }
+      if (heldRows !== null) {
+        const previous = previousHeld.current;
+        previousHeld.current = heldRows.length;
+        if (notify && previous !== null && heldRows.length > previous) {
+          raiseHeldNotification(heldRows.length - previous, heldRows);
+        }
       }
     };
     tick();
@@ -55,10 +90,31 @@ export const usePendingApprovals = ({ notify = false } = {}) => {
       active = false;
       clearInterval(timer);
     };
-  }, [refresh, notify]);
+  }, [refreshPublishes, refreshHeld, notify]);
 
-  return { count: pending.length, pending, loading, error, refresh };
+  return {
+    count: pending.length + held.length,
+    pending,
+    held,
+    loading,
+    heldLoading,
+    error,
+    refresh,
+  };
 };
+
+function raiseHeldNotification(added, rows) {
+  if (typeof window === "undefined" || !("Notification" in window)) return;
+  if (Notification.permission !== "granted") return;
+  try {
+    new Notification(
+      added === 1 ? "Code change waiting for approval" : `${added} code changes waiting for approval`,
+      { body: rows[0]?.subject || "", tag: "guaardvark-held-code" },
+    );
+  } catch {
+    // Same as publishes: the badge is the guaranteed signal.
+  }
+}
 
 /** Best-effort desktop notification. Silent when unsupported or not granted. */
 function raiseDesktopNotification(added, rows) {
