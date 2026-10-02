@@ -138,6 +138,26 @@ def test_import_zimage_lora_succeeds(client):
     assert subject["lora_path"].endswith("subject_%d_imported_v1.safetensors" % subject_id)
 
 
+def test_imported_lora_is_readable_by_other_users(client):
+    # ComfyUI may run as another user (Docker); an owner-only file fails to load.
+    import os
+    import stat
+
+    subject_id = _create_subject(client)
+    resp = client.post(
+        f"/api/cast-library/subjects/{subject_id}/import-lora",
+        data={
+            "lora_file": (io.BytesIO(_build_safetensors(_zimage_keys())), "zimage.safetensors"),
+            "base_model_id": "zimage-turbo",
+            "trigger_word": "caroline_1",
+        },
+        content_type="multipart/form-data",
+    )
+    assert resp.status_code == 200, resp.get_json()
+    mode = stat.S_IMODE(os.stat(resp.get_json()["subject"]["lora_path"]).st_mode)
+    assert mode & 0o044 == 0o044, oct(mode)
+
+
 def test_import_flux_lora_succeeds(client):
     subject_id = _create_subject(client)
     data = _build_safetensors(_flux_keys())
