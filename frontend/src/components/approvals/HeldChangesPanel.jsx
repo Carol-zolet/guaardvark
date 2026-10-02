@@ -34,6 +34,22 @@ const KIND_LABEL = (scan) => {
   return scan.source;
 };
 
+// What approving does depends on what was kept when the change was stopped. An
+// edit refused outright (a block) keeps no text to apply; approving it records
+// the digest, so the same change passes when it is made again.
+const APPROVAL_EFFECT = (scan) => {
+  if (!scan) return "apply";
+  if (scan.source === "watch") return "accept";
+  if (scan.pending_fix_id || scan.landable) return "apply";
+  return "allow-again";
+};
+
+const APPROVED_MESSAGE = {
+  apply: "Approved; the change landed",
+  accept: "Accepted as it is on disk",
+  "allow-again": "Approved; nothing was applied. The same change goes through if it is made again",
+};
+
 const formatWhen = (iso) => {
   if (!iso) return "";
   const then = new Date(iso).getTime();
@@ -87,7 +103,7 @@ const HeldChangesPanel = ({ held, loading, onChanged, showMessage }) => {
     try {
       if (decision === "approve") {
         await approveHeldChange(entry, { note, overrideBlock: detail.verdict === "block" });
-        showMessage?.("Approved; the change landed");
+        showMessage?.(APPROVED_MESSAGE[APPROVAL_EFFECT(detail)]);
       } else {
         await rejectHeldChange(entry, { note });
         showMessage?.("Rejected");
@@ -169,7 +185,8 @@ const HeldChangesPanel = ({ held, loading, onChanged, showMessage }) => {
     }
     const blocked = detail.verdict === "block";
     const diff = detail.fix?.diff || detail.diff;
-    const onDisk = detail.source === "watch";
+    const effect = APPROVAL_EFFECT(detail);
+    const onDisk = effect === "accept";
     return (
       <Box sx={{ p: 3 }}>
         <Stack direction="row" spacing={1} alignItems="center" sx={{ mb: 1 }} flexWrap="wrap">
@@ -212,6 +229,12 @@ const HeldChangesPanel = ({ held, loading, onChanged, showMessage }) => {
             Rejecting leaves it there and keeps it out of what this machine sends to others until it changes.
           </Alert>
         )}
+        {effect === "allow-again" && (
+          <Alert severity="info" sx={{ mt: 2 }}>
+            Nothing was kept to apply: this change was refused outright, so its text was not saved. Approving
+            lets exactly this change through the next time it is made. Rejecting closes it.
+          </Alert>
+        )}
 
         <Divider sx={{ my: 2 }} />
         <TextField size="small" label="Note" value={note} onChange={(e) => setNote(e.target.value)} fullWidth />
@@ -228,7 +251,13 @@ const HeldChangesPanel = ({ held, loading, onChanged, showMessage }) => {
             disabled={busy}
             onClick={() => setConfirming(true)}
           >
-            {blocked ? "Approve despite the block" : onDisk ? "Accept" : "Approve and apply"}
+            {blocked
+              ? "Approve despite the block"
+              : onDisk
+                ? "Accept"
+                : effect === "allow-again"
+                  ? "Approve"
+                  : "Approve and apply"}
           </Button>
           <Button color="error" startIcon={<CancelIcon />} disabled={busy} onClick={() => act("reject")}>
             Reject
@@ -248,9 +277,11 @@ const HeldChangesPanel = ({ held, loading, onChanged, showMessage }) => {
         open={confirming}
         title={detail?.verdict === "block" ? "Approve a blocked change?" : "Apply this change?"}
         description={
-          detail?.verdict === "block"
-            ? "The guard blocked this, not just held it. It lands only because you approve it here; read every finding first."
-            : "The change is written into this checkout now. If the file no longer reads as it did when it was held, nothing is written and the reason is shown."
+          APPROVAL_EFFECT(detail) === "allow-again"
+            ? "Nothing is written now. Exactly this change will pass the guard the next time it is made; read every finding first."
+            : detail?.verdict === "block"
+              ? "The guard blocked this, not just held it. It lands only because you approve it here; read every finding first."
+              : "The change is written into this checkout now. If the file no longer reads as it did when it was held, nothing is written and the reason is shown."
         }
         facts={detail ? [{ label: "Findings", value: detail.findings?.length || 0 }] : []}
         confirmLabel={detail?.verdict === "block" ? "Approve despite the block" : "Approve and apply"}
