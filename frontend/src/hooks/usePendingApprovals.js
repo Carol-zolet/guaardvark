@@ -2,11 +2,13 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { fetchPublishes } from "../api/connectionsService";
 import { inboundGuardService } from "../api/inboundGuardService";
 import { isActionable } from "../api/heldChanges";
+import { fetchQueue as fetchOutreachQueue } from "../api/outreachService";
 
 // A pending publish has no Task row until it is approved, so it is invisible to
 // the jobs API. The queue and the sidebar badge both read the publish records
 // directly, and share this hook so they cannot disagree about the count. Code
-// the inbound guard holds waits on the same person, so it counts here too.
+// the inbound guard holds and outreach drafts in supervised mode wait on the
+// same person, so they count here too.
 const POLL_MS = 30000;
 const LIMIT = 200;
 
@@ -21,6 +23,8 @@ const LIMIT = 200;
 export const usePendingApprovals = ({ notify = false } = {}) => {
   const [pending, setPending] = useState([]);
   const [held, setHeld] = useState([]);
+  const [outreach, setOutreach] = useState([]);
+  const [outreachLoading, setOutreachLoading] = useState(true);
   const [loading, setLoading] = useState(true);
   const [heldLoading, setHeldLoading] = useState(true);
   const [error, setError] = useState(null);
@@ -42,6 +46,19 @@ export const usePendingApprovals = ({ notify = false } = {}) => {
     }
   }, []);
 
+  const refreshOutreach = useCallback(async () => {
+    try {
+      const rows = await fetchOutreachQueue();
+      setOutreach(Array.isArray(rows) ? rows : []);
+      return rows;
+    } catch {
+      // Outreach routes answer only this machine without an API key.
+      return null;
+    } finally {
+      setOutreachLoading(false);
+    }
+  }, []);
+
   const refreshPublishes = useCallback(async () => {
     try {
       const rows = await fetchPublishes({
@@ -60,14 +77,14 @@ export const usePendingApprovals = ({ notify = false } = {}) => {
   }, []);
 
   const refresh = useCallback(
-    async () => (await Promise.all([refreshPublishes(), refreshHeld()]))[0],
-    [refreshPublishes, refreshHeld],
+    async () => (await Promise.all([refreshPublishes(), refreshHeld(), refreshOutreach()]))[0],
+    [refreshPublishes, refreshHeld, refreshOutreach],
   );
 
   useEffect(() => {
     let active = true;
     const tick = async () => {
-      const [rows, heldRows] = await Promise.all([refreshPublishes(), refreshHeld()]);
+      const [rows, heldRows] = await Promise.all([refreshPublishes(), refreshHeld(), refreshOutreach()]);
       if (!active) return;
       if (rows !== null) {
         const previous = previousCount.current;
@@ -90,14 +107,16 @@ export const usePendingApprovals = ({ notify = false } = {}) => {
       active = false;
       clearInterval(timer);
     };
-  }, [refreshPublishes, refreshHeld, notify]);
+  }, [refreshPublishes, refreshHeld, refreshOutreach, notify]);
 
   return {
-    count: pending.length + held.length,
+    count: pending.length + held.length + outreach.length,
     pending,
     held,
+    outreach,
     loading,
     heldLoading,
+    outreachLoading,
     error,
     refresh,
   };

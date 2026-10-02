@@ -35,6 +35,7 @@ import {
 import PageLayout from "../components/layout/PageLayout";
 import RejectPublishDialog from "../components/connections/RejectPublishDialog";
 import HeldChangesPanel from "../components/approvals/HeldChangesPanel";
+import OutreachDraftsPanel from "../components/approvals/OutreachDraftsPanel";
 import { useSnackbar } from "../components/common/SnackbarProvider";
 import {
   approvePublish,
@@ -91,7 +92,7 @@ const ApprovalsPage = () => {
   const [rejecting, setRejecting] = useState(null);
   const [notifyEnabled, setNotifyEnabled] = useState(desktopNotificationsGranted);
 
-  const { pending, held, loading, heldLoading, error, refresh } = usePendingApprovals({
+  const { pending, held, outreach, loading, heldLoading, outreachLoading, error, refresh } = usePendingApprovals({
     notify: notifyEnabled,
   });
 
@@ -364,7 +365,7 @@ const ApprovalsPage = () => {
   return (
     <PageLayout
       title="Approvals"
-      subtitle="Waiting on you: publishes before they go out, code before it lands"
+      subtitle="Waiting on you: publishes and outreach posts before they go out, code before it lands"
       actions={
         <Stack direction="row" spacing={1} alignItems="center">
           {desktopNotificationsAvailable() && (
@@ -427,6 +428,10 @@ const ApprovalsPage = () => {
             label={pending.length ? `Publishes (${pending.length})` : "Publishes"}
           />
           <Tab
+            value="outreach"
+            label={outreach.length ? `Outreach (${outreach.length})` : "Outreach"}
+          />
+          <Tab
             value="code"
             label={held.length ? `Code changes (${held.length})` : "Code changes"}
           />
@@ -436,6 +441,13 @@ const ApprovalsPage = () => {
           <HeldChangesPanel
             held={held}
             loading={heldLoading}
+            onChanged={refresh}
+            showMessage={showMessage}
+          />
+        ) : tab === "outreach" ? (
+          <OutreachDraftsPanel
+            drafts={outreach}
+            loading={outreachLoading}
             onChanged={refresh}
             showMessage={showMessage}
           />
