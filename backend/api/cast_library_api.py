@@ -1155,6 +1155,10 @@ def import_subject_lora(subject_id):
     tmp_fd, _tmp_name = tempfile.mkstemp(dir=target_dir, suffix=".partial")
     os.close(tmp_fd)
     tmp_path = Path(_tmp_name)
+    # mkstemp creates the file owner-only (0600) and the rename below keeps that
+    # mode. ComfyUI loads Cast LoRAs from this folder and can run as another
+    # user (Docker), so the stored LoRA is made readable like a trained one.
+    os.chmod(tmp_path, 0o644)
 
     written = 0
     oversized = False
