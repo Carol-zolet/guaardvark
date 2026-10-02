@@ -410,3 +410,34 @@ def test_make_default_refuses_unknown_base(client):
 def test_make_default_unknown_subject_returns_404(client):
     resp = client.post("/api/cast-library/subjects/99999/loras/zimage-turbo/make-default")
     assert resp.status_code == 404
+
+
+def test_make_default_keeps_a_default_that_predates_the_table(client, tmp_path):
+    """A member trained before subject_loras has a default no row holds.
+
+    Making another base the default must keep that LoRA as a row, so the
+    member can switch back to it.
+    """
+    subject_id = _create_subject(client)
+    legacy = tmp_path / f"subject_{subject_id}_v1.safetensors"
+    legacy.write_bytes(_build_safetensors(_zimage_keys()))
+    s = db.session.get(Subject, subject_id)
+    s.lora_path = str(legacy)
+    s.trigger_word = "member_old"
+    s.training_settings_json = {"base_model_id": "zimage-turbo"}
+    s.training_status = "trained"
+    db.session.commit()
+
+    flux = _import(client, subject_id, _flux_keys(), "flux-dev", "member_flux")
+    assert flux.status_code == 200, flux.get_json()
+    assert flux.get_json()["subject"]["lora_path"] == str(legacy)
+
+    to_flux = client.post(f"/api/cast-library/subjects/{subject_id}/loras/flux-dev/make-default")
+    assert to_flux.status_code == 200, to_flux.get_json()
+    rows = {r["base_model_id"]: r for r in to_flux.get_json()["subject"]["lora_versions"]}
+    assert rows["zimage-turbo"]["lora_path"] == str(legacy)
+    assert rows["zimage-turbo"]["trigger_word"] == "member_old"
+
+    back = client.post(f"/api/cast-library/subjects/{subject_id}/loras/zimage-turbo/make-default")
+    assert back.status_code == 200, back.get_json()
+    assert back.get_json()["subject"]["lora_path"] == str(legacy)

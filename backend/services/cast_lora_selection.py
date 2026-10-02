@@ -414,6 +414,8 @@ def _keep_default_as_row(subject: Any, existing: list, replacing_path: str) -> N
     prior_base = default_base(subject, existing)
     if not prior_base:
         return
+    settings = getattr(subject, "training_settings_json", None)
+    imported = isinstance(settings, dict) and bool(settings.get("imported"))
     prior = SubjectLora(
         subject_id=subject.id,
         base_model_id=prior_base,
@@ -423,7 +425,7 @@ def _keep_default_as_row(subject: Any, existing: list, replacing_path: str) -> N
             default=0,
         ),
         trigger_word=getattr(subject, "trigger_word", None),
-        source="trained",
+        source="imported" if imported else "trained",
     )
     db.session.add(prior)
     existing.append(prior)
