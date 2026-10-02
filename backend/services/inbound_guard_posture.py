@@ -16,7 +16,7 @@ around them, which change what Guaardvark does as surely as an edit would:
 Each check keeps its last snapshot as a baseline row (path "@posture/<name>").
 The first run records quietly; after that a change is diffed and judged, and
 anything at or above the hold threshold waits in the review list, with
-listeners (the network monitor's timeline among them) told as for any verdict.
+listeners told as for any verdict.
 """
 from __future__ import annotations
 

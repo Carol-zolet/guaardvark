@@ -1,7 +1,7 @@
 """Data shapes shared by every inbound-guard caller: a change, a finding, a verdict.
 
-Severities use the same five-step ladder as the network monitor extension's findings,
-so a verdict can be filed beside network findings without translation.
+Severities run info < low < medium < high < critical, a common ladder, so an
+extension can file a verdict beside findings of its own without translation.
 """
 from __future__ import annotations
 
