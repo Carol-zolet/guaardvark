@@ -3364,10 +3364,14 @@ class AgentControlService:
         not see. Only clicks count: a hotkey is marked verified whatever the
         screen does, so a pressed Home key used to turn a rejected "done"
         into success after five clicks that changed nothing (2026-09-23).
+        A click_at or draw counts too: it is verified only when pixels next
+        to its points changed. A smiley drawn exactly as asked was otherwise
+        refused "done" four times, because the eye would not call two dots
+        and a line "a complete smiley face" (2026-10-02).
         ``history`` is the current task's, reset when each task starts.
         """
         for st in history:
-            if st.failed or st.action.action_type not in cls._CLICK_FAMILY:
+            if st.failed or st.action.action_type not in cls._CLICK_FAMILY + ("click_at", "draw"):
                 continue
             r = st.result or {}
             if bool(r.get("verified")) or str(r.get("post_action_effect") or "") == "verified":

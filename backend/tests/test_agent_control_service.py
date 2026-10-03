@@ -655,6 +655,15 @@ class TestPointActions(unittest.TestCase):
         self.assertEqual(self.svc._refusal_for(AgentAction(action_type="type", text="hi")), "")
         self.assertEqual(self.svc._field_point, (300, 700))
 
+    def test_a_verified_stroke_counts_as_a_real_change_for_done(self):
+        from backend.services.agent_control_service import ActionStep, AgentAction
+        drawn = ActionStep(action=AgentAction(action_type="draw", points=[(1, 1), (9, 9)]),
+                           result={"success": True, "verified": True})
+        unchanged = ActionStep(action=AgentAction(action_type="click_at", coordinates=(5, 5)),
+                               result={"success": True, "verified": False})
+        self.assertTrue(self.A._task_has_verified_click([drawn]))
+        self.assertFalse(self.A._task_has_verified_click([unchanged]))
+
     def test_the_rule_names_the_screen_size(self):
         self.svc._screen_size = (1000, 1000)
         self.assertIn("the screen is 1000x1000", self.svc._point_rule())
