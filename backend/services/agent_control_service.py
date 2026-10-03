@@ -5407,6 +5407,29 @@ Reply ONLY with JSON:
                 break
         return lessons
 
+    _TARGETING_ACTIONS = ("click", "right_click", "double_click", "triple_click", "hover", "drag")
+
+    def _task_target_tokens(self) -> List[set]:
+        """The significant words of each thing this task aimed an action at."""
+        out: List[set] = []
+        for st in self._action_history:
+            a = st.action
+            if a.action_type not in self._TARGETING_ACTIONS:
+                continue
+            for desc in (a.target_description, getattr(a, "drag_to_description", "")):
+                toks = set(self._significant_tokens(desc or ""))
+                if toks:
+                    out.append(toks)
+        return out
+
+    def _is_task_target(self, element: str, targets: List[set]) -> bool:
+        """``element`` names something the task aimed at: its words are
+        within one target's words, or a target's words within its own."""
+        toks = set(self._significant_tokens(element or ""))
+        if not toks:
+            return False
+        return any(toks <= t or t <= toks for t in targets)
+
     def _write_session_lessons(self, session_id: Optional[str] = None) -> int:
         """Persist distilled lessons as belief_update memories.
 
@@ -5419,6 +5442,19 @@ Reply ONLY with JSON:
         Returns the number of memories actually persisted.
         """
         lessons = self._distill_lessons()
+        # Only lessons about what this task aimed at. The rest named things
+        # the knowledge files mention ("desktop", "Firefox icon", "thumbs up
+        # icon left of dislike") that were simply not part of a task on a web
+        # page, and every model read them as advice in every later run: 35
+        # such rows had built up by 2026-10-02 and were deleted.
+        targets = self._task_target_tokens()
+        kept = [l for l in lessons if self._is_task_target(l.get("element", ""), targets)]
+        if len(kept) < len(lessons):
+            logger.info(
+                f"[AGENT][BELIEF] {len(lessons) - len(kept)} lesson(s) not about this task's "
+                f"targets left unwritten: {[l.get('element') for l in lessons if l not in kept]}"
+            )
+        lessons = kept
         if not lessons:
             return 0
 
