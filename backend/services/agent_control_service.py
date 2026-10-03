@@ -1623,7 +1623,8 @@ class AgentControlService:
                             pixel_diff = round(change["share"] * 100, 3)
                             pixel_diff_value = pixel_diff
                             if kind == "scroll":
-                                moved = change["share"] >= self._SCROLL_MIN_SHARE
+                                moved = (change["share"] >= self._SCROLL_MIN_SHARE
+                                         and change["width_share"] >= self._SCROLL_MIN_WIDTH)
                             elif kind == "type":
                                 # One or two characters can't change four blocks.
                                 need = min(self._CHANGE_MIN_BLOCKS,
@@ -2596,9 +2597,14 @@ class AgentControlService:
     _CHANGE_BLOCK = 8
     _CHANGE_PIXEL_DELTA = 24
     # A type or hotkey is visible at 4 changed blocks (two or three
-    # characters of 14 px text); a scroll at 1% of the screen.
+    # characters of 14 px text); a scroll at 1% of the screen, spread over a
+    # tenth of its width (a 100 px pane on the 1000 px agent display).
+    # Measured there: a wheel event at the bottom of a page changed 0.92%,
+    # all of it the overlay scrollbar strip (~1 block column); real scrolls
+    # changed 8-50%.
     _CHANGE_MIN_BLOCKS = 4
     _SCROLL_MIN_SHARE = 0.01
+    _SCROLL_MIN_WIDTH = 0.10
     # Half-width and half-height of the box around a clicked field that typed
     # text has to change. Wide because text starts at the field's left edge,
     # wherever in the field the click landed.
@@ -2652,9 +2658,14 @@ class AgentControlService:
                 grown[:, :-1] |= live[:, 1:]
             moved = moved & ~grown
         changed = int(moved.sum())
+        columns = moved.shape[1]
         out = {
             "changed_blocks": changed,
             "share": changed / moved.size if moved.size else 0.0,
+            # Share of block columns with any change: a page that scrolled
+            # changes across its width, an overlay scrollbar flashing on the
+            # wheel event changes one or two columns at the edge.
+            "width_share": int(moved.any(axis=0).sum()) / columns if columns else 0.0,
             "live_blocks": live_count,
         }
         if near is not None:
@@ -4512,6 +4523,9 @@ Reply ONLY with JSON:
         if action_type in ("click", "right_click"):
             target = (action.target_description or "").strip().lower()
             return f"{action_type}:{target[:24]}" if target else action_type
+        if action_type == "scroll":
+            # By direction: down failing at the bottom of a page says nothing about up.
+            return "scroll:up" if (action.scroll_amount or 0) > 0 else "scroll:down"
         return action_type or "unknown"
 
     def _record_failure_report(

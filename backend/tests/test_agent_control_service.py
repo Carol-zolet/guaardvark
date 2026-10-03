@@ -513,5 +513,20 @@ class TestScreenChange(unittest.TestCase):
         far = self.A._screen_change(self.page, self.page, typed, near=(60, 2000))
         self.assertEqual(far["near_blocks"], 0)
 
+    def test_a_scrollbar_flash_at_the_bottom_of_a_page_is_not_a_scroll(self):
+        flashed = self.page.copy()
+        self.Draw.Draw(flashed).rectangle([392, 0, 399, 399], fill="gray")
+        change = self.A._screen_change(self.page, self.page, flashed)
+        self.assertLess(change["width_share"], self.A._SCROLL_MIN_WIDTH)
+
+    def test_scroll_blocks_are_kept_apart_by_direction(self):
+        from backend.services.agent_control_service import AgentAction
+        svc = self.A()
+        down = AgentAction(action_type="scroll", scroll_amount=-5)
+        svc._record_strategy_outcome(down, True)
+        svc._record_strategy_outcome(down, True)
+        self.assertIn("failed twice", svc._refusal_for(down))
+        self.assertEqual(svc._refusal_for(AgentAction(action_type="scroll", scroll_amount=5)), "")
+
     def test_frames_of_different_sizes_are_not_compared(self):
         self.assertIsNone(self.A._screen_change(self.page, self.page, self.Image.new("RGB", (10, 10))))
