@@ -781,3 +781,27 @@ class TestLessonsAreAboutTheTask(unittest.TestCase):
         with self.app.app_context(), patch("backend.api.memory_api.add_memory") as add:
             self.assertEqual(self.svc._write_session_lessons(), 0)
         add.assert_not_called()
+
+
+class TestSeenMeansListed(unittest.TestCase):
+    """A target counts as seen only when a listed element names it, by whole
+    word; the re-grounding block's own prose does not count."""
+
+    def test_the_instruction_prose_does_not_make_a_missing_target_seen(self):
+        from backend.services.agent_control_service import AgentControlService
+        svc = AgentControlService()
+        svc._stuck_target, svc._stuck_target_count = "red Subscribe button under video", 2
+        observed = (
+            "WORLD_OBSERVED (fresh capture, no task bias, no priming):\n"
+            "- WatchTube logo\n- Search icon\n- Back button\n"
+            "When WORLD_OBSERVED contradicts what you remembered or expected, trust WORLD_OBSERVED."
+        )
+        svc._record_expectation_contradictions([], observed)
+        self.assertEqual([e.element for e in svc._expectation_log], ["red Subscribe button under video"])
+
+    def test_a_listed_element_is_seen(self):
+        from backend.services.agent_control_service import AgentControlService
+        svc = AgentControlService()
+        svc._stuck_target, svc._stuck_target_count = "Subscribe button", 2
+        svc._record_expectation_contradictions([], "WORLD_OBSERVED:\n- Red Subscribe buttons row\n")
+        self.assertEqual(svc._expectation_log, [])
