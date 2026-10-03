@@ -50,12 +50,29 @@ def get_web_access_route():
     return success_response({"allow_web_search": allow})
 
 
+def _screen_agent_running() -> bool:
+    try:
+        from backend.services.agent_control_service import get_agent_control_service
+        return bool(getattr(get_agent_control_service(), "_active", False))
+    except Exception:
+        return False
+
+
 @settings_bp.route("/web_access", methods=["POST"])
 def set_web_access():
     if not request.is_json:
         return error_response("Request must be JSON")
     data = request.get_json()
     allow = bool(data.get("allow_web_search"))
+    if allow and _screen_agent_running():
+        # The agent's browser can open this app's own Settings page, and with
+        # web access off its first move was to go there (2026-10-03). Turning
+        # web access on is for a person, with the agent idle.
+        return error_response(
+            "Web access can't be turned on while the screen agent is running a task. "
+            "Stop the agent first.",
+            status_code=409,
+        )
     try:
         setting = db.session.get(Setting, "allow_web_search")
         if setting:

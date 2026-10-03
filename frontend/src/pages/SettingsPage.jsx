@@ -1681,7 +1681,10 @@ const SettingsPage = () => {
       console.warn("Failed to persist web search setting:", e);
     }
     try {
-      await apiService.setWebAccess(isEnabled);
+      // setWebAccess reports a refused save as {error}, not a throw; read it,
+      // or the switch shows a state the server does not have.
+      const result = await apiService.setWebAccess(isEnabled);
+      if (result?.error) throw new Error(result.error);
     } catch (err) {
       console.warn("Failed to update web access setting:", err);
       setWebSearchEnabled(previous);
@@ -1691,7 +1694,7 @@ const SettingsPage = () => {
         console.warn("Failed to restore web search setting:", e);
       }
       showMessage(
-        "Could not save web access; the setting was not changed.",
+        `Could not save web access; the setting was not changed. ${err?.message || ""}`.trim(),
         "error",
       );
       return;

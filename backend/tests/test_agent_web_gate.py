@@ -124,3 +124,44 @@ class TestAgentNavigate(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestWebAccessRoute(unittest.TestCase):
+    """The Settings route: turning web access on is refused while the screen
+    agent runs, since the agent's browser can open this very page."""
+
+    def setUp(self):
+        from flask import Flask
+        from backend.models import db
+        from backend.api.settings_api import settings_bp
+        self.app = Flask(__name__)
+        self.app.config.update(TESTING=True, SQLALCHEMY_DATABASE_URI="sqlite:///:memory:")
+        db.init_app(self.app)
+        self.app.register_blueprint(settings_bp)
+        with self.app.app_context():
+            db.create_all()
+        self.client = self.app.test_client()
+        prefix = settings_bp.url_prefix or ""
+        self.url = f"{prefix}/web_access"
+
+    def test_on_is_refused_while_the_agent_runs(self):
+        with patch("backend.api.settings_api._screen_agent_running", return_value=True), \
+             patch("backend.utils.agent_web_gate.enforce") as enforce:
+            r = self.client.post(self.url, json={"allow_web_search": True})
+        self.assertEqual(r.status_code, 409)
+        self.assertIn("Stop the agent first", r.get_data(as_text=True))
+        enforce.assert_not_called()
+
+    def test_off_is_always_allowed_and_applied_to_the_agent_browser(self):
+        with patch("backend.api.settings_api._screen_agent_running", return_value=True), \
+             patch("backend.utils.agent_web_gate.enforce", return_value={"allowed": False}) as enforce:
+            r = self.client.post(self.url, json={"allow_web_search": False})
+        self.assertEqual(r.status_code, 200)
+        enforce.assert_called_once_with(False, "Settings: web access")
+
+    def test_on_with_the_agent_idle(self):
+        with patch("backend.api.settings_api._screen_agent_running", return_value=False), \
+             patch("backend.utils.agent_web_gate.enforce", return_value={"allowed": True}) as enforce:
+            r = self.client.post(self.url, json={"allow_web_search": True})
+        self.assertEqual(r.status_code, 200)
+        enforce.assert_called_once_with(True, "Settings: web access")
