@@ -659,6 +659,15 @@ class AgentBrain:
                 emit_fn=emit_fn,
                 session_id=session_id,
             )
+            late = list(getattr(agent_result, "late_notes", None) or [])
+            if late:
+                # Said plainly rather than left to the narration model: the
+                # user should know a note was never acted on.
+                quoted = ", ".join(f"“{t[:120]}”" for t in late)
+                noun, verb = ("note", "it") if len(late) == 1 else ("notes", "them")
+                response = ((response or "").rstrip()
+                            + f"\n\nYour {noun} {quoted} came in after I'd finished, so I didn't act on "
+                              f"{verb}. Send {verb} again if you still want {verb}.")
 
             # Emit complete
             emit_fn("chat:complete", {

@@ -530,3 +530,162 @@ class TestScreenChange(unittest.TestCase):
 
     def test_frames_of_different_sizes_are_not_compared(self):
         self.assertIsNone(self.A._screen_change(self.page, self.page, self.Image.new("RGB", (10, 10))))
+
+
+class TestNotesWhileWorking(unittest.TestCase):
+    """Notes the user sends while a screen task runs: read at the next step,
+    kept in the prompt, and never a new task that kills the running one."""
+
+    def setUp(self):
+        from backend.services.agent_control_service import AgentControlService
+        self.svc = AgentControlService()
+
+    def _running(self, session_id="s1"):
+        self.svc._active = True
+        self.svc._killed = False
+        self.svc._notes_open = True
+        self.svc._task_session_id = session_id
+        self.svc._current_iteration = 2
+
+    def test_no_task_running_means_not_queued(self):
+        self.assertEqual(self.svc.add_steer_note("go left", "s1"),
+                         {"queued": False, "reason": "no_active_task"})
+
+    def test_a_note_is_queued_read_once_and_kept_in_the_prompt(self):
+        self._running()
+        out = self.svc.add_steer_note("  say guaardvark.com instead ", "s1")
+        self.assertTrue(out["queued"])
+        self.assertEqual(self.svc._steer_block(), "", "not in the prompt before the loop reads it")
+        new = self.svc._take_new_notes(4)
+        self.assertEqual([n["text"] for n in new], ["say guaardvark.com instead"])
+        self.assertEqual(self.svc._take_new_notes(5), [], "read once")
+        block = self.svc._steer_block()
+        self.assertIn('NEW (read at step 4) "say guaardvark.com instead"', block)
+        self.svc.add_steer_note("and keep it short", "s1")
+        self.svc._take_new_notes(6)
+        block = self.svc._steer_block()
+        self.assertIn('  - (read at step 4) "say guaardvark.com instead"', block)
+        self.assertIn('NEW (read at step 6) "and keep it short"', block)
+
+    def test_a_note_from_another_chat_is_refused(self):
+        self._running("s1")
+        self.assertEqual(self.svc.add_steer_note("hi", "s2")["reason"], "other_session")
+
+    def test_stop_ends_the_task_and_other_words_do_not(self):
+        self._running()
+        self.assertTrue(self.svc.add_steer_note("Stop!", "s1")["stopping"])
+        self.assertTrue(self.svc._killed)
+        self._running()
+        out = self.svc.add_steer_note("stop clicking the logo and scroll down", "s1")
+        self.assertNotIn("stopping", out)
+        self.assertFalse(self.svc._killed)
+
+    def test_notes_close_when_the_task_finishes(self):
+        self._running()
+        self.svc.add_steer_note("one more thing", "s1")
+        self.svc._notes_open = False
+        self.assertEqual(self.svc.add_steer_note("too late", "s1")["reason"], "no_active_task")
+        self.assertEqual(self.svc._late_notes(), ["one more thing"])
+
+    def test_notes_are_bounded(self):
+        self._running()
+        for i in range(self.svc._MAX_NOTES):
+            self.assertTrue(self.svc.add_steer_note(f"note {i}", "s1")["queued"])
+        self.assertEqual(self.svc.add_steer_note("one too many", "s1")["reason"], "too_many_notes")
+
+    def test_unified_prompt_carries_the_notes(self):
+        from unittest.mock import patch
+        from backend.services.agent_control_service import AgentControlService as A
+        self._running()
+        self.svc._pending_world_observed = ""
+        self.svc._failure_reports = []
+        self.svc._current_budget = None
+        self.svc.add_steer_note("the comment box is further down", "s1")
+        self.svc._take_new_notes(3)
+        with patch.object(A, "_get_desktop_state", staticmethod(lambda display=None: "Desktop: fixture")), \
+             patch.object(A, "_format_dom_grounding_for_prompt", lambda self: ""):
+            p = self.svc._build_unified_prompt("post a comment", [])
+        self.assertIn("NOTES FROM THE USER", p)
+        self.assertLess(p.index("NOTES FROM THE USER"), p.index("Task: post a comment"))
+
+
+class TestPointActions(unittest.TestCase):
+    """click_at and draw: exact screen points from the model, for tasks that
+    give coordinates and for drawing, where the eye has nothing to find."""
+
+    def setUp(self):
+        from backend.services.agent_control_service import AgentControlService
+        self.A = AgentControlService
+        self.svc = AgentControlService()
+
+    def test_click_at_and_draw_parse(self):
+        a = self.svc._parse_decision('{"action": "click_at", "x": 420, "y": 320}').action
+        self.assertEqual((a.action_type, a.coordinates), ("click_at", (420, 320)))
+        a = self.svc._parse_decision('{"action": "click_at", "point": [10.6, 20.2]}').action
+        self.assertEqual(a.coordinates, (11, 20))
+        a = self.svc._parse_decision(
+            '{"action": "draw", "points": [[400, 500], {"x": 450, "y": 530}, "bad", [1]]}').action
+        self.assertEqual(a.points, [(400, 500), (450, 530)])
+
+    def test_drag_reads_its_destination(self):
+        a = self.svc._parse_decision('{"action": "drag", "target_description": "a", "drag_to": "b"}').action
+        self.assertEqual(a.drag_to_description, "b")
+
+    def test_dots_at_different_places_are_not_a_repeat(self):
+        from backend.services.agent_control_service import ActionStep, AgentAction
+        h = [ActionStep(action=AgentAction(action_type="click_at", coordinates=(420, 320))),
+             ActionStep(action=AgentAction(action_type="click_at", coordinates=(640, 320)))]
+        self.assertEqual(self.A._pivot_block(h), "")
+        same = [ActionStep(action=AgentAction(action_type="click_at", coordinates=(420, 320))) for _ in range(2)]
+        self.assertIn("STOP.", self.A._pivot_block(same))
+
+    def test_history_says_where_points_went(self):
+        from backend.services.agent_control_service import ActionStep, AgentAction
+        h = [ActionStep(action=AgentAction(action_type="click_at", coordinates=(420, 320))),
+             ActionStep(action=AgentAction(action_type="draw", points=[(400, 500), (450, 530), (500, 500)]))]
+        lines = self.A._history_block(h, 40).splitlines()
+        self.assertEqual(lines[0], "Done (steps: 2, click attempts: 1):")
+        self.assertEqual(lines[1], "  click_at: at (420, 320) [OK]")
+        self.assertEqual(lines[2], "  draw: 3 points from (400, 500) to (500, 500) [OK]")
+
+    def test_a_field_clicked_by_point_can_be_typed_into(self):
+        from backend.services.agent_control_service import ActionStep, AgentAction
+        self.svc._action_history = [ActionStep(action=AgentAction(action_type="click_at", coordinates=(300, 700)),
+                                               result={"success": True})]
+        self.assertEqual(self.svc._refusal_for(AgentAction(action_type="type", text="hi")), "")
+        self.assertEqual(self.svc._field_point, (300, 700))
+
+    def test_the_rule_names_the_screen_size(self):
+        self.svc._screen_size = (1000, 1000)
+        self.assertIn("the screen is 1000x1000", self.svc._point_rule())
+
+
+class TestFailedToolsSayWhy(unittest.TestCase):
+    """A failed tool's own explanation reaches the model; a block says how
+    long it lasts."""
+
+    def test_output_stands_in_for_a_missing_error(self):
+        from backend.services.agent_tools import ToolResult
+        from backend.utils.agent_output_parser import format_tool_result_for_llm
+        r = ToolResult(success=False, output="Task failed after 17 steps (491.3s): timeout")
+        xml = format_tool_result_for_llm("agent_task_execute", r, format="xml")
+        self.assertIn("Error: Task failed after 17 steps (491.3s): timeout", xml)
+        self.assertNotIn("Error: None", xml)
+
+    def test_error_and_output_both_reach_the_model(self):
+        import json
+        from backend.services.agent_tools import ToolResult
+        from backend.utils.agent_output_parser import format_tool_result_for_llm
+        r = ToolResult(success=False, error="Task failed: timeout", output="Last steps: click at (1, 2)")
+        obs = json.loads(format_tool_result_for_llm("agent_task_execute", r, format="json"))
+        self.assertEqual(obs["error"], "Task failed: timeout")
+        self.assertEqual(obs["output"], "Last steps: click at (1, 2)")
+
+    def test_block_message_names_its_scope(self):
+        from backend.services.tool_execution_guard import ToolExecutionGuard
+        g = ToolExecutionGuard(max_failures_per_tool=2, scope="for the rest of this reply")
+        for _ in range(2):
+            g.record_result("agent_task_execute", {"task": "x"}, False, "timeout", 1)
+        allowed, why = g.check_call("agent_task_execute", {"task": "y"})
+        self.assertFalse(allowed)
+        self.assertIn("is disabled for the rest of this reply", why)
