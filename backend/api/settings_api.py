@@ -70,7 +70,11 @@ def set_web_access():
         db.session.rollback()
         current_app.logger.error(f"Failed to update web access setting: {e}")
         return error_response("Failed to update setting", status_code=500)
-    return success_response({"allow_web_search": allow})
+    # The screen agent's browser follows the setting too; without this it
+    # kept reaching any site with web access off.
+    from backend.utils.agent_web_gate import enforce
+    agent_browser = enforce(allow, "Settings: web access")
+    return success_response({"allow_web_search": allow, "agent_browser": agent_browser})
 
 
 @settings_bp.route("/address_provider", methods=["GET"])

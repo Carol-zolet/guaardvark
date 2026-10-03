@@ -200,6 +200,16 @@ const KillSwitchModal = ({ open, onClose }) => {
               Successfully killed {killResult.total_killed} processes
               {killResult.total_failed > 0 && `, ${killResult.total_failed} failed`}
             </Alert>
+
+            {killResult.web_access && (
+              <Alert severity={killResult.web_access.allow_web_search === false ? "warning" : "error"} sx={{ mb: 2 }}>
+                {killResult.web_access.allow_web_search === false
+                  ? "Web access is now off: no tool, agent task or agent browser can reach outside sites. It stays off until you turn it back on in Settings."
+                  : `Web access could not be turned off: ${killResult.web_access.error || "unknown error"}`}
+                {killResult.web_access.agent_browser?.task_stopped && " The running agent task was stopped."}
+                {killResult.web_access.agent_browser?.browser_closed > 0 && " The agent's browser was closed."}
+              </Alert>
+            )}
             
             {killResult.killed_processes.length > 0 && (
               <List dense>

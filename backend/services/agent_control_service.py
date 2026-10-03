@@ -704,6 +704,31 @@ class AgentControlService:
             return [n["text"] for n in self._steer_notes if n["seen_at_step"] is None]
 
     @staticmethod
+    def _is_local_url(url: str) -> bool:
+        from urllib.parse import urlparse
+        raw = (url or "").strip()
+        u = urlparse(raw)
+        if u.scheme in ("file", "about", "moz-extension", "chrome"):
+            return True
+        if "//" not in raw:
+            # "localhost:5173/x" or "example.com": a host with no scheme
+            u = urlparse("http://" + raw)
+        return (u.hostname or "").lower() in ("localhost", "127.0.0.1", "::1")
+
+    def _outside_allowed(self, url: str) -> bool:
+        """Web access (Settings) for a navigate. The agent browser refuses
+        outside sites itself when it is off (backend/utils/agent_web_gate.py);
+        this says so in words before the browser shows an error page."""
+        if self._is_local_url(url):
+            return True
+        try:
+            from backend.utils.settings_utils import web_access_block_reason
+            with self._app_context():
+                return web_access_block_reason("open outside sites") is None
+        except Exception:
+            return True
+
+    @staticmethod
     def _point_identity(action) -> tuple:
         """Where a click_at or draw went, for telling repeats apart: ten dots at
         ten places are not one action repeated ten times."""
@@ -5682,6 +5707,9 @@ Reply ONLY with JSON:
             return "the hotkey had no keys"
         if training_mode or kind in ("done", "wait", ""):
             return ""
+        if kind == "navigate" and not self._outside_allowed(action.url):
+            return ("web access is off in Settings, so this browser opens local pages only; "
+                    "the site was not opened")
         if kind in ("click_at", "draw") and not self._points_allowed:
             return (f"{kind} is for coordinates the task gives or for drawing; to click something "
                     f"on screen, use click with a target_description for the eye to find")
