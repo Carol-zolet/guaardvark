@@ -738,3 +738,46 @@ class TestDrawingReachesTheScreen(unittest.TestCase):
         self.assertEqual((a.action_type, a.points), ("draw", [(1, 2), (3, 4)]))
         a = svc._parse_decision('{"action": "click_point", "x": 5, "y": 6}').action
         self.assertEqual((a.action_type, a.coordinates), ("click_at", (5, 6)))
+
+
+class TestLessonsAreAboutTheTask(unittest.TestCase):
+    """Only lessons about what the task aimed at are written. Replays the
+    2026-10-02 YouTube comment run: its targets and the 7 lessons it saved."""
+
+    def setUp(self):
+        from flask import Flask
+        from backend.services.agent_control_service import (
+            AgentControlService, ActionStep, AgentAction, Expectation)
+        self.svc = AgentControlService()
+        self.svc._action_history = [
+            ActionStep(action=AgentAction(action_type="navigate", url="https://youtube.com")),
+            ActionStep(action=AgentAction(action_type="click", target_description="first video thumbnail")),
+            ActionStep(action=AgentAction(action_type="type", text="Check out the Guaardvark project")),
+            ActionStep(action=AgentAction(action_type="click", target_description="comment input field"),
+                       failed=True),
+        ]
+        saved = ["comment input field", "thumbs up icon left of dislike", "Reply button under comment",
+                 "empty Add a comment input", "first video result", "desktop", "Firefox icon"]
+        self.svc._expectation_log = [
+            Expectation(element=e, expected_visible=True, observed_visible=False, source="self_knowledge",
+                        source_line=None, confidence=0.5)
+            for e in saved
+        ]
+        self.app = Flask(__name__)
+
+    def test_only_task_targets_are_written(self):
+        from unittest.mock import patch
+        written = []
+        with self.app.app_context(), \
+             patch("backend.api.memory_api.add_memory",
+                   side_effect=lambda **kw: written.append(kw["metadata"]["element"]) or object()):
+            n = self.svc._write_session_lessons()
+        self.assertEqual(n, 2)
+        self.assertEqual(written, ["comment input field", "empty Add a comment input"])
+
+    def test_no_targets_means_no_lessons(self):
+        from unittest.mock import patch
+        self.svc._action_history = []
+        with self.app.app_context(), patch("backend.api.memory_api.add_memory") as add:
+            self.assertEqual(self.svc._write_session_lessons(), 0)
+        add.assert_not_called()
