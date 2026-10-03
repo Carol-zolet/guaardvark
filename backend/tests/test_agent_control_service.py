@@ -353,3 +353,165 @@ class TestStallRule(unittest.TestCase):
         self.svc.config.max_stall_steps = 2
         self.assertEqual(self._run([_stepped("A"), _stepped("A"), _stepped("A")]), 3)
 
+
+class TestHonestActions(unittest.TestCase):
+    """What the loop sends and what it tells the model, from the 2026-10-02
+    YouTube comment run (episode 5e877afc): scrolls with no amount sent no
+    wheel clicks, text typed with nothing focused hit YouTube's single-key
+    shortcuts, and a target the eye never found was retried 16 times."""
+
+    def setUp(self):
+        from backend.services.agent_control_service import AgentControlService
+        self.svc = AgentControlService()
+        self.svc._action_history = []
+
+    def _add(self, kind, target="", coords=None, failed=False, result=None, text="", keys=None):
+        from backend.services.agent_control_service import ActionStep, AgentAction
+        a = AgentAction(action_type=kind, target_description=target, text=text, keys=keys or [])
+        a.coordinates = coords
+        st = ActionStep(action=a, result=result if result is not None else {"success": not failed},
+                        failed=failed)
+        self.svc._action_history.append(st)
+        return st
+
+    def _refusal(self, kind, **kw):
+        from backend.services.agent_control_service import AgentAction
+        return self.svc._refusal_for(AgentAction(action_type=kind, **kw))
+
+    def test_scroll_without_an_amount_scrolls_down(self):
+        parse = self.svc._parse_decision
+        self.assertEqual(parse('{"action": "scroll"}').action.scroll_amount, -5)
+        self.assertEqual(parse('{"action": "scroll", "scroll_amount": 0}').action.scroll_amount, -5)
+        self.assertEqual(parse('{"action": "scroll", "scroll_amount": 3}').action.scroll_amount, 3)
+        self.assertEqual(parse('{"action": "scroll", "scroll_amount": 4, "direction": "down"}').action.scroll_amount, -4)
+        self.assertEqual(parse('{"action": "scroll", "direction": "up"}').action.scroll_amount, 5)
+        self.assertEqual(parse('{"action": "scroll", "scroll_amount": -99}').action.scroll_amount, -15)
+
+    def test_wait_keeps_its_seconds_in_scroll_amount(self):
+        self.assertEqual(self.svc._parse_decision('{"action": "wait"}').action.scroll_amount, 0)
+
+    def test_type_with_no_field_clicked_is_not_sent(self):
+        self._add("click", "first video thumbnail", coords=(321, 322),
+                  result={"success": True, "click_issued": True, "verified": True})
+        self._add("scroll", result={"success": True, "verified": True})
+        self.assertIn("no text field has been clicked", self._refusal("type", text="Check out"))
+
+    def test_type_after_clicking_something_that_is_not_a_field_is_not_sent(self):
+        self._add("click", "first video thumbnail", coords=(321, 322),
+                  result={"success": True, "click_issued": True})
+        self.assertIn("not a text field", self._refusal("type", text="Check out"))
+
+    def test_type_after_clicking_a_field_is_sent_and_remembers_where(self):
+        self._add("click", "Add a comment box", coords=(400, 700),
+                  result={"success": True, "click_issued": True})
+        self.assertEqual(self._refusal("type", text="hello"), "")
+        self.assertEqual(self.svc._field_point, (400, 700))
+
+    def test_type_after_a_focus_hotkey_is_sent(self):
+        self._add("hotkey", keys=["ctrl", "l"])
+        self.assertEqual(self._refusal("type", text="example.com"), "")
+
+    def test_enter_after_a_failed_type_is_not_sent(self):
+        self._add("type", text="hello", failed=True,
+                  result={"success": False, "reason": "typed_text_not_in_field"})
+        self.assertIn("Enter would act on the page", self._refusal("hotkey", keys=["Return"]))
+
+    def test_a_hotkey_with_no_keys_is_not_sent(self):
+        self.assertEqual(self._refusal("hotkey", keys=[]), "the hotkey had no keys")
+
+    def test_a_target_not_found_three_times_is_held_back_and_six_stops(self):
+        nf = {"success": False, "target_found": False, "click_issued": False,
+              "reason": "target_not_visible"}
+        for _ in range(2):
+            self._add("click", "comment input field", failed=True, result=dict(nf))
+            self.svc._note_not_found("comment input field")
+        self.assertEqual(self.svc._banned_targets, {})
+        st = self._add("click", "comment input field", failed=True, result=dict(nf))
+        self.svc._note_not_found("comment input field")
+        self.assertEqual(self.svc._step_status(st), "NOT ON SCREEN")
+        self.assertIn("comment input field", self.svc._banned_targets)
+        self.assertIn("was not on screen the last 3 times",
+                      self._refusal("click", target_description="The comment input field"))
+        self.assertEqual(self._refusal("click", target_description="Add a comment box"), "")
+        self.assertIn('NOT ON SCREEN: "comment input field" (3 looks)', self.svc._not_found_block())
+        self.assertIsNone(self.svc._target_given_up())
+        for _ in range(3):
+            self.svc._note_not_found("comment input field")
+        self.assertEqual(self.svc._target_given_up(), ("comment input field", 6))
+        self.assertEqual(self.svc._stop_rule_from_reason("target_not_found: 'x' was not on screen"),
+                         "not_found")
+
+    def test_a_cooldown_blocks_the_failed_target_not_every_click(self):
+        from backend.services.agent_control_service import AgentAction
+        post = AgentAction(action_type="click", target_description="Post button")
+        self.svc._record_strategy_outcome(post, True)
+        self.svc._record_strategy_outcome(post, True)
+        self.assertIn("failed twice", self._refusal("click", target_description="Post button"))
+        self.assertEqual(self._refusal("click", target_description="Cancel button"), "")
+
+    def test_refused_and_not_found_steps_say_so_to_the_model(self):
+        st = self._add("type", text="hi", failed=True,
+                       result={"success": False, "refused": True, "refusal": "no text field has been clicked"})
+        self.assertEqual(self.svc._step_status(st), "NOT SENT")
+        signal = self.svc._semantic_progress_signal(st.action, st.result, failed=True, pixel_diff=None)
+        self.assertEqual(signal.label, "action_refused")
+        nf = self._add("click", "comment input field", failed=True,
+                       result={"success": False, "target_found": False, "reason": "target_not_visible"})
+        signal = self.svc._semantic_progress_signal(nf.action, nf.result, failed=True, pixel_diff=None)
+        self.assertIn("is not on screen", signal.evidence)
+
+    def test_pivot_block_offers_no_named_click_targets(self):
+        for _ in range(2):
+            self._add("click", "comment input field", failed=True)
+        block = self.svc._pivot_block(self.svc._action_history)
+        self.assertIn("STOP.", block)
+        self.assertNotIn('"target_description"', block)
+
+    def test_pivot_block_does_not_offer_the_key_that_just_failed(self):
+        for _ in range(2):
+            self._add("hotkey", keys=["Page_Down"], failed=True)
+        block = self.svc._pivot_block(self.svc._action_history)
+        self.assertNotIn('"Page_Down"', block)
+        self.assertIn('"End"', block)
+
+
+class TestScreenChange(unittest.TestCase):
+    """The before/after check that decides whether a type, scroll or hotkey
+    did anything, with what moves by itself (a playing video) left out."""
+
+    def setUp(self):
+        from PIL import Image, ImageDraw
+        from backend.services.agent_control_service import AgentControlService
+        self.A = AgentControlService
+        self.Image, self.Draw = Image, ImageDraw
+        self.page = Image.new("RGB", (400, 400), "white")
+        d = ImageDraw.Draw(self.page)
+        for y in range(200, 400, 20):
+            d.text((10, y), "some page text on a line", fill="black")
+
+    def _video(self, seed):
+        out = self.page.copy()
+        self.Draw.Draw(out).rectangle([0, 0, 399, 150], fill=(seed * 60 % 255, 90, 160))
+        return out
+
+    def test_a_playing_video_is_not_a_change(self):
+        change = self.A._screen_change(self._video(1), self._video(2), self._video(3))
+        self.assertEqual(change["changed_blocks"], 0)
+        self.assertGreater(change["live_blocks"], 0)
+
+    def test_a_scroll_that_moved_the_page_is_a_change(self):
+        moved = self.Image.new("RGB", (400, 400), "white")
+        moved.paste(self.page.crop((0, 100, 400, 400)), (0, 0))
+        change = self.A._screen_change(self.page, self.page, moved)
+        self.assertGreaterEqual(change["share"], self.A._SCROLL_MIN_SHARE)
+
+    def test_typed_text_is_counted_near_the_field(self):
+        typed = self.page.copy()
+        self.Draw.Draw(typed).text((20, 170), "hello there", fill="black")
+        change = self.A._screen_change(self.page, self.page, typed, near=(60, 175))
+        self.assertGreaterEqual(change["near_blocks"], self.A._CHANGE_MIN_BLOCKS)
+        far = self.A._screen_change(self.page, self.page, typed, near=(60, 2000))
+        self.assertEqual(far["near_blocks"], 0)
+
+    def test_frames_of_different_sizes_are_not_compared(self):
+        self.assertIsNone(self.A._screen_change(self.page, self.page, self.Image.new("RGB", (10, 10))))

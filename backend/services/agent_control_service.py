@@ -419,6 +419,14 @@ class AgentControlService:
         self._strategy_cooldowns: Dict[str, int] = {}
         self._last_failed_strategy: str = ""
         self._same_strategy_failures: int = 0
+        # Per task: how often the eye looked for a click target and found
+        # nothing (keyed by _target_key), and the targets held back from
+        # clicking until the screen next changes (key -> name as written).
+        self._not_found_counts: Dict[str, int] = {}
+        self._banned_targets: Dict[str, str] = {}
+        # Where the field being typed into was clicked; the typed text has to
+        # show up near it.
+        self._field_point: Optional[Tuple[int, int]] = None
         self._pending_failure_label: str = ""
         self._recovery_memory: Dict[str, Dict[str, int]] = {}
         # Rolling window of structured failure reports for prompt context.
@@ -559,6 +567,9 @@ class AgentControlService:
             keys = getattr(action, "keys", None) or []
             return f"hotkey — {'+'.join(keys) or '(none)'}"
         if kind == "scroll":
+            amount = int(getattr(action, "scroll_amount", 0) or 0)
+            if amount:
+                return f"scroll — {'down' if amount < 0 else 'up'} {abs(amount)}"
             return "scroll"
         if kind == "wait":
             return "wait"
@@ -731,6 +742,13 @@ class AgentControlService:
             self._expectation_log = []
             self._session_expectations = None
             self._click_history = []
+            # Blocks and miss counts belong to the task that earned them.
+            self._strategy_cooldowns = {}
+            self._last_failed_strategy = ""
+            self._same_strategy_failures = 0
+            self._not_found_counts = {}
+            self._banned_targets = {}
+            self._field_point = None
 
         # Attempts per click target this task: the second try at the same
         # target asks the servo for precision (arms its correction loop).
@@ -943,8 +961,10 @@ class AgentControlService:
                         logger.error(f"[AGENT][STEP {iteration+1}][UNIFIED] Vision+decision failed: {result.error}")
                         consecutive_failures += 1
                         continue
-                    scene_desc = result.description[:200]
-                    logger.debug(f"[AGENT][STEP {iteration+1}][UNIFIED] {scene_desc}")
+                    # The whole reply goes on the step: cut to 200 characters,
+                    # the episode lost fields such as scroll_amount.
+                    scene_desc = result.description
+                    logger.debug(f"[AGENT][STEP {iteration+1}][UNIFIED] {scene_desc[:200]}")
                     decision = self._parse_decision(result.description)
                 else:
                     # SPLIT MODE: Separate SEE → ASSESS → THINK pipeline
@@ -994,11 +1014,17 @@ class AgentControlService:
                     f"keys={decision.action.keys or ''} "
                     f"reasoning_len={len(decision.action.reasoning or '')}"
                 )
-                self._emit_thinking(
-                    iteration=iteration + 1,
-                    label=self._build_action_label(decision.action),
-                    reasoning=decision.action.reasoning or "",
-                )
+                # Decided before the thinking line goes out, so a step that is
+                # not sent is one entry in the trail, not two with the same number.
+                refusal = ""
+                if not decision.task_complete and not decision.stuck:
+                    refusal = self._refusal_for(decision.action, training_mode=training_mode)
+                label = self._build_action_label(decision.action)
+                reasoning = decision.action.reasoning or ""
+                if refusal:
+                    label = f"{label} — not sent"
+                    reasoning = (reasoning + "\n\n" if reasoning else "") + f"Not sent: {refusal}"
+                self._emit_thinking(iteration=iteration + 1, label=label, reasoning=reasoning)
 
                 if decision.task_complete and training_mode:
                     # Training mode: ignore "done" — force the model to keep clicking
@@ -1220,29 +1246,6 @@ class AgentControlService:
                     consecutive_failures += 1
                     continue
 
-                # Strategy-level anti-looping: if an action class failed repeatedly,
-                # put it on short cooldown and force a pivot step.
-                blocked_steps = self._strategy_cooldowns.get(decision.action.action_type, 0)
-                if blocked_steps > 0 and decision.action.action_type not in ("done", "wait"):
-                    blocked = decision.action.action_type
-                    logger.warning(
-                        f"[AGENT][STEP {iteration+1}][PIVOT] Blocking repeated strategy "
-                        f"'{blocked}' for {blocked_steps} more step(s); forcing wait"
-                    )
-                    self._emit_thinking(
-                        iteration=iteration + 1,
-                        label=f"pivot — '{blocked}' blocked, waiting",
-                        reasoning=f"Strategy '{blocked}' failed repeatedly; forcing wait+re-observe before trying a new tactic.",
-                    )
-                    decision.action.action_type = "wait"
-                    decision.action.scroll_amount = 1
-                    decision.action.reasoning = (
-                        f"strategy cooldown active for {blocked}; wait and re-observe before new tactic"
-                    )
-                    decision.action.target_description = ""
-                    decision.action.text = ""
-                    decision.action.keys = []
-
                 # 4. ACT — Execute via servo (for clicks) or direct (for type/hotkey/scroll)
                 # In mouse_only mode, reject any keyboard-driven action. Mouse-driven
                 # gestures (click family + drag + hover) are all allowed.
@@ -1250,7 +1253,8 @@ class AgentControlService:
                     "click", "right_click", "double_click", "triple_click",
                     "drag", "hover", "move", "scroll", "done"
                 )
-                if getattr(self, '_mouse_only', False) and decision.action.action_type not in _MOUSE_ONLY_ALLOWED:
+                if (not refusal and getattr(self, '_mouse_only', False)
+                        and decision.action.action_type not in _MOUSE_ONLY_ALLOWED):
                     logger.info(f"[AGENT][STEP {iteration+1}][ACT] Mouse-only: rejecting {decision.action.action_type}")
                     decision.action.action_type = "click"
                     if not decision.action.target_description:
@@ -1260,7 +1264,7 @@ class AgentControlService:
                 # A click past the task's own stated limit is never sent. The
                 # run ends instead: a task that says "5 click attempts total"
                 # was failed by a 6th click, whatever the screen shows after it.
-                if (self._click_budget is not None and not training_mode
+                if (not refusal and self._click_budget is not None and not training_mode
                         and decision.action.action_type in self._CLICK_FAMILY):
                     used = sum(1 for s in self._action_history
                                if s.action.action_type in self._CLICK_FAMILY)
@@ -1286,11 +1290,29 @@ class AgentControlService:
                             total_time_seconds=time.time() - start_time
                         ))
 
-                if decision.action.action_type in ("click", "right_click"):
+                if refusal:
+                    # Not sent. The model reads why on its next step, as a
+                    # [NOT SENT] line and in the failure evidence.
+                    logger.warning(
+                        f"[AGENT][STEP {iteration+1}][REFUSE] {decision.action.action_type} "
+                        f"{(decision.action.target_description or decision.action.text or '')[:60]!r} "
+                        f"not sent: {refusal}"
+                    )
+                    result = {
+                        "success": False, "refused": True, "refusal": refusal,
+                        "reason": "action_refused", "click_issued": False,
+                        "post_action_effect": "not_checked",
+                    }
+                    failed = True
+                    pixel_diff_value = None
+                    if (decision.action.action_type in self._CLICK_FAMILY
+                            and self._target_key(decision.action.target_description) in self._banned_targets):
+                        self._note_not_found(decision.action.target_description)
+                elif decision.action.action_type in ("click", "right_click"):
                     button = "right" if decision.action.action_type == "right_click" else "left"
                     target = decision.action.target_description
                     pixel_diff_value: Optional[float] = None
-                    
+
                     # DOM match is a heuristic optimization, not a hard guard.
                     # If it fails, we still let the vision model try — it might
                     # be a desktop icon or OS element Firefox's DOM can't see.
@@ -1335,6 +1357,10 @@ class AgentControlService:
                         self._click_history.append(decision.action.coordinates)
                         result = dict(servo_result)
                         failed = not servo_result.get("success", False)
+                        if (not servo_result.get("target_found", True)
+                                and servo_result.get("reason") == "target_not_visible"
+                                and not training_mode):
+                            self._note_not_found(target)
 
                     # Special handling for desktop / launcher icon clicks (e.g. "Firefox icon").
                     # The servo DPC at the click site may see a small "icon pressed" animation
@@ -1566,6 +1592,17 @@ class AgentControlService:
                         f"[{'OK' if not failed else 'FAIL'}]"
                     )
                 else:
+                    kind = decision.action.action_type
+                    checks_change = kind in ("type", "hotkey", "scroll")
+                    # The frame just before acting. Compared with the frame the
+                    # model decided on, it shows what moves by itself (a playing
+                    # video, a spinner), which the after-check leaves out.
+                    pre_shot = None
+                    if checks_change:
+                        try:
+                            pre_shot, _ = self._capture_with_retry(screen)
+                        except Exception as e:
+                            logger.debug(f"[AGENT][STEP {iteration+1}][VERIFY] pre-action capture failed: {e}")
                     result = self._execute_action(decision.action, screen)
                     failed = not result.get("success", False)
                     pixel_diff_value: Optional[float] = None
@@ -1573,33 +1610,45 @@ class AgentControlService:
                     # Post-action observation: wait for the UI to update, then
                     # take a verification screenshot so the NEXT iteration's
                     # SEE step reflects the actual outcome of this action.
-                    if not failed and decision.action.action_type in ("type", "hotkey", "scroll"):
+                    if not failed and checks_change:
                         time.sleep(0.5)
                         post_shot, _ = self._capture_with_retry(screen)
-                        # Compare before/after to detect if the action had any visible effect
-                        if screenshot is not None and post_shot is not None:
-                            import numpy as np
-                            before_mean = np.array(screenshot).mean()
-                            after_mean = np.array(post_shot).mean()
-                            pixel_diff = abs(after_mean - before_mean)
-                            pixel_diff_value = float(pixel_diff)
-                            # A scroll that produced no pixel delta means the page
-                            # didn't move — either we're at the bottom, the cursor
-                            # is over a non-scrollable region (sidebar, overlay), or
-                            # Firefox doesn't have keyboard focus. Treat it as a
-                            # failed action so the loop-breaker (and the LLM's next
-                            # prompt context) sees the scroll didn't help, instead
-                            # of cheerfully logging "[OK]" three times in a row
-                            # before aborting as loop_detected_no_progress.
-                            ineffective = (
-                                (decision.action.action_type == "type" and pixel_diff < 0.05)
-                                or (decision.action.action_type == "scroll" and pixel_diff < 0.01)
-                            )
+                        near = self._field_point if kind == "type" else None
+                        change = self._screen_change(screenshot, pre_shot, post_shot, near=near)
+                        if change is None:
+                            result["verified"] = False
+                        else:
+                            result["screen_change"] = change
+                            # Percent of the screen that changed, live areas left out.
+                            pixel_diff = round(change["share"] * 100, 3)
+                            pixel_diff_value = pixel_diff
+                            if kind == "scroll":
+                                moved = change["share"] >= self._SCROLL_MIN_SHARE
+                            elif kind == "type":
+                                # One or two characters can't change four blocks.
+                                need = min(self._CHANGE_MIN_BLOCKS,
+                                           max(1, len((decision.action.text or "").strip())))
+                                moved = change.get("near_blocks", change["changed_blocks"]) >= need
+                            else:
+                                moved = change["changed_blocks"] >= self._CHANGE_MIN_BLOCKS
+                            # A scroll that moved nothing: at the end of the page,
+                            # or the cursor is over a pane that doesn't scroll.
+                            # Text that changed nothing near the field it was
+                            # meant for went somewhere else; on a page with
+                            # single-key shortcuts that is the page acting on it.
+                            # Both are failed steps so the next THINK knows.
+                            ineffective = kind in ("type", "scroll") and not moved
                             if ineffective:
+                                if kind == "type":
+                                    result["reason"] = (
+                                        "typed_text_not_in_field"
+                                        if change["changed_blocks"] >= self._CHANGE_MIN_BLOCKS
+                                        else "typed_text_not_visible"
+                                    )
                                 logger.warning(
                                     f"[AGENT][STEP {iteration+1}][VERIFY] "
-                                    f"{decision.action.action_type} produced no visible change "
-                                    f"(delta={pixel_diff:.3f}) — flagging as failed so the LLM "
+                                    f"{kind} produced no visible change where expected "
+                                    f"({change}) — flagging as failed so the LLM "
                                     f"sees the previous attempt was ineffective"
                                 )
                                 result["verified"] = False
@@ -1616,14 +1665,14 @@ class AgentControlService:
                                 # nudge, not a hard reroute. A fuller fix resolves the scroll
                                 # target from the DOM (or focuses the scrollable pane first)
                                 # rather than relying on the model to heed the hint.
-                                if decision.action.action_type == "scroll":
+                                if kind == "scroll":
                                     self._pending_world_observed = (
                                         "OBSERVED: your last scroll moved NOTHING — the page did "
                                         "not scroll. Do NOT scroll again. Instead, either click a "
-                                        "specific element from the 'Interactive elements on this "
-                                        "page' list above (e.g. the comment/composer box), or press "
-                                        "Page_Down / End to jump. If the target isn't listed yet, "
-                                        "click the page body once to give it keyboard focus, then retry."
+                                        "specific element you can see (e.g. the comment/composer "
+                                        "box), or press Page_Down / End to jump. If that does "
+                                        "nothing, click the page body once to give it keyboard "
+                                        "focus, then retry."
                                     )
                             else:
                                 # type and scroll reach here only past their change
@@ -1631,11 +1680,9 @@ class AgentControlService:
                                 # so it is verified only if the screen moved: a Home
                                 # on a page already at the top is not progress, and
                                 # counting it as one reset the stall guard.
-                                result["verified"] = (decision.action.action_type != "hotkey"
-                                                      or pixel_diff >= 0.01)
+                                result["verified"] = moved
                                 logger.debug(f"[AGENT][STEP {iteration+1}][VERIFY] "
-                                             f"{decision.action.action_type} delta={pixel_diff:.2f} "
-                                             f"verified={result['verified']}")
+                                             f"{kind} change={change} verified={moved}")
 
                     status_icon = "OK" if not failed else "FAIL"
                     detail_len = len(decision.action.text or "")
@@ -1654,7 +1701,14 @@ class AgentControlService:
                 )
                 self._last_progress_signal = signal
                 result["semantic_progress"] = asdict(signal)
-                self._record_strategy_outcome(decision.action, failed)
+                if not result.get("refused"):
+                    # A step that was not sent says nothing about whether the
+                    # action works; only executed failures earn a block.
+                    self._record_strategy_outcome(decision.action, failed)
+                if not failed and result.get("verified"):
+                    # The screen changed, so a target the eye could not find
+                    # may be there now.
+                    self._banned_targets.clear()
                 self._record_recovery_memory(signal, decision.action, failed)
                 self._record_failure_report(
                     iteration=iteration + 1,
@@ -1702,6 +1756,25 @@ class AgentControlService:
                     failed=failed,
                 )
                 self._action_history.append(step)
+
+                # A target the eye has looked for this many times without
+                # finding it is not going to appear by asking again.
+                given_up = self._target_given_up()
+                if given_up:
+                    name, looks = given_up
+                    logger.warning(f"[AGENT][NOT_FOUND] {name!r} not on screen in {looks} looks; stopping")
+                    self._emit_thinking(
+                        iteration=iteration + 1,
+                        label=f"stopping — '{name[:40]}' never found",
+                        reasoning=(f"The eye looked for '{name}' {looks} times and did not find it "
+                                   f"on screen, so the run stops here instead of asking again."),
+                    )
+                    return finish(AgentResult(
+                        success=False,
+                        reason=f"target_not_found: '{name[:60]}' was not on screen in {looks} looks",
+                        steps=self._action_history,
+                        total_time_seconds=time.time() - start_time,
+                    ))
 
                 # 5b. EARLY DONE — after a successful action, check if the
                 # task goal is obviously met based on desktop state. Saves
@@ -2270,6 +2343,7 @@ class AgentControlService:
         ("loop_detected", "loop"),
         ("budget_exhausted", "budget"),
         ("click_budget_spent", "budget"),
+        ("target_not_found", "not_found"),
         ("error", "error"),
     )
 
@@ -2516,6 +2590,80 @@ class AgentControlService:
         import numpy as np
         arr = np.array(image)
         return arr.mean() < 10  # Average pixel value below 10 = effectively black
+
+    # The before/after comparison works on 8 px blocks: a block changed when
+    # any pixel in it moved by more than 24 grey levels.
+    _CHANGE_BLOCK = 8
+    _CHANGE_PIXEL_DELTA = 24
+    # A type or hotkey is visible at 4 changed blocks (two or three
+    # characters of 14 px text); a scroll at 1% of the screen.
+    _CHANGE_MIN_BLOCKS = 4
+    _SCROLL_MIN_SHARE = 0.01
+    # Half-width and half-height of the box around a clicked field that typed
+    # text has to change. Wide because text starts at the field's left edge,
+    # wherever in the field the click landed.
+    _FIELD_BOX = (450, 200)
+
+    @classmethod
+    def _changed_blocks(cls, a, b):
+        """Block grid of where frame ``b`` differs from frame ``a``, or None."""
+        import numpy as np
+        if a is None or b is None or a.size != b.size:
+            return None
+        ga = np.asarray(a.convert("L"), dtype=np.int16)
+        gb = np.asarray(b.convert("L"), dtype=np.int16)
+        s = cls._CHANGE_BLOCK
+        h, w = (ga.shape[0] // s) * s, (ga.shape[1] // s) * s
+        if not h or not w:
+            return None
+        diff = np.abs(ga[:h, :w] - gb[:h, :w]) > cls._CHANGE_PIXEL_DELTA
+        return diff.reshape(h // s, s, w // s, s).any(axis=(1, 3))
+
+    @classmethod
+    def _screen_change(cls, seen, before, after, near: Optional[Tuple[int, int]] = None):
+        """What an action changed on screen, leaving out what moves by itself.
+
+        ``seen`` is the frame the model decided on, ``before`` the one taken
+        just before acting. Blocks that differ between those two (a playing
+        video, a spinner, a blinking caret) changed without the action and
+        are not counted. This replaced a comparison of the whole screen's
+        mean brightness, which a playing video passed every time: a scroll
+        that moved nothing and text that reached no field both read as done.
+
+        Returns {"changed_blocks", "share", "live_blocks"} plus "near_blocks"
+        (changes inside _FIELD_BOX around ``near``) when ``near`` is given;
+        None when the frames can't be compared.
+        """
+        moved = cls._changed_blocks(before, after)
+        if moved is None:
+            return None
+        live = cls._changed_blocks(seen, before)
+        live_count = 0
+        if live is not None:
+            live_count = int(live.sum())
+            grown = live.copy()
+            if live_count >= 20:
+                # One block of margin, so the edge of a playing video counts
+                # as live. Not for a few blocks (a blinking caret): grown, it
+                # would hide the first characters typed next to it.
+                grown[1:, :] |= live[:-1, :]
+                grown[:-1, :] |= live[1:, :]
+                grown[:, 1:] |= live[:, :-1]
+                grown[:, :-1] |= live[:, 1:]
+            moved = moved & ~grown
+        changed = int(moved.sum())
+        out = {
+            "changed_blocks": changed,
+            "share": changed / moved.size if moved.size else 0.0,
+            "live_blocks": live_count,
+        }
+        if near is not None:
+            s = cls._CHANGE_BLOCK
+            bx, by = cls._FIELD_BOX
+            x0, x1 = max(0, (near[0] - bx) // s), max(0, (near[0] + bx) // s + 1)
+            y0, y1 = max(0, (near[1] - by) // s), max(0, (near[1] + by) // s + 1)
+            out["near_blocks"] = int(moved[y0:y1, x0:x1].sum())
+        return out
 
     def _capture_with_retry(self, screen, max_retries: int = 3) -> Tuple[Image.Image, Tuple[int, int]]:
         """Capture a healthy frame or fail before poisoning the vision loop."""
@@ -2874,8 +3022,17 @@ class AgentControlService:
         "When your most recent history step shows [OK] for a concrete target (e.g. \"GOTHAM RISING video thumbnail [OK]\" or servo DPC verified change), base the success_proof directly on that target + \"now visible/achieved\". Prior servo-verified clicks are strong evidence the goal state is real; use them to ground your proof rather than re-inventing a description."
     )
     _SCHEMA_FULL = (
-        "{\"status\": \"IN_PROGRESS|COMPLETE\", \"action\": \"click|right_click|type|hotkey|scroll|wait|done|navigate|tool\", \"target_description\": \"...\", \"text\": \"literal value only\", \"keys\": [\"ctrl\",\"t\"], \"url\": \"https://...\", \"reasoning\": \"why\", \"expected_effect\": \"visible result after this action\", \"success_proof\": \"visible state proving done (only when action=done)\", \"tool_name\": \"optional for action=tool\", \"tool_params\": {}}"
+        "{\"status\": \"IN_PROGRESS|COMPLETE\", \"action\": \"click|right_click|type|hotkey|scroll|wait|done|navigate|tool\", \"target_description\": \"...\", \"text\": \"literal value only\", \"keys\": [\"ctrl\",\"t\"], \"scroll_amount\": -5, \"url\": \"https://...\", \"reasoning\": \"why\", \"expected_effect\": \"visible result after this action\", \"success_proof\": \"visible state proving done (only when action=done)\", \"tool_name\": \"optional for action=tool\", \"tool_params\": {}}"
     )
+    # The sign follows LocalScreenBackend.scroll (negative is down). With no
+    # amount in the reply the loop scrolls down 5; an amount of 0 used to send
+    # no wheel clicks at all and still be logged as a scroll.
+    _SCROLL_RULE = (
+        "scroll_amount: wheel notches, negative scrolls DOWN, positive scrolls UP (e.g. -5 = down 5). "
+        "type sends keys to whatever has focus: click the text field first, in the step before you type."
+    )
+    _DEFAULT_SCROLL = -5
+    _MAX_SCROLL = 15
     _SCHEMA_MOUSE_ONLY = (
         "{\"status\": \"IN_PROGRESS|COMPLETE\", \"action\": \"click|right_click|done\", \"target_description\": \"...\", \"reasoning\": \"why\", \"expected_effect\": \"visible result after this action\", \"success_proof\": \"visible state proving done (only when action=done)\"}"
     )
@@ -2907,6 +3064,12 @@ class AgentControlService:
         runs, where every dot click was no_visible_change).
         """
         if step.failed:
+            r = step.result or {}
+            if r.get("refused"):
+                return "NOT SENT"
+            if (step.action.action_type in cls._CLICK_FAMILY
+                    and r.get("reason") == "target_not_visible" and not r.get("target_found", False)):
+                return "NOT ON SCREEN"
             return "FAIL"
         effect = str((step.result or {}).get("post_action_effect") or "")
         if step.action.action_type in cls._CLICK_FAMILY and effect in cls._NO_CHANGE_EFFECTS:
@@ -3074,20 +3237,44 @@ class AgentControlService:
         a_type, a_target, a_text, a_keys, a_scroll, a_url = last_full[0]
         a_desc = a_target or a_text or (str(list(a_keys)) if a_keys else "") or a_url or (str(a_scroll) if a_scroll else "")
         # Concrete options the model can copy: gemma4:e4b acknowledged a soft
-        # "pick something different" and repeated itself anyway.
+        # "pick something different" and repeated itself anyway. Keys only:
+        # a named click target here is one the page may not have, and the
+        # list used to offer "comment input field" to a model stuck on
+        # exactly that target.
+        options = [
+            ("Escape", "release focus from search/address bar so scroll reaches page"),
+            ("Home", "jump to top of page"),
+            ("End", "jump to bottom"),
+            ("Page_Up", "page up"),
+            ("Page_Down", "page down"),
+        ]
+        repeated_keys = [k.lower() for k in a_keys] if a_type == "hotkey" else []
+        lines = "".join(
+            f"  • {{\"action\": \"hotkey\", \"keys\": [\"{key}\"], \"reasoning\": \"{why}\"}}\n"
+            for key, why in options if [key.lower()] != repeated_keys
+        )
         return (
             f"STOP. \"{a_type}: {a_desc}\" already failed TWICE in a row. "
             f"Doing it a third time will hard-abort the task — you will not "
             f"reach the goal by repeating this action.\n"
-            f"YOUR NEXT ACTION MUST BE EXACTLY ONE OF THESE:\n"
-            f"  • {{\"action\": \"hotkey\", \"keys\": [\"Escape\"], \"reasoning\": \"release focus from search/address bar so scroll reaches page\"}}\n"
-            f"  • {{\"action\": \"hotkey\", \"keys\": [\"Home\"], \"reasoning\": \"jump to top of page\"}}\n"
-            f"  • {{\"action\": \"hotkey\", \"keys\": [\"End\"], \"reasoning\": \"jump to bottom\"}}\n"
-            f"  • {{\"action\": \"hotkey\", \"keys\": [\"Page_Up\"], \"reasoning\": \"page up\"}}\n"
-            f"  • {{\"action\": \"hotkey\", \"keys\": [\"Page_Down\"], \"reasoning\": \"page down\"}}\n"
-            f"  • {{\"action\": \"click\", \"target_description\": \"comment input field\", \"reasoning\": \"focus the textarea directly\"}}\n"
-            f"  • {{\"action\": \"click\", \"target_description\": \"reply button\", \"reasoning\": \"open reply UI\"}}\n"
+            f"YOUR NEXT ACTION MUST BE EXACTLY ONE OF THESE, or a click on something "
+            f"you can actually see on the screen now:\n"
+            f"{lines}"
             f"Pick one. Do not pick the exact same \"{a_type}: {a_desc}\" again.\n\n"
+        )
+
+    def _not_found_block(self) -> str:
+        """The click targets held back because the eye could not find them."""
+        if not self._banned_targets:
+            return ""
+        names = ", ".join(
+            f"\"{name}\" ({self._not_found_counts.get(key, 0)} looks)"
+            for key, name in self._banned_targets.items()
+        )
+        return (
+            f"NOT ON SCREEN: {names}. The eye looked and did not find these, and the "
+            f"screen has not changed since. A click on them will not be sent. Look at "
+            f"the screen: scroll, go back, or click something that is there.\n\n"
         )
 
     @staticmethod
@@ -3151,7 +3338,7 @@ class AgentControlService:
             history, self.config.max_iterations, getattr(self, "_click_budget", None))
         repeat_block = "" if training_mode else self._repeat_block(history)
         prior_block = self._prior_run_block()
-        pivot_block = self._pivot_block(history)
+        pivot_block = self._pivot_block(history) + self._not_found_block()
         desktop_state = AgentControlService._get_desktop_state()
         training_override = self._training_override(training_mode)
         confidence = self._confidence_line(task, desktop_state)
@@ -3174,6 +3361,8 @@ class AgentControlService:
 {self._TARGET_DESCRIPTION_RULES}
 
 {self._EXPECTED_EFFECT_RULE}
+
+{self._SCROLL_RULE}
 
 {self._DONE_RULE}
 
@@ -4224,6 +4413,8 @@ Reply ONLY with JSON:
                     detail += f' text="{step["text"]}"'
                 if step.get("keys"):
                     detail += f' keys={step["keys"]}'
+                if step.get("scroll_amount"):
+                    detail += f' scroll_amount={step["scroll_amount"]}'
                 lines.append(f"  Step {i}: {action}{detail} — {step['reasoning']}")
 
         return "\n".join(lines) + "\n\n"
@@ -4302,6 +4493,7 @@ Reply ONLY with JSON:
     def _is_failure_label(label: str) -> bool:
         return label in {
             "target_not_visible",
+            "action_refused",
             "completion_unproven",
             "input_not_applied",
             "click_no_effect",
@@ -4380,7 +4572,13 @@ Reply ONLY with JSON:
         delta_known = pixel_diff is not None
         delta_zero = delta_known and pixel_diff < 0.005
         reason = (result.get("reason") or "").strip()
-        if action_type == "click" and reason == "vision_call_failed":
+        if result.get("refused"):
+            cause = f"not sent — {result.get('refusal', '')}"
+        elif action_type == "click" and reason == "target_not_visible":
+            cause = "target not on screen — the eye looked and found nothing; no click was sent"
+        elif action_type == "type" and reason == "typed_text_not_in_field":
+            cause = "text did not appear near the field; the keys went to the page"
+        elif action_type == "click" and reason == "vision_call_failed":
             cause = (
                 "vision model itself failed twice (Ollama timeout/unresponsive) — "
                 "this is NOT evidence the target is missing; retry shortly"
@@ -5012,26 +5210,159 @@ Reply ONLY with JSON:
         self._strategy_cooldowns = updated
 
     def _record_strategy_outcome(self, action: AgentAction, failed: bool) -> None:
-        """Track repeated failed strategies and apply short cooldowns."""
+        """Track repeated failed strategies and apply short cooldowns.
+
+        Keyed by _action_recovery_key (a click with its target, a hotkey with
+        its keys), not the action class: two failed clicks on one target used
+        to block every click, on any target, for the next steps.
+        """
         action_type = (action.action_type or "").strip().lower()
         if action_type in ("", "done", "wait"):
             return
+        key = self._action_recovery_key(action)
         if failed:
-            if self._last_failed_strategy == action_type:
+            if self._last_failed_strategy == key:
                 self._same_strategy_failures += 1
             else:
-                self._last_failed_strategy = action_type
+                self._last_failed_strategy = key
                 self._same_strategy_failures = 1
             if self._same_strategy_failures >= 2:
                 # Short cooldown so the model must try a different tactic.
-                self._strategy_cooldowns[action_type] = max(
-                    self._strategy_cooldowns.get(action_type, 0),
+                self._strategy_cooldowns[key] = max(
+                    self._strategy_cooldowns.get(key, 0),
                     2,
                 )
         else:
-            if self._last_failed_strategy == action_type:
+            if self._last_failed_strategy == key:
                 self._last_failed_strategy = ""
                 self._same_strategy_failures = 0
+
+    # A click target the eye has not found this many times is held back
+    # until the screen changes; at the second number the run stops.
+    _NOT_FOUND_HOLD = 3
+    _NOT_FOUND_STOP = 6
+    # Hotkeys that put the keyboard focus in a text field.
+    _FOCUS_HOTKEYS = {
+        ("ctrl", "l"), ("ctrl", "k"), ("alt", "d"), ("f6",), ("/",), ("slash",),
+        ("tab",), ("shift", "tab"),
+    }
+    _SUBMIT_KEYS = {"return", "enter", "kp_enter"}
+    # Words that say a click target is somewhere text can go. A type after a
+    # click on anything else (a video, a button) sends the keys to the page,
+    # where single-key shortcuts act on them: on YouTube "c", "k", "t", "i"
+    # and "/" toggled captions, paused, went to theater and miniplayer, and
+    # moved the rest of the text into the search box.
+    # Words such as "title", "name", "caption", "search" or "comments" are
+    # left out on purpose: a video title, a channel name, the captions
+    # button, a search result and a comments header are all things a model
+    # clicks before typing by mistake. "search box" and "comment field" still
+    # match on their second word.
+    _FIELD_WORDS = re.compile(
+        r"\b(?:(?:field|box|input|textbox|textarea|text|composer|editor|bar|area|message|"
+        r"chat|prompt|address|url|query|e-?mail|user(?:name)?|password|subject|entry)s?|"
+        r"reply|add a comment)\b",
+        re.IGNORECASE,
+    )
+
+    @staticmethod
+    def _target_key(target: str) -> str:
+        key = " ".join((target or "").lower().split())
+        return re.sub(r"^(?:the|a|an)\s+", "", key)
+
+    def _note_not_found(self, target: str) -> None:
+        """Count one look for ``target`` that found nothing."""
+        key = self._target_key(target)
+        if not key:
+            return
+        n = self._not_found_counts.get(key, 0) + 1
+        self._not_found_counts[key] = n
+        if n >= self._NOT_FOUND_HOLD:
+            self._banned_targets.setdefault(key, (target or "").strip())
+
+    def _target_given_up(self) -> Optional[Tuple[str, int]]:
+        """(name, looks) for a target looked for _NOT_FOUND_STOP times, else None."""
+        for key, n in self._not_found_counts.items():
+            if n >= self._NOT_FOUND_STOP:
+                return self._banned_targets.get(key, key), n
+        return None
+
+    def _last_acted_step(self) -> Optional[ActionStep]:
+        for st in reversed(self._action_history):
+            if st.action.action_type != "wait":
+                return st
+        return None
+
+    def _dom_has_focused_field(self) -> bool:
+        """The page snapshot (when the browser exposes one) shows a focused text field."""
+        snap = self._dom_snapshot
+        for el in (getattr(snap, "elements", None) or []):
+            if not getattr(el, "focused", False):
+                continue
+            tag = (getattr(el, "tag", "") or "").lower()
+            kind = (getattr(el, "element_type", "") or "").lower()
+            if tag == "textarea" or kind in ("textbox", "composer", "searchbox", "combobox"):
+                return True
+            if tag == "input" and kind in ("", "text", "search", "email", "url", "password", "tel", "number"):
+                return True
+        return False
+
+    def _type_focus(self) -> Tuple[bool, Optional[Tuple[int, int]], str]:
+        """Is there a field for a type to go into: (yes, where it was clicked, why not)."""
+        last = self._last_acted_step()
+        if last is not None and not last.failed:
+            a = last.action
+            r = last.result or {}
+            coords = tuple(a.coordinates) if a.coordinates else None
+            if a.action_type in self._CLICK_FAMILY and coords and coords != (0, 0) and r.get("click_issued", True):
+                if self._FIELD_WORDS.search(a.target_description or ""):
+                    return True, coords, ""
+                if self._dom_has_focused_field():
+                    return True, None, ""
+                return False, None, (
+                    f"the last click was on '{a.target_description}', which is not a text field; "
+                    f"click the field the text belongs in (call it a field, box or input), then type")
+            if a.action_type == "type":
+                return True, self._field_point, ""
+            if a.action_type == "hotkey" and tuple(k.lower() for k in (a.keys or [])) in self._FOCUS_HOTKEYS:
+                return True, None, ""
+        if self._dom_has_focused_field():
+            return True, None, ""
+        return False, None, (
+            "no text field has been clicked, so the keys would go to the page itself "
+            "(pages read single keys as shortcuts); click the field first, then type")
+
+    def _refusal_for(self, action: AgentAction, training_mode: bool = False) -> str:
+        """Why this action should not be sent, or "" to send it."""
+        kind = (action.action_type or "").strip().lower()
+        if kind == "hotkey" and not [k for k in (action.keys or []) if str(k).strip()]:
+            return "the hotkey had no keys"
+        if training_mode or kind in ("done", "wait", ""):
+            return ""
+        if kind in self._CLICK_FAMILY:
+            key = self._target_key(action.target_description)
+            if key in self._banned_targets:
+                n = self._not_found_counts.get(key, 0)
+                return (f"'{action.target_description}' was not on screen the last {n} times the eye "
+                        f"looked, and the screen has not changed since; scroll, go back, or pick "
+                        f"something you can see")
+        block = self._strategy_cooldowns.get(self._action_recovery_key(action), 0)
+        if block > 0:
+            return (f"'{self._action_recovery_key(action)}' failed twice in a row; "
+                    f"try a different action first")
+        if getattr(self, "_mouse_only", False):
+            return ""
+        if kind == "type":
+            ok, point, why = self._type_focus()
+            if not ok:
+                return why
+            self._field_point = point
+            return ""
+        if kind == "hotkey" and str(action.keys[-1]).lower() in self._SUBMIT_KEYS:
+            last = self._last_acted_step()
+            if last is not None and last.action.action_type == "type" and last.failed:
+                return ("the text before it did not go into a field, so Enter would act on the "
+                        "page instead; click the field and type again first")
+        return ""
 
     def _format_strategy_cooldowns(self) -> str:
         """Human-readable strategy blocks for prompt context."""
@@ -5067,6 +5398,28 @@ Reply ONLY with JSON:
             )
 
         if failed:
+            if result.get("refused"):
+                return ProgressSignal(
+                    label="action_refused",
+                    confidence=0.95,
+                    evidence=f"not sent: {result.get('refusal', '')}",
+                    next_hint="do what the reason says, or choose a different action",
+                )
+            if reason == "target_not_visible" and action_type in self._CLICK_FAMILY:
+                target = (action.target_description or "").strip()
+                return ProgressSignal(
+                    label="target_not_visible",
+                    confidence=0.95,
+                    evidence=f"'{target}' is not on screen: the eye looked and found nothing, no click was sent",
+                    next_hint="scroll to it, or click something you can see",
+                )
+            if reason == "typed_text_not_in_field":
+                return ProgressSignal(
+                    label="input_not_applied",
+                    confidence=0.9,
+                    evidence="the screen changed, but not near the field: the keys went to the page",
+                    next_hint="click the text field, check it is focused, then type",
+                )
             if reason == "no_dom_match":
                 return ProgressSignal(
                     label="target_not_visible",
@@ -5200,7 +5553,7 @@ Reply ONLY with JSON:
             history, self.config.max_iterations, getattr(self, "_click_budget", None))
         repeat_block = "" if training_mode else self._repeat_block(history)
         prior_block = self._prior_run_block()
-        pivot_block = self._pivot_block(history)
+        pivot_block = self._pivot_block(history) + self._not_found_block()
         desktop_state = self._get_desktop_state()
         training_override = self._training_override(training_mode)
         confidence = self._confidence_line(task, desktop_state)
@@ -5214,7 +5567,8 @@ Reply ONLY with JSON:
             rules = f"MOUSE ONLY. Actions: click, right_click, done.\n{self._STATE_MANAGEMENT}"
             schema = self._SCHEMA_MOUSE_ONLY
         else:
-            rules = f"One action per step. After typing a URL, press Return.\n{self._STATE_MANAGEMENT}"
+            rules = (f"One action per step. After typing a URL, press Return.\n{self._STATE_MANAGEMENT}"
+                     f"\n\n{self._SCROLL_RULE}")
             schema = self._SCHEMA_FULL
 
         return f"""{pivot_block}{chat_context_block}{failures_block}---
@@ -5302,13 +5656,26 @@ Reply ONLY with JSON:
                     # If it was just a modifier, it's effectively a 'wait' or a 'stuck' signal
                     action_type = "wait"
 
+            scroll_amount = data.get("scroll_amount", 0)
+            if action_type == "scroll":
+                try:
+                    scroll_amount = int(scroll_amount or 0)
+                except (TypeError, ValueError):
+                    scroll_amount = 0
+                direction = str(data.get("direction") or "").lower()
+                if not scroll_amount:
+                    scroll_amount = abs(self._DEFAULT_SCROLL) if direction == "up" else self._DEFAULT_SCROLL
+                elif direction in ("up", "down"):
+                    scroll_amount = abs(scroll_amount) if direction == "up" else -abs(scroll_amount)
+                scroll_amount = max(-self._MAX_SCROLL, min(self._MAX_SCROLL, scroll_amount))
+
             action = AgentAction(
                 action_type=action_type,
                 target_cell=data.get("target_cell", ""),
                 target_description=data.get("target_description", ""),
                 text=raw_text,
                 keys=keys,
-                scroll_amount=data.get("scroll_amount", 0),
+                scroll_amount=scroll_amount,
                 url=data.get("url", ""),
                 reasoning=data.get("reasoning", ""),
                 expected_effect=(data.get("expected_effect") or data.get("success_proof") or "").strip(),

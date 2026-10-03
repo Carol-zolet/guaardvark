@@ -838,6 +838,9 @@ class AgentBrain:
         }
         if r in mapping:
             return mapping[r]
+        if r.startswith("target_not_found"):
+            return ("I kept looking for what I needed to click and it wasn't on the screen, "
+                    "so I stopped rather than keep asking. Tell me where it is or what to try?")
         return "Task completed." if success else "Task failed."
 
     def _parse_gemma4_actions(self, response: str) -> List[Dict]:
