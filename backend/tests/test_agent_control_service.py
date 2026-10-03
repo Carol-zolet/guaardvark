@@ -698,3 +698,25 @@ class TestFailedToolsSayWhy(unittest.TestCase):
         allowed, why = g.check_call("agent_task_execute", {"task": "y"})
         self.assertFalse(allowed)
         self.assertIn("is disabled for the rest of this reply", why)
+
+
+class TestDrawingReachesTheScreen(unittest.TestCase):
+    """"Draw ..." in agent mode is a screen task, not an image request; the
+    names models invent for the point actions still reach them."""
+
+    def test_agent_mode_draw_goes_to_the_screen(self):
+        from backend.services.agent_brain import is_pure_image_request
+        msg = "Draw a smiley face on this blank canvas: two eyes and a smiling mouth."
+        self.assertFalse(is_pure_image_request(msg, {"agent_mode": True}))
+        self.assertFalse(is_pure_image_request(msg, {}), "a canvas is the screen")
+        self.assertTrue(is_pure_image_request("draw a cat in a hat", {}))
+        self.assertFalse(is_pure_image_request("open the second drawer of the cabinet", {}))
+        self.assertTrue(is_pure_image_request("make an image of a lighthouse", {"agent_screen_active": True}))
+
+    def test_invented_action_names_are_mapped(self):
+        from backend.services.agent_control_service import AgentControlService
+        svc = AgentControlService()
+        a = svc._parse_decision('{"action": "draw_stroke", "points": [[1, 2], [3, 4]]}').action
+        self.assertEqual((a.action_type, a.points), ("draw", [(1, 2), (3, 4)]))
+        a = svc._parse_decision('{"action": "click_point", "x": 5, "y": 6}').action
+        self.assertEqual((a.action_type, a.coordinates), ("click_at", (5, 6)))

@@ -60,6 +60,9 @@ class UnifiedChatService {
         ...options,
         agent_screen_active: agentScreenActive,
         screen_viewer_open: screenOpen,
+        // Sticky /agent mode: every message is a screen task, so the backend
+        // does not reroute "draw ..." to image generation.
+        agent_mode: inAgentMode,
         image_model: options.image_model || imageModel,
         ...(thinkPref !== undefined ? { think: thinkPref } : {}),
       },
