@@ -607,3 +607,85 @@ class TestNotesWhileWorking(unittest.TestCase):
             p = self.svc._build_unified_prompt("post a comment", [])
         self.assertIn("NOTES FROM THE USER", p)
         self.assertLess(p.index("NOTES FROM THE USER"), p.index("Task: post a comment"))
+
+
+class TestPointActions(unittest.TestCase):
+    """click_at and draw: exact screen points from the model, for tasks that
+    give coordinates and for drawing, where the eye has nothing to find."""
+
+    def setUp(self):
+        from backend.services.agent_control_service import AgentControlService
+        self.A = AgentControlService
+        self.svc = AgentControlService()
+
+    def test_click_at_and_draw_parse(self):
+        a = self.svc._parse_decision('{"action": "click_at", "x": 420, "y": 320}').action
+        self.assertEqual((a.action_type, a.coordinates), ("click_at", (420, 320)))
+        a = self.svc._parse_decision('{"action": "click_at", "point": [10.6, 20.2]}').action
+        self.assertEqual(a.coordinates, (11, 20))
+        a = self.svc._parse_decision(
+            '{"action": "draw", "points": [[400, 500], {"x": 450, "y": 530}, "bad", [1]]}').action
+        self.assertEqual(a.points, [(400, 500), (450, 530)])
+
+    def test_drag_reads_its_destination(self):
+        a = self.svc._parse_decision('{"action": "drag", "target_description": "a", "drag_to": "b"}').action
+        self.assertEqual(a.drag_to_description, "b")
+
+    def test_dots_at_different_places_are_not_a_repeat(self):
+        from backend.services.agent_control_service import ActionStep, AgentAction
+        h = [ActionStep(action=AgentAction(action_type="click_at", coordinates=(420, 320))),
+             ActionStep(action=AgentAction(action_type="click_at", coordinates=(640, 320)))]
+        self.assertEqual(self.A._pivot_block(h), "")
+        same = [ActionStep(action=AgentAction(action_type="click_at", coordinates=(420, 320))) for _ in range(2)]
+        self.assertIn("STOP.", self.A._pivot_block(same))
+
+    def test_history_says_where_points_went(self):
+        from backend.services.agent_control_service import ActionStep, AgentAction
+        h = [ActionStep(action=AgentAction(action_type="click_at", coordinates=(420, 320))),
+             ActionStep(action=AgentAction(action_type="draw", points=[(400, 500), (450, 530), (500, 500)]))]
+        lines = self.A._history_block(h, 40).splitlines()
+        self.assertEqual(lines[0], "Done (steps: 2, click attempts: 1):")
+        self.assertEqual(lines[1], "  click_at: at (420, 320) [OK]")
+        self.assertEqual(lines[2], "  draw: 3 points from (400, 500) to (500, 500) [OK]")
+
+    def test_a_field_clicked_by_point_can_be_typed_into(self):
+        from backend.services.agent_control_service import ActionStep, AgentAction
+        self.svc._action_history = [ActionStep(action=AgentAction(action_type="click_at", coordinates=(300, 700)),
+                                               result={"success": True})]
+        self.assertEqual(self.svc._refusal_for(AgentAction(action_type="type", text="hi")), "")
+        self.assertEqual(self.svc._field_point, (300, 700))
+
+    def test_the_rule_names_the_screen_size(self):
+        self.svc._screen_size = (1000, 1000)
+        self.assertIn("the screen is 1000x1000", self.svc._point_rule())
+
+
+class TestFailedToolsSayWhy(unittest.TestCase):
+    """A failed tool's own explanation reaches the model; a block says how
+    long it lasts."""
+
+    def test_output_stands_in_for_a_missing_error(self):
+        from backend.services.agent_tools import ToolResult
+        from backend.utils.agent_output_parser import format_tool_result_for_llm
+        r = ToolResult(success=False, output="Task failed after 17 steps (491.3s): timeout")
+        xml = format_tool_result_for_llm("agent_task_execute", r, format="xml")
+        self.assertIn("Error: Task failed after 17 steps (491.3s): timeout", xml)
+        self.assertNotIn("Error: None", xml)
+
+    def test_error_and_output_both_reach_the_model(self):
+        import json
+        from backend.services.agent_tools import ToolResult
+        from backend.utils.agent_output_parser import format_tool_result_for_llm
+        r = ToolResult(success=False, error="Task failed: timeout", output="Last steps: click at (1, 2)")
+        obs = json.loads(format_tool_result_for_llm("agent_task_execute", r, format="json"))
+        self.assertEqual(obs["error"], "Task failed: timeout")
+        self.assertEqual(obs["output"], "Last steps: click at (1, 2)")
+
+    def test_block_message_names_its_scope(self):
+        from backend.services.tool_execution_guard import ToolExecutionGuard
+        g = ToolExecutionGuard(max_failures_per_tool=2, scope="for the rest of this reply")
+        for _ in range(2):
+            g.record_result("agent_task_execute", {"task": "x"}, False, "timeout", 1)
+        allowed, why = g.check_call("agent_task_execute", {"task": "y"})
+        self.assertFalse(allowed)
+        self.assertIn("is disabled for the rest of this reply", why)
