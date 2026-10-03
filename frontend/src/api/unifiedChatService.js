@@ -91,6 +91,17 @@ class UnifiedChatService {
   }
 
   /**
+   * Hand the running screen-agent task a note without stopping it. The agent
+   * reads it at its next step. Resolves to the server's answer:
+   * {queued: true} when the task took it, {queued: false, reason} when no
+   * task is running for this chat (the caller then treats it as an ordinary
+   * message).
+   */
+  async steerAgent(sessionId, message) {
+    return steerAgent(sessionId, message);
+  }
+
+  /**
    * Register a callback for a Socket.IO event.
    * Tracks listeners for cleanup.
    */
@@ -200,6 +211,22 @@ class UnifiedChatService {
     this._listeners = [];
     debugLog('[UnifiedChatService] cleanup COMPLETE');
   }
+}
+
+/**
+ * POST a note to the running agent task (see UnifiedChatService.steerAgent).
+ */
+export async function steerAgent(sessionId, message) {
+  const response = await fetch(`${API_BASE}/api/agent-control/steer`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ session_id: sessionId, message }),
+  });
+  const json = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(json.error || `HTTP ${response.status}`);
+  }
+  return json;
 }
 
 export default UnifiedChatService;

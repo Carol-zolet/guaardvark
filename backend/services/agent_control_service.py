@@ -222,6 +222,9 @@ class AgentResult:
     # The agent_task_runs row this result was written to ("" when the write
     # was skipped or failed). The episode record; see _persist_task_run.
     run_id: str = ""
+    # Notes the user sent while the task ran that arrived after its last
+    # step, so the model never read them. The chat reply says so.
+    late_notes: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -467,6 +470,14 @@ class AgentControlService:
         # infinite loops on non-responsive elements.
         self._click_history: List[Tuple[int, int]] = []
         self._lock = threading.Lock()
+        # Notes the user sends while a task runs ("chime-ins"): each is
+        # {"text", "received_at", "before_step", "seen_at_step"}. Read by the
+        # loop at its next step and kept in the prompt for the rest of the
+        # task. Guarded by _lock; reset when a task starts.
+        self._steer_notes: List[Dict[str, Any]] = []
+        # Closed as a task starts to finish, so a note can't be accepted
+        # after the last step that could have read it.
+        self._notes_open = False
         self.config = AgentControlConfig()
         self._debug_run_id = ""
         self._emit_fn: Optional[Callable] = None  # set per-task by execute_task
@@ -479,17 +490,21 @@ class AgentControlService:
         # way the thinking trail is, so feedback can reach the recipe.
         self._recipe_usage_buffer: List[Dict[str, Any]] = []
 
-    def _emit_thinking(self, iteration: int, label: str, reasoning: str) -> None:
+    def _emit_thinking(self, iteration: int, label: str, reasoning: str, kind: str = "") -> None:
         """Stream a per-step reasoning blob to the chat. No-ops when emit_fn unset
         (CLI/tests/legacy callers). Errors are swallowed — the loop must not be
         derailed by a flaky socket."""
         # Always buffer for persistence, even when emit_fn isn't wired — the
         # caller drains this after the loop regardless of socket state.
-        self._thinking_steps_buffer.append({
+        entry = {
             "iteration": int(iteration),
             "label": label or "",
             "reasoning": reasoning or "",
-        })
+        }
+        if kind:
+            # "note": the user's own message, shown as theirs in the trail.
+            entry["kind"] = kind
+        self._thinking_steps_buffer.append(entry)
         logger.debug(
             f"[THINKING-PERSIST] emit iter={iteration} label={label!r} "
             f"buffer_len={len(self._thinking_steps_buffer)} id(self)={id(self)}"
@@ -505,12 +520,15 @@ class AgentControlService:
             return
         try:
             logger.info(f"[SOCKET-CHAT] EMIT via ACS chat:thinking iter={iteration} status={label!r} source=agent_loop")
-            emit("chat:thinking", {
+            payload = {
                 "iteration": int(iteration),
                 "status": label,
                 "reasoning": reasoning or "",
                 "source": "agent_loop",
-            })
+            }
+            if kind:
+                payload["kind"] = kind
+            emit("chat:thinking", payload)
             logger.debug(f"[EMIT-HANDOFF][ACS_EMIT] chat:thinking(source=agent_loop) emitted for iter={iteration}")
         except Exception as e:
             logger.debug(f"_emit_thinking failed (non-fatal): {e}")
@@ -606,6 +624,89 @@ class AgentControlService:
         self._ready = False
         logger.warning("KILL SWITCH ACTIVATED — all agent operations halted")
 
+    # A note that only says stop ends the run, as the Stop button does.
+    _STOP_NOTE = re.compile(
+        r"^\s*(?:please\s+)?(?:stop|cancel|abort|halt|quit)(?:\s+(?:it|that|this|now|please))*"
+        r"\s*[.!]*\s*$",
+        re.IGNORECASE,
+    )
+    _MAX_NOTES = 10
+    _MAX_NOTE_CHARS = 500
+
+    def add_steer_note(self, text: str, session_id: Optional[str] = None) -> Dict[str, Any]:
+        """Hand a running task a note from the user without stopping it.
+
+        The loop reads the note before its next step and keeps it in the
+        prompt for the rest of the task; the task itself is unchanged. A
+        message sent the ordinary way while a task runs starts a new task
+        and kills this one, which is what this exists to avoid.
+
+        Returns {"queued": bool, ...}. Not queued when no task is running,
+        or the running task belongs to another chat session.
+        """
+        text = (text or "").strip()
+        if not text:
+            return {"queued": False, "reason": "empty"}
+        stop = False
+        with self._lock:
+            if not self._active or self._killed or not self._notes_open:
+                return {"queued": False, "reason": "no_active_task"}
+            if session_id and self._task_session_id and session_id != self._task_session_id:
+                return {"queued": False, "reason": "other_session"}
+            if self._STOP_NOTE.match(text):
+                stop = True
+            elif len(self._steer_notes) >= self._MAX_NOTES:
+                return {"queued": False, "reason": "too_many_notes"}
+            else:
+                before_step = self._current_iteration + 2
+                self._steer_notes.append({
+                    "text": text[:self._MAX_NOTE_CHARS],
+                    "received_at": time.time(),
+                    "before_step": before_step,
+                    "seen_at_step": None,
+                })
+                count = len(self._steer_notes)
+        if stop:
+            logger.warning("[AGENT][NOTE] stop note received; stopping the task")
+            self.kill()
+            return {"queued": True, "stopping": True}
+        logger.info(f"[AGENT][NOTE] note {count} queued for step {before_step}: {text[:80]!r}")
+        return {"queued": True, "notes": count, "before_step": before_step}
+
+    def _take_new_notes(self, step: int) -> List[Dict[str, Any]]:
+        """Notes not yet shown to the model, marked as read at ``step``."""
+        with self._lock:
+            new = [n for n in self._steer_notes if n["seen_at_step"] is None]
+            for n in new:
+                n["seen_at_step"] = step
+            return [dict(n) for n in new]
+
+    def _has_unseen_notes(self) -> bool:
+        with self._lock:
+            return any(n["seen_at_step"] is None for n in self._steer_notes)
+
+    def _late_notes(self) -> List[str]:
+        with self._lock:
+            return [n["text"] for n in self._steer_notes if n["seen_at_step"] is None]
+
+    def _steer_block(self) -> str:
+        """Every note the user sent during this task, for the prompt."""
+        with self._lock:
+            notes = [dict(n) for n in self._steer_notes if n["seen_at_step"] is not None]
+        if not notes:
+            return ""
+        newest = max(n["seen_at_step"] for n in notes)
+        lines = []
+        for n in notes:
+            mark = "NEW " if n["seen_at_step"] == newest else ""
+            lines.append(f"  - {mark}(read at step {n['seen_at_step']}) \"{n['text']}\"")
+        return (
+            "NOTES FROM THE USER, sent while you were working, oldest first. They come from "
+            "the person who gave you the task and they update it: where a note and the task "
+            "disagree, follow the note. Keep going; do not start the task over unless a note "
+            "says to.\n" + "\n".join(lines) + "\n\n"
+        )
+
     def get_status(self) -> Dict[str, Any]:
         """Get current agent control status."""
         last = None
@@ -678,6 +779,11 @@ class AgentControlService:
         task_ctx = AgentTaskContext(task_id=task_id, task=task, started_at=time.time())
 
         def finish(result: AgentResult) -> AgentResult:
+            with self._lock:
+                owns_notes = self._active_task_id == task_id
+                if owns_notes:
+                    self._notes_open = False
+            result.late_notes = self._late_notes() if owns_notes else []
             # Derive `verified` from the last step's per-action verifier result.
             # The induction gate in agent_control_api uses this to filter
             # "clicked but nothing happened" runs out of candidate-recipe
@@ -736,6 +842,8 @@ class AgentControlService:
             self._prior_run_note = ""
             self._task_session_id = session_id
             self._task_started_at = time.time()
+            self._steer_notes = []
+            self._notes_open = True
             # Phase 4: session state is task-scoped. Re-parse the knowledge
             # files in case they were edited between runs; reset the log so
             # last task's contradictions don't bleed into this one's lessons.
@@ -857,6 +965,8 @@ class AgentControlService:
         self._current_budget = effective_budget
         task_timeout = 3600 if training_mode else self.config.task_timeout_seconds  # 1 hour for training
         self._stall_steps = 0
+        # User notes read this iteration, recorded on the step it produces.
+        notes_for_step: List[str] = []
 
         try:
             for iteration in range(max_iters):
@@ -915,6 +1025,24 @@ class AgentControlService:
                             steps=self._action_history,
                             total_time_seconds=time.time() - start_time,
                         ))
+
+                # Notes the user sent since the last step: read now and kept
+                # in the prompt from here on. A note is new information, so the
+                # stall and failure counts and the not-on-screen holds start
+                # over and the model has room to act on it.
+                new_notes = self._take_new_notes(iteration + 1)
+                if new_notes:
+                    for n in new_notes:
+                        self._emit_thinking(
+                            iteration=iteration + 1,
+                            label=f"your note — {n['text'][:60]}",
+                            reasoning=f"Read before step {iteration + 1}: \"{n['text']}\"",
+                            kind="note",
+                        )
+                    self._stall_steps = 0
+                    consecutive_failures = 0
+                    self._banned_targets.clear()
+                    notes_for_step.extend(n["text"] for n in new_notes)
 
                 # 1. SEE — Capture screenshot
                 screenshot, cursor_pos = self._capture_with_retry(screen)
@@ -1032,6 +1160,13 @@ class AgentControlService:
                     decision.task_complete = False
                     decision.action.action_type = "click"
                     decision.action.target_description = "colored circle"
+
+                if decision.task_complete and not training_mode and self._has_unseen_notes():
+                    # A note arrived while this step was being decided. The
+                    # model hasn't read it, so "done" may no longer be true:
+                    # read the note first.
+                    logger.info(f"[AGENT][STEP {iteration+1}][NOTE] done held: a note arrived")
+                    continue
 
                 if decision.task_complete:
                     # Guard: "done" on step 1 with no actions taken is suspicious.
@@ -1756,6 +1891,9 @@ class AgentControlService:
                     verification=signal.evidence,
                     failed=failed,
                 )
+                if notes_for_step:
+                    result["user_notes"] = list(notes_for_step)
+                    notes_for_step.clear()
                 self._action_history.append(step)
 
                 # A target the eye has looked for this many times without
@@ -3349,7 +3487,7 @@ class AgentControlService:
             history, self.config.max_iterations, getattr(self, "_click_budget", None))
         repeat_block = "" if training_mode else self._repeat_block(history)
         prior_block = self._prior_run_block()
-        pivot_block = self._pivot_block(history) + self._not_found_block()
+        pivot_block = self._pivot_block(history) + self._not_found_block() + self._steer_block()
         desktop_state = AgentControlService._get_desktop_state()
         training_override = self._training_override(training_mode)
         confidence = self._confidence_line(task, desktop_state)
@@ -5567,7 +5705,7 @@ Reply ONLY with JSON:
             history, self.config.max_iterations, getattr(self, "_click_budget", None))
         repeat_block = "" if training_mode else self._repeat_block(history)
         prior_block = self._prior_run_block()
-        pivot_block = self._pivot_block(history) + self._not_found_block()
+        pivot_block = self._pivot_block(history) + self._not_found_block() + self._steer_block()
         desktop_state = self._get_desktop_state()
         training_override = self._training_override(training_mode)
         confidence = self._confidence_line(task, desktop_state)

@@ -530,3 +530,80 @@ class TestScreenChange(unittest.TestCase):
 
     def test_frames_of_different_sizes_are_not_compared(self):
         self.assertIsNone(self.A._screen_change(self.page, self.page, self.Image.new("RGB", (10, 10))))
+
+
+class TestNotesWhileWorking(unittest.TestCase):
+    """Notes the user sends while a screen task runs: read at the next step,
+    kept in the prompt, and never a new task that kills the running one."""
+
+    def setUp(self):
+        from backend.services.agent_control_service import AgentControlService
+        self.svc = AgentControlService()
+
+    def _running(self, session_id="s1"):
+        self.svc._active = True
+        self.svc._killed = False
+        self.svc._notes_open = True
+        self.svc._task_session_id = session_id
+        self.svc._current_iteration = 2
+
+    def test_no_task_running_means_not_queued(self):
+        self.assertEqual(self.svc.add_steer_note("go left", "s1"),
+                         {"queued": False, "reason": "no_active_task"})
+
+    def test_a_note_is_queued_read_once_and_kept_in_the_prompt(self):
+        self._running()
+        out = self.svc.add_steer_note("  say guaardvark.com instead ", "s1")
+        self.assertTrue(out["queued"])
+        self.assertEqual(self.svc._steer_block(), "", "not in the prompt before the loop reads it")
+        new = self.svc._take_new_notes(4)
+        self.assertEqual([n["text"] for n in new], ["say guaardvark.com instead"])
+        self.assertEqual(self.svc._take_new_notes(5), [], "read once")
+        block = self.svc._steer_block()
+        self.assertIn('NEW (read at step 4) "say guaardvark.com instead"', block)
+        self.svc.add_steer_note("and keep it short", "s1")
+        self.svc._take_new_notes(6)
+        block = self.svc._steer_block()
+        self.assertIn('  - (read at step 4) "say guaardvark.com instead"', block)
+        self.assertIn('NEW (read at step 6) "and keep it short"', block)
+
+    def test_a_note_from_another_chat_is_refused(self):
+        self._running("s1")
+        self.assertEqual(self.svc.add_steer_note("hi", "s2")["reason"], "other_session")
+
+    def test_stop_ends_the_task_and_other_words_do_not(self):
+        self._running()
+        self.assertTrue(self.svc.add_steer_note("Stop!", "s1")["stopping"])
+        self.assertTrue(self.svc._killed)
+        self._running()
+        out = self.svc.add_steer_note("stop clicking the logo and scroll down", "s1")
+        self.assertNotIn("stopping", out)
+        self.assertFalse(self.svc._killed)
+
+    def test_notes_close_when_the_task_finishes(self):
+        self._running()
+        self.svc.add_steer_note("one more thing", "s1")
+        self.svc._notes_open = False
+        self.assertEqual(self.svc.add_steer_note("too late", "s1")["reason"], "no_active_task")
+        self.assertEqual(self.svc._late_notes(), ["one more thing"])
+
+    def test_notes_are_bounded(self):
+        self._running()
+        for i in range(self.svc._MAX_NOTES):
+            self.assertTrue(self.svc.add_steer_note(f"note {i}", "s1")["queued"])
+        self.assertEqual(self.svc.add_steer_note("one too many", "s1")["reason"], "too_many_notes")
+
+    def test_unified_prompt_carries_the_notes(self):
+        from unittest.mock import patch
+        from backend.services.agent_control_service import AgentControlService as A
+        self._running()
+        self.svc._pending_world_observed = ""
+        self.svc._failure_reports = []
+        self.svc._current_budget = None
+        self.svc.add_steer_note("the comment box is further down", "s1")
+        self.svc._take_new_notes(3)
+        with patch.object(A, "_get_desktop_state", staticmethod(lambda display=None: "Desktop: fixture")), \
+             patch.object(A, "_format_dom_grounding_for_prompt", lambda self: ""):
+            p = self.svc._build_unified_prompt("post a comment", [])
+        self.assertIn("NOTES FROM THE USER", p)
+        self.assertLess(p.index("NOTES FROM THE USER"), p.index("Task: post a comment"))
