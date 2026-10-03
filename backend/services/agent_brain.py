@@ -118,6 +118,28 @@ CONVERSATIONAL_PASSTHROUGH = SOCIAL_TIER2_PATTERNS
 # Pure-chat openers that don't need a screenshot (subset used by gemma4 direct)
 NO_SCREEN_CONTEXT = SOCIAL_TIER2_PATTERNS
 
+
+_PURE_IMAGE_PHRASES = ("generate image", "make a picture", "picture of", "image of", "create image",
+                       "generate a photo", "visualize", "make an image")
+_SCREEN_WORDS = re.compile(r"\b(?:screen|click|canvas|paint|pencil|brush)")
+
+
+def is_pure_image_request(message: str, options: Optional[Dict[str, Any]] = None) -> bool:
+    """A request for a generated picture, which goes to the image tool even
+    when the agent screen is active.
+
+    Never in sticky /agent mode, where every message is a screen task (the
+    input says so): "draw a smiley face on this canvas" there went to image
+    generation instead of the screen. "draw" counts as a word ("drawer" and
+    "withdraw" are not image requests), and a message about the screen, a
+    click, a canvas, a paint program or a pencil is about the screen.
+    """
+    if options and options.get("agent_mode"):
+        return False
+    msg = (message or "").lower()
+    wants_image = any(p in msg for p in _PURE_IMAGE_PHRASES) or re.search(r"\bdraw\b", msg) is not None
+    return wants_image and _SCREEN_WORDS.search(msg) is None
+
 # Vision task detection
 VISION_PATTERNS = re.compile(
     r"(?i)(?:virtual\s+(?:screen|display|computer|browser|machine)|"
@@ -318,9 +340,7 @@ class AgentBrain:
         # force the standard tool-calling path (LLM must output generate_image tool call)
         # so that the selected /imagemodel is respected via injection, and behavior
         # is consistent with direct /imagine. Skip gemma-direct even if screen active.
-        msg_l = (message or "").lower()
-        pure_image_kw = ["generate image", "draw", "make a picture", "picture of", "image of", "create image", "generate a photo", "visualize", "make an image"]
-        force_standard_image = any(kw in msg_l for kw in pure_image_kw) and "screen" not in msg_l and "click" not in msg_l
+        force_standard_image = is_pure_image_request(message, options)
 
         try:
             # -- Gemma4 direct path: no chains, no routing, no bloated prompts --

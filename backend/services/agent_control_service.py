@@ -3313,6 +3313,14 @@ class AgentControlService:
         "Coordinates are screen pixels, (0, 0) is the top-left corner{size}."
     )
     _MAX_DRAW_POINTS = 200
+    # Ornith-1.5 35B answered "draw_stroke" twice before using "draw"
+    # (2026-10-02); each was an unknown action and a lost step.
+    _ACTION_ALIASES = {
+        "draw_stroke": "draw", "stroke": "draw", "draw_line": "draw", "line": "draw",
+        "polyline": "draw", "draw_path": "draw", "draw_curve": "draw",
+        "click_point": "click_at", "click_xy": "click_at", "click_coordinates": "click_at",
+        "click_at_point": "click_at",
+    }
     _SCHEMA_MOUSE_ONLY = (
         "{\"status\": \"IN_PROGRESS|COMPLETE\", \"action\": \"click|right_click|done\", \"target_description\": \"...\", \"reasoning\": \"why\", \"expected_effect\": \"visible result after this action\", \"success_proof\": \"visible state proving done (only when action=done)\"}"
     )
@@ -5908,6 +5916,8 @@ Reply ONLY with JSON:
 
             data = json.loads(text)
             action_type = data.get("action", "").lower().strip()
+            # Names models invent for the point actions.
+            action_type = self._ACTION_ALIASES.get(action_type, action_type)
             status = (data.get("status") or "IN_PROGRESS").upper().strip()
             decision.status = status
 
