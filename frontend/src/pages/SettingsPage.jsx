@@ -1699,8 +1699,8 @@ const SettingsPage = () => {
     debugLog("Web Search toggled", { isEnabled });
     showMessage(
       isEnabled
-        ? "Web access enabled: tools may fetch pages and search the web."
-        : "Web access disabled: web and browser tools are blocked.",
+        ? "Web access enabled: tools may fetch pages and search the web, and the agent's browser may open outside sites."
+        : "Web access disabled: web tools are blocked and the agent's browser opens local pages only (any running agent task was stopped).",
       "info",
     );
   };
@@ -3869,7 +3869,17 @@ const SettingsPage = () => {
       />
       <KillSwitchModal
         open={killSwitchOpen}
-        onClose={() => setKillSwitchOpen(false)}
+        onClose={() => {
+          setKillSwitchOpen(false);
+          // The kill switch turns web access off; show the switch as it is now.
+          apiService
+            .getWebAccess()
+            .then((result) => {
+              const allowWeb = result?.data?.allow_web_search ?? result?.allow_web_search;
+              if (typeof allowWeb === "boolean") setWebSearchEnabled(allowWeb);
+            })
+            .catch((err) => console.warn("Failed to refresh web access:", err));
+        }}
       />
       <RebootProgressModal
         open={rebootProgressModalOpen}
