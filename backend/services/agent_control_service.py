@@ -5450,7 +5450,7 @@ Reply ONLY with JSON:
         targets = self._task_target_tokens()
         kept = [l for l in lessons if self._is_task_target(l.get("element", ""), targets)]
         if len(kept) < len(lessons):
-            logger.info(
+            logger.warning(
                 f"[AGENT][BELIEF] {len(lessons) - len(kept)} lesson(s) not about this task's "
                 f"targets left unwritten: {[l.get('element') for l in lessons if l not in kept]}"
             )
