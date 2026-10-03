@@ -481,6 +481,8 @@ class AgentControlService:
         # The display's size for the current task, for the point rule and
         # the off-screen check on click_at / draw.
         self._screen_size: Optional[Tuple[int, int]] = None
+        # Whether this task is offered click_at and draw (_points_wanted).
+        self._points_on = False
         # Closed as a task starts to finish, so a note can't be accepted
         # after the last step that could have read it.
         self._notes_open = False
@@ -739,6 +741,32 @@ class AgentControlService:
                 continue
         return out
 
+    # A task that gives coordinates ("(420, 320)", "x=420") or is about
+    # drawing. Only those are offered click_at and draw: offered to every
+    # task, Ornith-1.5 35B deciding blind from the eye's description used
+    # click_at with guessed pixels on the five-dots page and hit 3 of 5
+    # (2026-10-02), where naming the dots for the eye hits 5 of 5.
+    _POINTS_WANTED = re.compile(
+        r"\(\s*\d{1,4}\s*,\s*\d{1,4}\s*\)|\b[xy]\s*[=:]\s*\d{1,4}|\bclick_at\b|"
+        r"\b(?:draw(?:s|ing|n)?|sketch\w*|doodle\w*|scribble\w*|canvas\w*|paint\w*|pencil\w*|"
+        r"brush\w*|strokes?)\b",
+        re.IGNORECASE,
+    )
+
+    @classmethod
+    def _points_wanted(cls, text: str) -> bool:
+        return bool(cls._POINTS_WANTED.search(text or ""))
+
+    @property
+    def _points_allowed(self) -> bool:
+        return bool(getattr(self, "_points_on", False))
+
+    def _schema_full(self) -> str:
+        return self._SCHEMA_FULL_POINTS if self._points_allowed else self._SCHEMA_FULL
+
+    def _point_block(self) -> str:
+        return self._point_rule() + "\n\n" if self._points_allowed else ""
+
     def _point_rule(self) -> str:
         size = getattr(self, "_screen_size", None)
         return self._POINT_RULE.format(
@@ -927,6 +955,7 @@ class AgentControlService:
             self._screen_size = tuple(screen.screen_size())
         except Exception:
             self._screen_size = None
+        self._points_on = self._points_wanted(task)
         self._brain_eye = self.resolve_brain_eye(screen_size=self._screen_size)
         if not self._brain_eye.eye:
             logger.error(f"[AGENT] no drivable eye: {self._brain_eye.reason}")
@@ -1102,6 +1131,8 @@ class AgentControlService:
                     consecutive_failures = 0
                     self._banned_targets.clear()
                     notes_for_step.extend(n["text"] for n in new_notes)
+                    if any(self._points_wanted(n["text"]) for n in new_notes):
+                        self._points_on = True
 
                 # 1. SEE — Capture screenshot
                 screenshot, cursor_pos = self._capture_with_retry(screen)
@@ -3290,7 +3321,17 @@ class AgentControlService:
         "When your most recent history step shows [OK] for a concrete target (e.g. \"GOTHAM RISING video thumbnail [OK]\" or servo DPC verified change), base the success_proof directly on that target + \"now visible/achieved\". Prior servo-verified clicks are strong evidence the goal state is real; use them to ground your proof rather than re-inventing a description."
     )
     _SCHEMA_FULL = (
-        "{\"status\": \"IN_PROGRESS|COMPLETE\", \"action\": \"click|click_at|draw|right_click|type|hotkey|scroll|wait|done|navigate|tool\", \"target_description\": \"...\", \"x\": 420, \"y\": 320, \"points\": [[400, 500], [450, 530], [500, 500]], \"text\": \"literal value only\", \"keys\": [\"ctrl\",\"t\"], \"scroll_amount\": -5, \"url\": \"https://...\", \"reasoning\": \"why\", \"expected_effect\": \"visible result after this action\", \"success_proof\": \"visible state proving done (only when action=done)\", \"tool_name\": \"optional for action=tool\", \"tool_params\": {}}"
+        "{\"status\": \"IN_PROGRESS|COMPLETE\", \"action\": \"click|right_click|type|hotkey|scroll|wait|done|navigate|tool\", \"target_description\": \"...\", \"text\": \"literal value only\", \"keys\": [\"ctrl\",\"t\"], \"scroll_amount\": -5, \"url\": \"https://...\", \"reasoning\": \"why\", \"expected_effect\": \"visible result after this action\", \"success_proof\": \"visible state proving done (only when action=done)\", \"tool_name\": \"optional for action=tool\", \"tool_params\": {}}"
+    )
+    # The same with the exact-point actions, offered only to tasks that give
+    # coordinates or are about drawing (see _points_wanted).
+    _SCHEMA_FULL_POINTS = _SCHEMA_FULL.replace(
+        "\"action\": \"click|right_click|",
+        "\"action\": \"click|click_at|draw|right_click|",
+    ).replace(
+        "\"target_description\": \"...\", ",
+        "\"target_description\": \"...\", \"x\": 420, \"y\": 320, "
+        "\"points\": [[400, 500], [450, 530], [500, 500]], ",
     )
     # The sign follows LocalScreenBackend.scroll (negative is down). With no
     # amount in the reply the loop scrolls down 5; an amount of 0 used to send
@@ -3662,12 +3703,10 @@ class AgentControlService:
 
 {self._SCROLL_RULE}
 
-{self._point_rule()}
-
-{self._DONE_RULE}
+{self._point_block()}{self._DONE_RULE}
 
 Reply ONLY with JSON:
-{self._SCHEMA_FULL}
+{self._schema_full()}
 
 {self._TOOLBOX_NOTE}
 """
@@ -5643,6 +5682,9 @@ Reply ONLY with JSON:
             return "the hotkey had no keys"
         if training_mode or kind in ("done", "wait", ""):
             return ""
+        if kind in ("click_at", "draw") and not self._points_allowed:
+            return (f"{kind} is for coordinates the task gives or for drawing; to click something "
+                    f"on screen, use click with a target_description for the eye to find")
         if kind in self._CLICK_FAMILY:
             key = self._target_key(action.target_description)
             if key in self._banned_targets:
@@ -5873,8 +5915,9 @@ Reply ONLY with JSON:
             schema = self._SCHEMA_MOUSE_ONLY
         else:
             rules = (f"One action per step. After typing a URL, press Return.\n{self._STATE_MANAGEMENT}"
-                     f"\n\n{self._SCROLL_RULE}\n\n{self._point_rule()}")
-            schema = self._SCHEMA_FULL
+                     f"\n\n{self._SCROLL_RULE}"
+                     + (f"\n\n{self._point_rule()}" if self._points_allowed else ""))
+            schema = self._schema_full()
 
         return f"""{pivot_block}{chat_context_block}{failures_block}---
 
