@@ -5305,6 +5305,12 @@ Reply ONLY with JSON:
         cleaned = re.sub(r"[(),./\\]+", " ", text.lower())
         return [t for t in cleaned.split() if t and len(t) > 2 and t not in noise]
 
+    @staticmethod
+    def _word_in(token: str, text: str) -> bool:
+        """``token`` starts a word in ``text`` ("icon" in "icons", not "red"
+        in "remembered")."""
+        return re.search(r"\b" + re.escape(token), text) is not None
+
     def _record_expectation_contradictions(
         self,
         expectations: List[Expectation],
@@ -5326,7 +5332,11 @@ Reply ONLY with JSON:
         if not body:
             return
 
-        observed_text = body.lower()
+        # The element list only: the block's header and closing instruction
+        # are fixed prose, and matched against them "red" was "seen" inside
+        # "remembered", so a missing red button never became a lesson.
+        listed = [ln[2:] for ln in body.splitlines() if ln.startswith("- ")]
+        observed_text = ("\n".join(listed) if listed else body).lower()
 
         for exp in expectations:
             if not exp.expected_visible:
@@ -5334,7 +5344,7 @@ Reply ONLY with JSON:
             tokens = self._significant_tokens(exp.element)
             if not tokens:
                 continue
-            element_seen = any(tok in observed_text for tok in tokens)
+            element_seen = any(self._word_in(tok, observed_text) for tok in tokens)
             if element_seen:
                 continue
             # Contradiction — copy the expectation with observed_visible=False
@@ -5358,7 +5368,7 @@ Reply ONLY with JSON:
             already_logged = any(
                 e.element.lower() == stuck.lower() for e in self._expectation_log
             )
-            stuck_seen = any(tok in observed_text for tok in stuck_tokens) if stuck_tokens else True
+            stuck_seen = any(self._word_in(tok, observed_text) for tok in stuck_tokens) if stuck_tokens else True
             if not stuck_seen and not already_logged:
                 self._expectation_log.append(Expectation(
                     element=stuck,
