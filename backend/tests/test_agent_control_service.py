@@ -664,6 +664,22 @@ class TestPointActions(unittest.TestCase):
         self.assertTrue(self.A._task_has_verified_click([drawn]))
         self.assertFalse(self.A._task_has_verified_click([unchanged]))
 
+    def test_point_actions_are_offered_only_to_coordinate_or_drawing_tasks(self):
+        from backend.services.agent_control_service import AgentAction
+        wanted = self.A._points_wanted
+        self.assertTrue(wanted("one eye on the upper-left (around x=420, y=320)"))
+        self.assertTrue(wanted("click at (420, 320)"))
+        self.assertTrue(wanted("Draw a smiley face on this blank canvas"))
+        self.assertFalse(wanted("Please click once in each of the dots. You have 5 click attempts total."))
+        self.assertFalse(wanted("open the second drawer"))
+        self.svc._points_on = False
+        self.assertIn("use click with a target_description",
+                      self.svc._refusal_for(AgentAction(action_type="click_at", coordinates=(1, 2))))
+        self.assertNotIn("click_at", self.svc._schema_full())
+        self.svc._points_on = True
+        self.assertEqual(self.svc._refusal_for(AgentAction(action_type="click_at", coordinates=(1, 2))), "")
+        self.assertIn("click|click_at|draw|", self.svc._schema_full())
+
     def test_the_rule_names_the_screen_size(self):
         self.svc._screen_size = (1000, 1000)
         self.assertIn("the screen is 1000x1000", self.svc._point_rule())
