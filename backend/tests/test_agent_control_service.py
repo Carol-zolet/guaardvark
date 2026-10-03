@@ -490,8 +490,10 @@ class TestScreenChange(unittest.TestCase):
             d.text((10, y), "some page text on a line", fill="black")
 
     def _video(self, seed):
+        # Grey levels far enough apart (80) to clear the 24-level change threshold.
         out = self.page.copy()
-        self.Draw.Draw(out).rectangle([0, 0, 399, 150], fill=(seed * 60 % 255, 90, 160))
+        grey = (40, 120, 200)[(seed - 1) % 3]
+        self.Draw.Draw(out).rectangle([0, 0, 399, 150], fill=(grey, grey, grey))
         return out
 
     def test_a_playing_video_is_not_a_change(self):
